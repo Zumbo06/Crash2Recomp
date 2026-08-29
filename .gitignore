@@ -1,0 +1,181 @@
+# ==========================================================================
+# Crash 2 Recomp
+#
+# What this repo IS: the launcher source, our reverse-engineering work
+# (seeds, symbols, patches, notes) and the build scripts.
+#
+# What it is NOT: the game, anything derived from the game, a BIOS, or the
+# psxrecomp framework. Those are either copyrighted, machine-translated from
+# copyrighted code, or third-party trees we deliberately do not carry.
+#
+# Everything under _build/ is reproducible from this repo plus your own disc.
+# ==========================================================================
+
+
+# --------------------------------------------------------------------------
+# 1. Copyrighted game data - NEVER commit any of this
+# --------------------------------------------------------------------------
+# Your disc dump. Keep it outside the repo, or here where it stays ignored.
+Crash Bandicoot 2 - Cortex Strikes Back (USA)/
+*.bin
+*.cue
+*.iso
+*.chd
+*.img
+*.ccd
+*.sub
+*.m3u
+
+# The game's boot executable, extracted from the disc (e.g. SCUS_941.54).
+input/
+prepared_disc/
+SCUS_*
+SCES_*
+SLUS_*
+SLES_*
+
+# C machine-translated from the game's MIPS code. Derived work - regenerate it
+# locally with psxrecomp.exe build; never distribute it.
+generated/
+*_full.c
+*_full_*.c
+*_dispatch.c
+*_decls.h
+*.ranges
+
+# PS1 BIOS images. OpenBIOS is MIT and ships with psxrecomp; a retail dump is
+# yours alone. Neither belongs in git.
+*.BIN
+openbios.bin
+SCPH*.bin
+SCPH*.BIN
+bios/
+
+
+# --------------------------------------------------------------------------
+# 2. Third-party trees we do not carry
+# --------------------------------------------------------------------------
+# psxrecomp is a BUILD-TIME TOOL, not a dependency of this project.
+# PolyForm Noncommercial licensed. Fetch it yourself:
+#   _build/psxrecomp-cli  <- release zip
+#   _build/psxrecomp-src  <- git clone (for `analyze` tooling)
+_build/psxrecomp-cli/
+_build/psxrecomp-src/
+_build/psxrecomp-cli.zip
+psxrecomp/
+recomp-ui/
+
+# The generated project (contains the vendored framework + generated C).
+_build/Crash2Recomp/
+
+# Downloaded toolchains (ninja, cmake-clang-v1).
+_build/tools/
+toolchain/
+*.tar.gz
+*.zip
+
+
+# --------------------------------------------------------------------------
+# 3. Build output
+# --------------------------------------------------------------------------
+# Ignore the scratch build area, but keep the scripts we actually wrote.
+# (Pattern must be `_build/*`, not `_build/`, for the negations to apply.)
+_build/*
+!_build/*.ps1
+!_build/padprobe.c
+
+build/
+build-clang/
+dist/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+
+# --------------------------------------------------------------------------
+# 4. Runtime-generated state
+# --------------------------------------------------------------------------
+# Save data and memory cards are personal, and savestates are not portable
+# between BIOS backends.
+userdata/
+saves/
+save/
+*.mcd
+*.mcr
+*.sav
+*.savestate
+
+# Written by the runtime next to the executable on first launch.
+settings.json
+settings.toml
+keybinds.ini
+input.ini
+config.ini
+game_options.toml
+disc.cfg
+bios.cfg
+
+# Overlay capture/compile cache - rebuilt by playing.
+overlay_captures.json
+overlay_captures.json.d/
+overlay_cache/
+overlay_toolchain/
+
+# Diagnostics.
+*.log
+psx_freeze_dump_*.json
+psx_cps_exit_trace.json
+analysis/
+
+# Screenshots and frame grabs from debugging. Launcher UI artwork and anything
+# under docs/ is real content, so keep those.
+*.png
+!docs/**/*.png
+!launcher/**/assets/**/*.png
+!launcher/**/assets/**/*.ico
+!launcher/**/assets/**/*.svg
+
+
+# --------------------------------------------------------------------------
+# 5. Python (the launcher)
+# --------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller
+*.spec
+launcher/build/
+launcher/dist/
+
+
+# --------------------------------------------------------------------------
+# 6. Editors and OS
+# --------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+Desktop.ini
+.DS_Store

@@ -1,0 +1,15 @@
+--- _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp.orig	2026-08-29 16:09:07.144159500 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp	2026-08-29 16:09:07.218518500 +0300
+@@ -187,6 +187,12 @@
+     extern uint64_t g_dirty_window_dispatches;
+     extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+     extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
++    /* MSVC link fix: these are defined in C TUs but were only redeclared
++     * block-scope inside functions below, so MSVC mangled the references. */
++    extern int      g_psx_dispatch_depth, g_call_unit_depth;
++    extern uint32_t i_stat, i_mask;
++    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count, g_vblank_ack_count;
++    extern uint64_t g_dirty_ram_blocks_run, g_dirty_pump_count, g_guest_store_count;
+ }
+ 
+ /* memory.c */
