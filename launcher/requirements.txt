@@ -1,0 +1,3 @@
+# Launcher dependencies.
+# PySide6 is LGPL, which keeps distribution of the launcher unencumbered.
+PySide6>=6.9,<7

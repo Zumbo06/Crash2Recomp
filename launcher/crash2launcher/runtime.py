@@ -8,11 +8,13 @@ give the player two competing menus.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
+from . import gametoml
 from .config import Settings
 from .paths import Layout
 
@@ -51,6 +53,10 @@ def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
     args += ["--memcard-dir", str(layout.save_dir)]
     args += ["--window-title", "Crash Bandicoot 2 Recompiled"]
 
+    # Opens the runtime's TCP debug server - how we read the SPU event ring.
+    if settings.debug_port:
+        args += ["--debug-port", str(settings.debug_port)]
+
     return LaunchPlan(
         program=layout.runtime_exe,
         args=args,
@@ -62,6 +68,10 @@ def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
 def _build_env(settings: Settings) -> dict[str, str]:
     """Environment overrides for the runtime.
 
+    Most enhancement knobs live here rather than in a config file. The runtime
+    reads them directly with ``getenv`` and lets them win over config, which is
+    exactly what we want for fast A/B testing from the launcher.
+
     ``PSX_DEV_INPUT=1`` makes player 1 read the keyboard *and* every connected
     controller at once. Without it a Release build defaults player 1 to
     "keyboard" and never opens a gamepad at all - the runtime expects its own
@@ -69,9 +79,84 @@ def _build_env(settings: Settings) -> dict[str, str]:
     ``--no-launcher`` because this launcher replaces it.
     """
     env: dict[str, str] = {}
+
     if settings.merge_all_input:
         env["PSX_DEV_INPUT"] = "1"
+
+    # Frame pacing. Note the runtime treats vsync and its wall-clock pacer as
+    # mutually exclusive, and vsync only really clocks ~60 Hz panels.
+    env["PSX_VSYNC"] = str(settings.vsync)
+
+    if settings.frame_interpolation:
+        env["PSX_FRAME_INTERPOLATION"] = "1"
+        # Only 0 (follow host) or >= 90 is accepted; clamp() already enforced it.
+        if settings.frame_interpolation_fps:
+            env["PSX_FRAME_INTERPOLATION_FPS"] = str(settings.frame_interpolation_fps)
+
+    if settings.smooth_60fps:
+        env["PSX_SMOOTH_60FPS"] = "1"
+    if settings.frame_blend:
+        env["PSX_FRAME_BLEND"] = "1"
+
+    # Audio diagnostics for the sound cut-off work.
+    if settings.audio_legacy:
+        env["PSXRECOMP_AUDIO_LEGACY"] = "1"
+    if settings.audio_shadow:
+        env["PSX_AUDIO_SHADOW"] = "1"
+
+    if settings.fps_telemetry:
+        env["PSX_FPS_TELEMETRY"] = "1"
+
     return env
+
+
+def apply_config_settings(layout: Layout, settings: Settings) -> None:
+    """Write the settings that are *not* environment variables into game.toml.
+
+    Two of these have no env override at all - the runtime only reads them from
+    config - so they must be on disk before launching:
+
+    ``[video] supersampling``
+        Internal-resolution SSAA. The loader validates 1..4 and *throws* outside
+        that range, taking the whole config down with it, so Settings.clamp()
+        enforces the bound before we ever write.
+
+    ``[controller] p1_device``
+        Assigns a physical device to player 1. Without it a release build pins
+        player 1 to "keyboard" and never opens a gamepad. "auto" means the first
+        connected pad. This is the supported route; PSX_DEV_INPUT (see
+        _build_env) is a diagnostic merge that layers on top, and the two
+        cooperate - the pad is properly assigned *and* the keyboard still works.
+
+    Uses the line-preserving writer in :mod:`gametoml`, so comments and key
+    order in the generated game.toml survive.
+    """
+    if not layout.game_toml.is_file():
+        return
+    gametoml.update(
+        layout.game_toml,
+        {
+            "video": {
+                "renderer": settings.renderer,
+                "supersampling": settings.supersampling,
+            },
+            "controller": {"p1_device": "auto"},
+        },
+    )
+
+
+def effective_scale_from_log(line: str) -> int | None:
+    """Pull the scale the renderer *actually* used out of its startup line.
+
+    The request is clamped to SW_MAX_INTERNAL_SCALE and can also fall back on
+    an allocation failure, so the log is the only trustworthy source. Matches:
+    ``psxrecomp: GL GPU pipeline ready (internal scale 2x, ...``
+    """
+    match = _SCALE_RE.search(line)
+    return int(match.group(1)) if match else None
+
+
+_SCALE_RE = re.compile(r"internal scale\s+(\d+)x")
 
 
 def _resolve_disc(layout: Layout, settings: Settings) -> Path | None:
