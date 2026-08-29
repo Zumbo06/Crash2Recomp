@@ -8,7 +8,9 @@ give the player two competing menus.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,7 +18,7 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from . import gametoml
 from .config import Settings
-from .paths import Layout
+from .paths import Layout, find_c_toolchain_bin
 
 
 @dataclass
@@ -57,11 +59,14 @@ def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
     if settings.debug_port:
         args += ["--debug-port", str(settings.debug_port)]
 
+    env = _build_env(settings)
+    env.update(overlay_env(layout, settings))
+
     return LaunchPlan(
         program=layout.runtime_exe,
         args=args,
         cwd=layout.runtime_exe.parent,
-        env=_build_env(settings),
+        env=env,
     )
 
 
@@ -110,6 +115,54 @@ def _build_env(settings: Settings) -> dict[str, str]:
     return env
 
 
+def _quote(path: Path | str) -> str:
+    return f'"{path}"'
+
+
+def overlay_autocompile_cmd(layout: Layout) -> str:
+    """The command the runtime shells out to in order to compile overlays.
+
+    Used verbatim by the runtime, so every path is absolute and quoted.
+    """
+    return " ".join([
+        _quote(sys.executable),
+        _quote(layout.overlay_script),
+        "--captures", _quote(layout.overlay_captures),
+        "--game-toml", _quote(layout.game_toml),
+        "--recompiler", _quote(layout.recompiler_exe),
+        "--runtime-include", _quote(layout.runtime_include),
+        "--out-dir", _quote(layout.overlay_cache),
+    ])
+
+
+def overlay_env(layout: Layout, settings: Settings) -> dict[str, str]:
+    """Environment that turns on native compilation of streamed level code.
+
+    Crash 2 loads level code as overlays. Anything the runtime cannot dispatch
+    natively runs on the MIPS interpreter - correct, but far slower. Two things
+    are needed to avoid that:
+
+    * a C compiler on PATH, which is how ``autocompile_toolchain_available()``
+      decides the gcc tier is usable at all
+    * ``PSX_OVERLAY_AUTOCOMPILE_CMD``, the command it shells out to
+
+    The command is used verbatim, so every path is supplied here. Without it the
+    runtime falls back to its bundled-TCC tier, which needs an
+    ``overlay_toolchain/`` directory we do not ship, and then gives up to the
+    interpreter.
+    """
+    env: dict[str, str] = {}
+    if not settings.native_overlays or not layout.can_compile_overlays:
+        return env
+
+    toolchain = find_c_toolchain_bin()
+    if toolchain:
+        env["PATH"] = str(toolchain) + os.pathsep + os.environ.get("PATH", "")
+
+    env["PSX_OVERLAY_AUTOCOMPILE_CMD"] = overlay_autocompile_cmd(layout)
+    return env
+
+
 def apply_config_settings(layout: Layout, settings: Settings) -> None:
     """Write the settings that are *not* environment variables into game.toml.
 
@@ -141,6 +194,20 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
                 "supersampling": settings.supersampling,
             },
             "controller": {"p1_device": "auto"},
+            # Setting overlay_autocompile_cmd is what makes the runtime consider
+            # the gcc tier available at all (it gates on
+            # has_overlay_autocompile_cmd && a compiler on PATH). Without it the
+            # runtime picks its bundled-TCC tier, looks for an
+            # overlay_toolchain/ directory we do not ship, and falls back to the
+            # interpreter.
+            "runtime": {
+                "overlay_backend": "auto" if settings.native_overlays else "tcc",
+                "overlay_autocompile_cmd": (
+                    overlay_autocompile_cmd(layout)
+                    if settings.native_overlays and layout.can_compile_overlays
+                    else ""
+                ),
+            },
         },
     )
 

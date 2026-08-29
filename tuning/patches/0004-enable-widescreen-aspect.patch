@@ -1,0 +1,32 @@
+Enable the generic widescreen / ultrawide aspect path.
+
+Applied to the vendored psxrecomp tree.
+
+WHY: the framework already implements widescreen fully and generically (see
+WIDESCREEN.md -- GTE X-squash via gte_set_display_aspect, per-prim proportion
+correction so sprites/HUD are not stretched, HUD edge anchoring, FMV 4:3
+pillarbox, authentic 4:3 BIOS boot), and `[video] aspect_ratio = "W:H"` is
+parsed and validated in config_loader.cpp. The only thing preventing it is a
+POLICY gate: upstream treats widescreen as "mod-owned" on PSX, to be activated
+by trusted mod plugins rather than a generic setting. These two constexprs
+drive a clamp (~main.cpp:11349) that forces any non-4:3 aspect back to 4:3.
+There is no environment override, unlike frame interpolation.
+
+This is a deliberate override of a DISTRIBUTION POLICY, not a technical limit,
+and is appropriate for a personal build only. Do not propose it upstream.
+
+STATUS: the clamp is gone -- the runtime now logs
+    "widescreen 16:9 (native-wide, present 1:1; engages at game entry)"
+instead of "clamping display aspect 16:9 -> 4:3". However the wider field of
+view does NOT yet visibly engage in Crash 2; the rendered image stays 4:3.
+Diagnosing that needs a -DPSX_DEBUG_TOOLS=ON build so the TCP debug server
+(ws_aspect / ws_census / gpu_state's ws.{configured,active,game_mode}) is
+compiled in -- the stock build sets PSX_NO_DEBUG_TOOLS=1 and strips it.
+
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -10674,10675 +10674,10675 @@
+-    constexpr bool ws_offered = false;
+-    constexpr bool ws_ultrawide_offered = false;
++    constexpr bool ws_offered = true;
++    constexpr bool ws_ultrawide_offered = true;

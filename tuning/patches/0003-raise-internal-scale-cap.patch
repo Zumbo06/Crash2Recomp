@@ -1,0 +1,34 @@
+Raise the internal-resolution (SSAA) cap from 4x to 8x.
+
+Applied to the vendored psxrecomp tree. Three places must change together --
+the two renderer caps and the config-loader range check, which *throws* on an
+out-of-range value and would otherwise take the whole config load down.
+
+MEASURED RESULT (Crash 2, RTX-class GPU, 2026-08-29):
+    5x  avg 59.9 fps, min 59.6 over 68 samples  -- clean
+    6x  avg 60.0 fps, min 52.9                  -- occasional dips
+    8x  allocates and reports "internal scale 8x", then produces NO frames
+So the launcher caps its UI at 6 and treats 5x as the sweet spot
+(crash2launcher/config.py: MAX_SUPERSAMPLING / RECOMMENDED_SUPERSAMPLING).
+The runtime cap is left at 8 so the ceiling is the measurement, not the build.
+
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -128 +128 @@
+-#define GL_MAX_INTERNAL_SCALE 4
++#define GL_MAX_INTERNAL_SCALE 8
+
+--- a/runtime/include/gpu_sw_renderer.h
++++ b/runtime/include/gpu_sw_renderer.h
+@@ -11 +11 @@
+-#define SW_MAX_INTERNAL_SCALE 4
++#define SW_MAX_INTERNAL_SCALE 8
+
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -540,542 +540,542 @@
+-            if (n < 1 || n > 4) {
++            if (n < 1 || n > 8) {
+                 throw std::runtime_error(fmt::format(
+-                    "[video] supersampling out of range (1..4): {}", n));
++                    "[video] supersampling out of range (1..8): {}", n));

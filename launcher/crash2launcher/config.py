@@ -18,10 +18,14 @@ from typing import Any
 RENDERERS = ("opengl", "vulkan", "software")
 ASPECTS = ("4:3", "16:9", "21:9")
 
-# Mirrors SW_MAX_INTERNAL_SCALE in the runtime's gpu_sw_renderer.h. Requesting
-# more is not an error - the runtime just clamps it - but the UI should not
-# offer a value that silently does nothing.
-MAX_SUPERSAMPLING = 4
+# The runtime's own cap was raised 4 -> 8 (tuning/patches/0003), but measurement
+# says 8x is not usable: it allocates and reports "internal scale 8x", then
+# produces no frames at all. 6x averages 60 fps with occasional dips to ~53;
+# 5x is clean (min 59.6 over 68 samples). So the UI stops at 6 and treats 5 as
+# the sweet spot. The config loader throws above the runtime cap, so this must
+# never exceed it.
+MAX_SUPERSAMPLING = 6
+RECOMMENDED_SUPERSAMPLING = 5
 
 
 @dataclass
@@ -65,6 +69,12 @@ class Settings:
     # Diagnostics for the sound cut-off investigation.
     audio_legacy: bool = False
     audio_shadow: bool = False
+
+    # --- performance ------------------------------------------------------
+    # Compile streamed level code (overlays) to native instead of letting it
+    # fall back to the MIPS interpreter. Needs a C compiler on PATH, which the
+    # launcher supplies from psxrecomp's own clang pack.
+    native_overlays: bool = True
 
     # --- diagnostics ------------------------------------------------------
     # Non-zero opens the runtime's TCP debug server, which is how we read the

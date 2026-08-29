@@ -1,0 +1,34 @@
+--- _build/Crash2Recomp/psxrecomp/runtime/include/cpu_state.h.orig	2026-08-29 18:05:33.284102700 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/include/cpu_state.h	2026-08-29 18:05:40.286923700 +0300
+@@ -74,6 +74,15 @@
+  * Static recompiled code and the interpreter share host cycle state directly,
+  * so their barrier compiles to nothing. */
+ #ifdef PSX_OVERLAY_DLL_BUILD
++/* The overlay DLL *defines* this with dllexport, so the declaration must carry
++ * the attribute too - clang rejects adding dllexport on a redeclaration
++ * outright (GCC only warns), which broke every overlay compile. Same export
++ * convention as overlay_init in overlay_api.h. */
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
+ void overlay_flush_cycles(void);
+ static inline void psx_store_cycle_barrier(void) { overlay_flush_cycles(); }
+ #else
+--- _build/Crash2Recomp/psxrecomp/runtime/include/psx_cycles.h.orig	2026-08-29 18:05:33.316686600 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/include/psx_cycles.h	2026-08-29 18:05:47.849748800 +0300
+@@ -126,6 +126,13 @@
+ /* Publish deferred charges (IRQ edge / MMIO / savestate). Overlay DLLs keep
+  * their pending total in the callback shim rather than these host globals. */
+ #if defined(PSX_OVERLAY_DLL_BUILD)
++/* Declaration must carry dllexport to match the DLL's definition; clang errors
++ * on adding it at redeclaration. See the matching note in cpu_state.h. */
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
+ void overlay_flush_cycles(void);
+ static inline void psx_cyc_local_publish(void) { }
+ static inline void psx_cyc_batch_flush(void) { overlay_flush_cycles(); }

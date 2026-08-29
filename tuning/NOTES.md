@@ -79,3 +79,62 @@ Dead end worth recording: `input.ini`'s `[controller] device = 0` does nothing.
 - Overlay captures are being written; the TCC overlay tier is inactive
   ("no bundled toolchain at .../overlay_toolchain"), so uncovered overlay code
   falls back to the interpreter. Worth revisiting for performance.
+
+## Enhancements round (2026-08-29)
+
+### Overlay native compilation — FIXED, real speedup
+
+Symptom: `tcc tier active but no bundled toolchain ... (overlay gaps ->
+interpreter)`. Crash 2 streams level code as overlays, so uncovered code ran on
+the MIPS interpreter.
+
+Two things were needed, and the second is the non-obvious one:
+
+1. A C compiler on PATH. `autocompile_toolchain_available()` (autocompile.c)
+   just scans PATH for gcc/cc/clang; psxrecomp's own clang pack supplies it.
+2. **`[runtime] overlay_autocompile_cmd`.** The gate is
+   `deferred_has_overlay_ac && autocompile_toolchain_available()` — a compiler
+   alone is NOT enough. Without the command the runtime picks its bundled-TCC
+   tier, looks for an `overlay_toolchain/` directory we do not ship, and gives
+   up to the interpreter. The launcher now writes this key and also sets
+   `PSX_OVERLAY_AUTOCOMPILE_CMD`.
+
+Then every overlay compile failed with a **clang-only** error:
+`redeclaration of 'overlay_flush_cycles' cannot add 'dllexport' attribute`.
+The DLL defines it with dllexport; `cpu_state.h` and `psx_cycles.h` declared it
+bare under `PSX_OVERLAY_DLL_BUILD`. GCC only warns, clang errors. Fixed by
+giving both declarations the same export attribute used by `overlay_init` in
+`overlay_api.h` — see `patches/0002`. Result: **18 failures -> 0**, 2 DLLs
+built, tier now reports `overlay autocompile enabled (gcc)`.
+
+### Internal resolution — raised, but 8x is NOT usable
+
+Cap raised 4->8 in three places (`patches/0003`). Measured on Crash 2:
+
+| scale | avg fps | min fps | verdict |
+|-------|---------|---------|---------|
+| 5x    | 59.9    | 59.6    | clean |
+| 6x    | 60.0    | 52.9    | occasional dips |
+| 8x    | —       | —       | allocates, then produces NO frames |
+
+Launcher caps at 6, recommends 5. The ceiling is the measurement, not the build.
+
+### Widescreen — clamp removed, but does not engage yet
+
+`ws_offered` / `ws_ultrawide_offered` were `constexpr false`, clamping any
+aspect back to 4:3 (`patches/0004`). Flipping them removes the clamp — the
+runtime now logs `widescreen 16:9 (native-wide, present 1:1; engages at game
+entry)` — but the image stays 4:3 in practice. Unresolved.
+
+Next step: rebuild with `-DPSX_DEBUG_TOOLS=ON`. The stock build sets
+`PSX_NO_DEBUG_TOOLS=1`, which strips the TCP debug server, so `ws_aspect`,
+`ws_census` and `gpu_state`'s `ws.{configured,active,game_mode}` — the exact
+tools for this — are unavailable. (That build flag also flips player 1's
+default device to "auto", which is the same gate behind the old controller bug.)
+
+### Gotcha: sed -i destroys CRLF
+
+`sed -i` on these sources rewrote CRLF -> LF file-wide, turning a 2-line change
+into a 13,513-line diff. Harmless to the build, but it makes generated patches
+worthless. `patches/0003` and `0004` were therefore hand-written. Prefer the
+Edit tool over `sed -i` on the vendored tree.
