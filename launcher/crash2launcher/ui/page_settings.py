@@ -24,8 +24,41 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import MAX_SUPERSAMPLING, RENDERERS, Settings
+from ..config import (
+    ASPECTS,
+    MAX_SUPERSAMPLING,
+    RECOMMENDED_SUPERSAMPLING,
+    RENDERERS,
+    Settings,
+)
 from .common import card, dim, heading, row, section
+
+FULLSCREEN_MODES = [
+    ("Windowed", 0),
+    ("Borderless fullscreen (desktop resolution)", 1),
+    ("Exclusive fullscreen (changes display mode)", 2),
+]
+
+# 0 lets the runtime choose. The loader accepts 640..7680.
+WINDOW_WIDTHS = [
+    ("Auto", 0),
+    ("1280 (720p)", 1280),
+    ("1920 (1080p)", 1920),
+    ("2560 (1440p)", 2560),
+    ("3840 (4K)", 3840),
+]
+
+TEXTURE_FILTERS = [
+    ("Nearest (sharp, authentic)", "nearest"),
+    ("Bilinear (smooth)", "bilinear"),
+]
+
+CRT_FILTERS = [
+    ("Off (raw)", "raw"),
+    ("CRT", "crt"),
+    ("Composite", "composite"),
+    ("Trinitron", "trinitron"),
+]
 
 # label -> stored value
 VSYNC_MODES = [
@@ -73,6 +106,7 @@ class SettingsPage(QWidget):
         ))
 
         lay.addWidget(self._video_card())
+        lay.addWidget(self._quality_card())
         lay.addWidget(self._pacing_card())
         lay.addWidget(self._input_card())
         lay.addWidget(self._audio_card())
@@ -90,24 +124,94 @@ class SettingsPage(QWidget):
 
         self.scale = QComboBox()
         for n in range(1, MAX_SUPERSAMPLING + 1):
-            self.scale.addItem(f"{n}x  ({320 * n}x{240 * n} internal)", n)
+            label = f"{n}x  ({320 * n}x{240 * n} internal)"
+            if n == RECOMMENDED_SUPERSAMPLING:
+                label += "   - recommended"
+            self.scale.addItem(label, n)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
         self.scale.currentIndexChanged.connect(self._on_scale)
 
-        self.fullscreen = QCheckBox("Start fullscreen")
-        self.fullscreen.setChecked(self.settings.fullscreen)
-        self.fullscreen.toggled.connect(self._on_fullscreen)
+        self.fullscreen = QComboBox()
+        for label, value in FULLSCREEN_MODES:
+            self.fullscreen.addItem(label, value)
+        self.fullscreen.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(FULLSCREEN_MODES)
+                  if v == self.settings.fullscreen_mode), 0))
+        self.fullscreen.currentIndexChanged.connect(self._on_fullscreen)
+
+        self.win_width = QComboBox()
+        for label, value in WINDOW_WIDTHS:
+            self.win_width.addItem(label, value)
+        self.win_width.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(WINDOW_WIDTHS)
+                  if v == self.settings.window_width), 0))
+        self.win_width.currentIndexChanged.connect(self._on_win_width)
+
+        self.aspect = QComboBox()
+        self.aspect.addItems(ASPECTS)
+        self.aspect.setCurrentText(self.settings.aspect)
+        self.aspect.currentTextChanged.connect(self._on_aspect)
 
         return card(
-            section("Video"),
+            section("Display"),
             row("Renderer", self.renderer),
             row("Internal resolution", self.scale),
             dim(
-                f"Supersampling is written to game.toml - the runtime has no "
-                f"environment override for it, and clamps above {MAX_SUPERSAMPLING}x. "
-                "The Play page shows the scale the renderer actually used."
+                f"Measured on this machine: 5x is clean, 6x dips to ~53 fps, and "
+                f"8x produces no frames at all - so the list stops at "
+                f"{MAX_SUPERSAMPLING}x. The Play page shows the scale the renderer "
+                "actually used, which is the only trustworthy number."
             ),
-            self.fullscreen,
+            row("Fullscreen", self.fullscreen),
+            row("Window width", self.win_width),
+            row("Aspect ratio", self.aspect),
+            dim(
+                "Alt+Enter or Ctrl+F also toggle fullscreen while playing. "
+                "Widescreen deliberately stays 4:3 during the BIOS boot, FMVs and "
+                "full-2D screens such as menus - it applies to 3D gameplay."
+            ),
+        )
+
+    def _quality_card(self) -> QWidget:
+        self.tex_filter = QComboBox()
+        for label, value in TEXTURE_FILTERS:
+            self.tex_filter.addItem(label, value)
+        self.tex_filter.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(TEXTURE_FILTERS)
+                  if v == self.settings.texture_filter), 0))
+        self.tex_filter.currentIndexChanged.connect(self._on_tex_filter)
+
+        self.crt = QComboBox()
+        for label, value in CRT_FILTERS:
+            self.crt.addItem(label, value)
+        self.crt.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(CRT_FILTERS)
+                  if v == self.settings.crt_filter), 0))
+        self.crt.currentIndexChanged.connect(self._on_crt)
+
+        self.aa = QCheckBox("Anti-aliasing")
+        self.aa.setChecked(self.settings.antialiasing)
+        self.aa.toggled.connect(self._on_aa)
+
+        self.geom = QCheckBox("Geometry correction (reduces PS1 vertex wobble)")
+        self.geom.setChecked(self.settings.geometry_correction)
+        self.geom.toggled.connect(self._on_geom)
+
+        self.persp = QCheckBox("Perspective-correct texturing (reduces warping)")
+        self.persp.setChecked(self.settings.perspective_texturing)
+        self.persp.toggled.connect(self._on_persp)
+
+        return card(
+            section("Image quality"),
+            row("Texture filtering", self.tex_filter),
+            row("CRT filter", self.crt),
+            self.aa,
+            self.geom,
+            self.persp,
+            dim(
+                "These live in settings.toml beside the game executable - there is "
+                "no environment override, so they apply on the next launch."
+            ),
         )
 
     def _pacing_card(self) -> QWidget:
@@ -223,8 +327,36 @@ class SettingsPage(QWidget):
         self.settings.supersampling = self.scale.itemData(index)
         self._touch()
 
-    def _on_fullscreen(self, on: bool) -> None:
-        self.settings.fullscreen = on
+    def _on_fullscreen(self, index: int) -> None:
+        self.settings.fullscreen_mode = self.fullscreen.itemData(index)
+        self._touch()
+
+    def _on_win_width(self, index: int) -> None:
+        self.settings.window_width = self.win_width.itemData(index)
+        self._touch()
+
+    def _on_aspect(self, value: str) -> None:
+        self.settings.aspect = value
+        self._touch()
+
+    def _on_tex_filter(self, index: int) -> None:
+        self.settings.texture_filter = self.tex_filter.itemData(index)
+        self._touch()
+
+    def _on_crt(self, index: int) -> None:
+        self.settings.crt_filter = self.crt.itemData(index)
+        self._touch()
+
+    def _on_aa(self, on: bool) -> None:
+        self.settings.antialiasing = on
+        self._touch()
+
+    def _on_geom(self, on: bool) -> None:
+        self.settings.geometry_correction = on
+        self._touch()
+
+    def _on_persp(self, on: bool) -> None:
+        self.settings.perspective_texturing = on
         self._touch()
 
     def _on_vsync(self, index: int) -> None:

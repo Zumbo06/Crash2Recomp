@@ -38,8 +38,20 @@ class Settings:
     # --- video ------------------------------------------------------------
     renderer: str = "opengl"
     aspect: str = "4:3"
-    fullscreen: bool = False
+    # Tri-state, not a bool: 0 windowed, 1 borderless desktop, 2 exclusive.
+    # Alt+Enter / Ctrl+F also toggle this at runtime.
+    fullscreen_mode: int = 0
+    # 0 = let the runtime choose. Otherwise pins the window width; the loader
+    # accepts 640..7680, so 3840 gives a 4K-wide window.
+    window_width: int = 0
     integer_scaling: bool = False
+
+    # --- image quality (settings.toml only - no env override exists) -------
+    texture_filter: str = "nearest"     # nearest | bilinear
+    crt_filter: str = "raw"             # raw | crt | composite | trinitron
+    antialiasing: bool = False
+    geometry_correction: bool = False
+    perspective_texturing: bool = False
 
     # Internal-resolution supersampling (SSAA). Goes into game.toml as
     # [runtime] video_supersampling, NOT an env var. The runtime clamps to
@@ -112,6 +124,15 @@ class Settings:
         self.volume = max(0, min(100, int(self.volume or 0)))
         if self.vsync not in (-1, 0, 1):
             self.vsync = 0
+        if self.fullscreen_mode not in (0, 1, 2):
+            self.fullscreen_mode = 0
+        if self.texture_filter not in ("nearest", "bilinear"):
+            self.texture_filter = "nearest"
+        if self.crt_filter not in ("raw", "crt", "composite", "trinitron"):
+            self.crt_filter = "raw"
+        # The loader rejects a window_width outside 640..7680; 0 means "auto".
+        width = int(self.window_width or 0)
+        self.window_width = width if (width == 0 or 640 <= width <= 7680) else 0
         # The runtime silently ignores an interpolation target below 90.
         fps = int(self.frame_interpolation_fps or 0)
         self.frame_interpolation_fps = fps if (fps == 0 or fps >= 90) else 0

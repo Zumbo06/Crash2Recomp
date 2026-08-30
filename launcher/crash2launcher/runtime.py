@@ -16,7 +16,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from . import gametoml
+from . import gametoml, usersettings
 from .config import Settings
 from .paths import Layout, find_c_toolchain_bin
 
@@ -186,6 +186,12 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
     """
     if not layout.game_toml.is_file():
         return
+
+    # settings.toml sits beside the runtime executable and layers over
+    # game.toml. Fullscreen mode, window width, CRT and texture filtering exist
+    # ONLY here - there is no game.toml key or env override for them.
+    usersettings.save(layout.runtime_exe.parent / "settings.toml", settings)
+
     gametoml.update(
         layout.game_toml,
         {
