@@ -1,0 +1,113 @@
+--- _build/Crash2Recomp/psxrecomp/recompiler/src/config_loader.h.wh	2026-08-30 16:08:45.291069300 +0300
++++ _build/Crash2Recomp/psxrecomp/recompiler/src/config_loader.h	2026-08-30 16:08:59.946949300 +0300
+@@ -369,6 +369,12 @@
+     // the historical fit-to-display behavior; player settings may override it.
+     int                   video_window_width = 0;
+ 
++    // Optional explicit window HEIGHT. Zero keeps the derived height
++    // (width * den / num), which ties the output canvas to the content aspect.
++    // Setting both makes the window an exact canvas -- e.g. 3840x2160 -- with
++    // the present path pillarboxing 4:3 content inside it.
++    int                   video_window_height = 0;
++
+     // antialiasing: when true the present path uses linear filtering when
+     // scaling the framebuffer to the window (smooths the supersample
+     // downscale and any window resize). false = nearest (sharp pixels).
+@@ -1152,6 +1158,9 @@
+     // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
+     // both the launcher and the emulator window so they boot at the same size.
+     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
++    // Explicit height. When unset the height stays derived from the width and
++    // the content aspect; when set, width+height form an exact output canvas.
++    bool has_window_height  = false; int  window_height  = 0;
+     bool has_antialiasing   = false; bool antialiasing   = true;
+     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+--- _build/Crash2Recomp/psxrecomp/recompiler/src/config_loader.cpp.wh	2026-08-30 16:08:45.327489500 +0300
++++ _build/Crash2Recomp/psxrecomp/recompiler/src/config_loader.cpp	2026-08-30 16:09:22.591322300 +0300
+@@ -543,6 +543,14 @@
+             }
+             rt.video_supersampling = static_cast<int>(n);
+         }
++        if (video.contains("window_height")) {
++            const auto n = toml::find<int64_t>(video, "window_height");
++            if (n < 360 || n > 4320) {
++                throw std::runtime_error(fmt::format(
++                    "[video] window_height out of range (360..4320): {}", n));
++            }
++            rt.video_window_height = static_cast<int>(n);
++        }
+         if (video.contains("window_width")) {
+             const auto n = toml::find<int64_t>(video, "window_width");
+             if (n < 640 || n > 7680) {
+@@ -2220,6 +2228,10 @@
+             const auto n = toml::find<int64_t>(v, "window_width");
+             if (n >= 640 && n <= 3840) { s.window_width = (int)n; s.has_window_width = true; }
+         });
++        if (v.contains("window_height")) try_get([&]{
++            const auto n = toml::find<int64_t>(v, "window_height");
++            if (n >= 360 && n <= 2160) { s.window_height = (int)n; s.has_window_height = true; }
++        });
+         if (v.contains("antialiasing")) try_get([&]{
+             s.antialiasing = toml::find<bool>(v, "antialiasing"); s.has_antialiasing = true;
+         });
+@@ -2535,6 +2547,8 @@
+         f << "supersampling     = " << s.supersampling << "\n";
+     if (s.has_window_width)
+         f << "window_width      = " << s.window_width << "\n";
++    if (s.has_window_height)
++        f << "window_height     = " << s.window_height << "\n";
+     if (s.has_antialiasing)
+         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
+     if (s.has_texture_filter)
+--- _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp.wh	2026-08-30 16:08:45.365858800 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp	2026-08-30 16:10:04.037007500 +0300
+@@ -1150,6 +1150,11 @@
+ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
+ static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
+ static bool          g_video_win_w_explicit = false; /* user chose a width */
++/* Explicit output HEIGHT. 0 keeps the derived height (width * den / num), which
++ * ties the canvas to the content aspect. Setting both makes the window an exact
++ * canvas (e.g. 3840x2160) and lets the present path pillarbox 4:3 inside it. */
++static int           g_video_win_h    = 0;
++static bool          g_video_win_h_explicit = false;
+ static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
+ static int           g_audio_freq     = 44100; /* host device request */
+ static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+@@ -10812,6 +10817,10 @@
+                 g_video_win_w = gc.runtime.video_window_width;
+                 g_video_win_w_explicit = true;
+             }
++            if (gc.runtime.video_window_height > 0) {
++                g_video_win_h = gc.runtime.video_window_height;
++                g_video_win_h_explicit = true;
++            }
+             g_video_aa         = gc.runtime.video_antialiasing;
+             g_video_texfilter  = gc.runtime.video_texture_filter;
+             g_video_fmv_filter = gc.runtime.video_fmv_filter;
+@@ -11200,6 +11209,8 @@
+         if (us.has_supersampling)  g_video_scale     = us.supersampling;
+         if (us.has_window_width)   g_video_win_w     = us.window_width;
+         if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
++        if (us.has_window_height)  g_video_win_h     = us.window_height;
++        if (us.has_window_height && us.window_height > 0) g_video_win_h_explicit = true;
+         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+@@ -12950,6 +12961,16 @@
+      * the image scales to fill the larger window with no further distortion. */
+     int game_w = g_video_win_w, game_h = 0;
+     clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
++    /* An explicit height decouples the output canvas from the content aspect:
++     * the window becomes exactly W x H (1920x1080, 2560x1440, 3840x2160) and
++     * the present path letterboxes/pillarboxes the content inside it, instead
++     * of the height being forced to width * den / num. Only honour it when a
++     * width was given too, so a stray height cannot distort the fit-to-display
++     * default. */
++    if (g_video_win_h_explicit && g_video_win_w_explicit && g_video_win_h > 0) {
++        game_w = g_video_win_w;
++        game_h = g_video_win_h;
++    }
+     sdl_window = SDL_CreateWindow(
+         window_title.c_str(),
+         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,

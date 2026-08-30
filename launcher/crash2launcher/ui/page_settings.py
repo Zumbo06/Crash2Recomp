@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from ..config import (
     ASPECTS,
     MAX_SUPERSAMPLING,
+    OUTPUT_RESOLUTIONS,
     RECOMMENDED_SUPERSAMPLING,
     RENDERERS,
     Settings,
@@ -39,18 +40,15 @@ FULLSCREEN_MODES = [
     ("Exclusive fullscreen (changes display mode)", 2),
 ]
 
-# 0 lets the runtime choose. The loader accepts 640..7680.
-WINDOW_WIDTHS = [
-    ("Auto", 0),
-    ("1280 (720p)", 1280),
-    ("1920 (1080p)", 1920),
-    ("2560 (1440p)", 2560),
-    ("3840 (4K)", 3840),
-]
-
 TEXTURE_FILTERS = [
     ("Nearest (sharp, authentic)", "nearest"),
     ("Bilinear (smooth)", "bilinear"),
+]
+
+# Which widescreen implementation runs when the aspect is not 4:3.
+WIDESCREEN_MODES = [
+    ("Projection hack (works on any title)", False),
+    ("Native-wide (needs per-game data)", True),
 ]
 
 CRT_FILTERS = [
@@ -139,18 +137,34 @@ class SettingsPage(QWidget):
                   if v == self.settings.fullscreen_mode), 0))
         self.fullscreen.currentIndexChanged.connect(self._on_fullscreen)
 
-        self.win_width = QComboBox()
-        for label, value in WINDOW_WIDTHS:
-            self.win_width.addItem(label, value)
-        self.win_width.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(WINDOW_WIDTHS)
-                  if v == self.settings.window_width), 0))
-        self.win_width.currentIndexChanged.connect(self._on_win_width)
+        self.output_resolution = QComboBox()
+        for label, width, height in OUTPUT_RESOLUTIONS:
+            self.output_resolution.addItem(label, (width, height))
+        self.output_resolution.setCurrentIndex(next(
+            (i for i, (_, width, height) in enumerate(OUTPUT_RESOLUTIONS)
+             if (width, height) == (
+                 self.settings.window_width, self.settings.window_height
+             )),
+            0,
+        ))
+        self.output_resolution.currentIndexChanged.connect(
+            self._on_output_resolution
+        )
 
         self.aspect = QComboBox()
         self.aspect.addItems(ASPECTS)
         self.aspect.setCurrentText(self.settings.aspect)
         self.aspect.currentTextChanged.connect(self._on_aspect)
+
+        self.ws_mode = QComboBox()
+        for label, value in WIDESCREEN_MODES:
+            self.ws_mode.addItem(label, value)
+        self.ws_mode.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(WIDESCREEN_MODES)
+                  if v == self.settings.widescreen_native_wide), 0))
+        self.ws_mode.currentIndexChanged.connect(self._on_ws_mode)
+
+        self._sync_output_controls()
 
         return card(
             section("Display"),
@@ -163,12 +177,17 @@ class SettingsPage(QWidget):
                 "actually used, which is the only trustworthy number."
             ),
             row("Fullscreen", self.fullscreen),
-            row("Window width", self.win_width),
-            row("Aspect ratio", self.aspect),
+            row("Output resolution", self.output_resolution),
+            row("Gameplay aspect", self.aspect),
+            row("Widescreen mode", self.ws_mode),
             dim(
-                "Alt+Enter or Ctrl+F also toggle fullscreen while playing. "
-                "Widescreen deliberately stays 4:3 during the BIOS boot, FMVs and "
-                "full-2D screens such as menus - it applies to 3D gameplay."
+                "The 1080p, 1440p and 4K choices are exact output canvases, "
+                "independent of the aspect - 4:3 content pillarboxes inside them. "
+                "Borderless always uses the desktop resolution, and Alt+Enter or "
+                "Ctrl+F toggles fullscreen while playing.\n\n"
+                "Leave Widescreen mode on the projection hack: native-wide needs "
+                "per-game viewport data that Crash 2 does not have, and without it "
+                "nothing widens at all."
             ),
         )
 
@@ -223,7 +242,7 @@ class SettingsPage(QWidget):
         )
         self.vsync.currentIndexChanged.connect(self._on_vsync)
 
-        self.interp = QCheckBox("Enable frame interpolation")
+        self.interp = QCheckBox("High-refresh presentation interpolation (OpenGL)")
         self.interp.setChecked(self.settings.frame_interpolation)
         self.interp.toggled.connect(self._on_interp)
 
@@ -234,12 +253,8 @@ class SettingsPage(QWidget):
             next((i for i, (_, v) in enumerate(INTERP_TARGETS)
                   if v == self.settings.frame_interpolation_fps), 0)
         )
-        self.interp_fps.setEnabled(self.settings.frame_interpolation)
         self.interp_fps.currentIndexChanged.connect(self._on_interp_fps)
-
-        self.smooth = QCheckBox("Smooth 60 fps presentation")
-        self.smooth.setChecked(self.settings.smooth_60fps)
-        self.smooth.toggled.connect(self._on_smooth)
+        self._sync_interpolation_controls()
 
         self.blend = QCheckBox("Temporal frame blending")
         self.blend.setChecked(self.settings.frame_blend)
@@ -248,14 +263,14 @@ class SettingsPage(QWidget):
         return card(
             section("Frame pacing and high refresh"),
             dim(
-                "The game simulates at a fixed 59.94 Hz. Interpolation only "
-                "changes how frames are presented, so judge it visually - it can "
-                "introduce artifacts."
+                "Crash 2 gameplay now updates and renders at a native 59.94 fps "
+                "instead of repeating each frame twice. Targets above 60 are "
+                "presentation interpolation only; they do not accelerate gameplay "
+                "and can introduce blending artifacts."
             ),
             row("V-sync", self.vsync),
             self.interp,
             row("Interpolation target", self.interp_fps),
-            self.smooth,
             self.blend,
         )
 
@@ -329,6 +344,7 @@ class SettingsPage(QWidget):
 
     def _on_fullscreen(self, index: int) -> None:
         self.settings.fullscreen_mode = self.fullscreen.itemData(index)
+        self._sync_output_controls()
         self._touch()
 
     def _on_win_width(self, index: int) -> None:
@@ -338,6 +354,37 @@ class SettingsPage(QWidget):
     def _on_aspect(self, value: str) -> None:
         self.settings.aspect = value
         self._touch()
+
+    def _on_ws_mode(self, index: int) -> None:
+        self.settings.widescreen_native_wide = self.ws_mode.itemData(index)
+        self._touch()
+
+    def _on_output_resolution(self, index: int) -> None:
+        width, height = self.output_resolution.itemData(index)
+        self.settings.window_width = width
+        self.settings.window_height = height
+        self._sync_output_controls()
+        self._touch()
+
+    def _sync_interpolation_controls(self) -> None:
+        """The interpolation target only means anything while interpolation is
+        on, and the runtime ignores any value below 90."""
+        on = self.settings.frame_interpolation
+        self.interp_fps.setEnabled(on)
+        self.interp_fps.setToolTip(
+            "" if on else "Enable frame interpolation to choose a target."
+        )
+
+    def _sync_output_controls(self) -> None:
+        """Borderless fullscreen always uses the desktop resolution, so an
+        explicit output canvas cannot apply - say so rather than letting the
+        control look effective."""
+        borderless = self.settings.fullscreen_mode == 1
+        self.output_resolution.setEnabled(not borderless)
+        self.output_resolution.setToolTip(
+            "Borderless fullscreen always uses the desktop resolution."
+            if borderless else ""
+        )
 
     def _on_tex_filter(self, index: int) -> None:
         self.settings.texture_filter = self.tex_filter.itemData(index)

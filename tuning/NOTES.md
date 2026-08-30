@@ -138,3 +138,54 @@ default device to "auto", which is the same gate behind the old controller bug.)
 into a 13,513-line diff. Harmless to the build, but it makes generated patches
 worthless. `patches/0003` and `0004` were therefore hand-written. Prefer the
 Edit tool over `sed -i` on the vendored tree.
+
+### Widescreen — SOLVED: it was mode selection, not the aspect setting
+
+Symptom: `[video] aspect_ratio = "16:9"` was accepted, the clamp was gone, the
+startup line said `widescreen 16:9`, and yet nothing widened — in menus *or* 3D
+gameplay.
+
+`gpu_state` (needs a `-DPSX_DEBUG_TOOLS=ON` build) gave the answer:
+
+    configured = 0   active = 0   squash = [1,1]   mode = 2   nw_extra = 0
+
+There are **two** widescreen implementations, chosen in `refresh_widescreen_projection()`:
+
+    const int mode = wide ? (native_wide ? 2 : 1) : 0;
+
+* **mode 2, "native-wide"** — renders extra columns instead of squashing.
+  Higher quality, but needs per-game viewport data. Crash 2 has none, so
+  `nw_extra` stays 0 and nothing widens. **This is the framework default**
+  (`ws_native_wide = true`, config_loader.cpp:1387).
+* **mode 1, GTE X-squash + stretched present** — the classic DuckStation/Beetle
+  widescreen hack. Squash the projection horizontally, present stretched, net
+  result is genuinely wider FOV. Works on any title with no per-game data.
+
+Fix is config-only, no patch: **`[widescreen] native_wide = false`** in
+game.toml. The startup line then reads `GTE X-squash + stretched present` and
+the image fills the canvas edge to edge.
+
+Dead ends ruled out along the way (all wrong):
+- `fntrace_is_game_started()` never firing — it fires, `game_started: 1`
+- the `ws_offered` clamp — real, and patch 0004 removes it, but it was not the
+  reason nothing widened
+- `ws_aspect 16 9` over TCP — returns ok but changes nothing in mode 2, because
+  native-wide bypasses the GTE squash entirely
+
+Exposed as a launcher setting (`widescreen_native_wide`, default False).
+
+**Gotcha: duplicate dict key.** `apply_config_settings` briefly had two
+`"widescreen"` keys in the same dict literal; Python silently keeps the last,
+so a hardcoded `native_wide: True` shadowed the setting and game.toml kept
+reverting. Merged into one entry.
+
+### Output resolution decoupled from aspect (patch 0005)
+
+`window_height` did not exist — the loader knew only `window_title` and
+`window_width`, and height was always `width * den / num`, tying the canvas to
+the content aspect. Added `[video] window_height` (game.toml 360..4320,
+settings.toml 360..2160) plus `g_video_win_h`, honoured only when a width is
+also set. Verified: a 1920x1080 canvas with 4:3 content pillarboxes correctly
+instead of forcing a 1920x1440 window.
+
+Note `settings.toml` caps `window_width` at 3840 (game.toml allows 7680).

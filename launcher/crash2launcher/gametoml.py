@@ -61,6 +61,12 @@ def update(path: Path, changes: dict[str, dict[str, Any]]) -> None:
     section_end: dict[str, int] = {}
     current = ""
     for i, line in enumerate(lines):
+        # An array-of-tables (for example [[recompiler.patch]]) ends the scalar
+        # table for our purposes. Treating its keys as part of the preceding
+        # section would make a later settings save insert keys into the patch.
+        if line.lstrip().startswith("[["):
+            current = ""
+            continue
         m = _SECTION_RE.match(line)
         if m:
             current = m.group(1).strip()
@@ -71,6 +77,9 @@ def update(path: Path, changes: dict[str, dict[str, Any]]) -> None:
 
     current = ""
     for i, line in enumerate(lines):
+        if line.lstrip().startswith("[["):
+            current = ""
+            continue
         m = _SECTION_RE.match(line)
         if m:
             current = m.group(1).strip()

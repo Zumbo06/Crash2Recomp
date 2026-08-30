@@ -16,7 +16,18 @@ from pathlib import Path
 from typing import Any
 
 RENDERERS = ("opengl", "vulkan", "software")
-ASPECTS = ("4:3", "16:9", "21:9")
+ASPECTS = ("4:3", "16:9")
+
+# Exact output canvases offered by the launcher.  Aspect ratio is deliberately
+# separate: a 4:3 BIOS/FMV can pillarbox inside (say) a 3840x2160 canvas, while
+# 3D gameplay uses the title's native-wide profile.
+OUTPUT_RESOLUTIONS = (
+    ("Auto (fit display)", 0, 0),
+    ("1280 x 720 (HD)", 1280, 720),
+    ("1920 x 1080 (Full HD)", 1920, 1080),
+    ("2560 x 1440 (QHD)", 2560, 1440),
+    ("3840 x 2160 (4K UHD)", 3840, 2160),
+)
 
 # The runtime's own cap was raised 4 -> 8 (tuning/patches/0003), but measurement
 # says 8x is not usable: it allocates and reports "internal scale 8x", then
@@ -37,14 +48,28 @@ class Settings:
 
     # --- video ------------------------------------------------------------
     renderer: str = "opengl"
-    aspect: str = "4:3"
+    aspect: str = "16:9"
     # Tri-state, not a bool: 0 windowed, 1 borderless desktop, 2 exclusive.
     # Alt+Enter / Ctrl+F also toggle this at runtime.
     fullscreen_mode: int = 0
-    # 0 = let the runtime choose. Otherwise pins the window width; the loader
-    # accepts 640..7680, so 3840 gives a 4K-wide window.
+    # 0/0 = let the runtime choose. Otherwise these pin the output canvas in
+    # physical pixels; unlike the old width-only setting, height is not inferred
+    # from the content aspect.
     window_width: int = 0
+    window_height: int = 0
     integer_scaling: bool = False
+
+    # Which widescreen implementation to use when aspect != 4:3.
+    #
+    # False -> GTE X-squash + stretched present. This is the classic
+    #   DuckStation/Beetle widescreen hack: squash the projection horizontally,
+    #   present stretched, net result is a genuinely wider field of view. Works
+    #   on any title with no per-game data.
+    # True  -> "native-wide", which renders extra columns instead of squashing.
+    #   Higher quality in principle, but it needs per-game viewport data; with
+    #   none, nw_extra stays 0 and NOTHING widens. That is the framework
+    #   default and why widescreen silently did nothing on Crash 2.
+    widescreen_native_wide: bool = False
 
     # --- image quality (settings.toml only - no env override exists) -------
     texture_filter: str = "nearest"     # nearest | bilinear
@@ -118,7 +143,7 @@ class Settings:
         if self.renderer not in RENDERERS:
             self.renderer = "opengl"
         if self.aspect not in ASPECTS:
-            self.aspect = "4:3"
+            self.aspect = "16:9"
         # The runtime hard-clamps supersampling to SW_MAX_INTERNAL_SCALE.
         self.supersampling = max(1, min(MAX_SUPERSAMPLING, int(self.supersampling or 1)))
         self.volume = max(0, min(100, int(self.volume or 0)))
@@ -130,9 +155,20 @@ class Settings:
             self.texture_filter = "nearest"
         if self.crt_filter not in ("raw", "crt", "composite", "trinitron"):
             self.crt_filter = "raw"
-        # The loader rejects a window_width outside 640..7680; 0 means "auto".
+        # The loader rejects an output size outside these bounds; 0/0 means
+        # "auto". Migrate old width-only settings by deriving the missing height
+        # once, then persist an exact pair on the next save.
         width = int(self.window_width or 0)
-        self.window_width = width if (width == 0 or 640 <= width <= 7680) else 0
+        height = int(self.window_height or 0)
+        if width and not height:
+            num, den = (int(part) for part in self.aspect.split(":"))
+            height = round(width * den / num)
+        if width == 0:
+            height = 0
+        if not (width == 0 or (640 <= width <= 7680 and 360 <= height <= 4320)):
+            width = height = 0
+        self.window_width = width
+        self.window_height = height
         # The runtime silently ignores an interpolation target below 90.
         fps = int(self.frame_interpolation_fps or 0)
         self.frame_interpolation_fps = fps if (fps == 0 or fps >= 90) else 0

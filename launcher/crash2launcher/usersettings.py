@@ -3,7 +3,7 @@
 This is a *different* file from ``game.toml`` and a different layer: the runtime
 reads ``settings.toml`` from beside its own executable and layers it over the
 bundled game.toml, so it is where per-user display choices belong. Several
-options exist ONLY here - fullscreen mode, window width, the CRT filter and
+options exist ONLY here - fullscreen mode, output size, the CRT filter and
 texture filtering have no game.toml or environment equivalent.
 
 The schema below mirrors ``save_user_settings`` in the framework's
@@ -28,9 +28,11 @@ FULLSCREEN_WINDOWED = 0
 FULLSCREEN_BORDERLESS = 1
 FULLSCREEN_EXCLUSIVE = 2
 
-# The loader rejects a window_width outside this range.
+# The loader rejects an output size outside these ranges.
 MIN_WINDOW_WIDTH = 640
 MAX_WINDOW_WIDTH = 7680
+MIN_WINDOW_HEIGHT = 360
+MAX_WINDOW_HEIGHT = 4320
 
 
 def _vsync_name(value: int) -> str:
@@ -57,9 +59,10 @@ def render(settings: Settings) -> str:
         f"frame_interpolation = {'true' if settings.frame_interpolation else 'false'}",
         f"frame_interpolation_fps = {settings.frame_interpolation_fps}",
     ]
-    # 0 means "let the runtime pick"; only pin a width when the user asked.
-    if settings.window_width:
+    # 0/0 means "let the runtime pick"; only pin an exact pair when requested.
+    if settings.window_width and settings.window_height:
         lines.append(f"window_width      = {settings.window_width}")
+        lines.append(f"window_height     = {settings.window_height}")
     lines.append("")
     return "\n".join(lines)
 

@@ -92,14 +92,18 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # mutually exclusive, and vsync only really clocks ~60 Hz panels.
     env["PSX_VSYNC"] = str(settings.vsync)
 
-    if settings.frame_interpolation:
+    # The current high-refresh compositor is implemented by the OpenGL path.
+    # It is presentation interpolation above the game's native 59.94 Hz update,
+    # never a guest-clock multiplier.
+    if settings.frame_interpolation and settings.renderer == "opengl":
         env["PSX_FRAME_INTERPOLATION"] = "1"
         # Only 0 (follow host) or >= 90 is accepted; clamp() already enforced it.
         if settings.frame_interpolation_fps:
             env["PSX_FRAME_INTERPOLATION_FPS"] = str(settings.frame_interpolation_fps)
 
-    if settings.smooth_60fps:
-        env["PSX_SMOOTH_60FPS"] = "1"
+    # PSX_SMOOTH_60FPS blended duplicate 30 Hz frames. Crash 2 now has a guarded
+    # native 59.94 Hz title patch, so enabling that legacy blend would only blur
+    # already-distinct frames.
     if settings.frame_blend:
         env["PSX_FRAME_BLEND"] = "1"
 
@@ -170,7 +174,7 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
     config - so they must be on disk before launching:
 
     ``[video] supersampling``
-        Internal-resolution SSAA. The loader validates 1..4 and *throws* outside
+        Internal-resolution SSAA. The vendored loader validates 1..8 and *throws* outside
         that range, taking the whole config down with it, so Settings.clamp()
         enforces the bound before we ever write.
 
@@ -200,6 +204,25 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
                 "supersampling": settings.supersampling,
             },
             "controller": {"p1_device": "auto"},
+            # Crash 2 has no sprite-tag hook, so opt its fully-3D gameplay into
+            # the GTE activity detector. BIOS, FMV and full-2D screens stay 4:3
+            # inside the output canvas either way.
+            #
+            # native_wide is a MODE choice, not an on/off switch, and it is the
+            # one that decides whether widescreen does anything at all:
+            #   True  - expand the render target. Needs per-game viewport data;
+            #           Crash 2 has none, so nw_extra stays 0 and NOTHING
+            #           widens. This is the framework default.
+            #   False - GTE X-squash + stretched present, the DuckStation/Beetle
+            #           widescreen hack. Works on any title, verified widening
+            #           Crash 2 edge to edge.
+            "widescreen": {
+                "offer": True,
+                "offer_ultrawide": False,
+                "native_wide": settings.widescreen_native_wide,
+                "gte_game_mode": True,
+                "precise_nclip": True,
+            },
             # Setting overlay_autocompile_cmd is what makes the runtime consider
             # the gcc tier available at all (it gates on
             # has_overlay_autocompile_cmd && a compiler on PATH). Without it the
