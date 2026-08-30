@@ -51,6 +51,13 @@ WIDESCREEN_MODES = [
     ("Native-wide (needs per-game data)", True),
 ]
 
+# How the image fills the output canvas.
+SCALING_MODES_UI = [
+    ("Letterbox (keep shape, bars)", "letterbox"),
+    ("Stretch (fill exactly, distorts)", "stretch"),
+    ("Fill (keep shape, crop edges)", "fill"),
+]
+
 CRT_FILTERS = [
     ("Off (raw)", "raw"),
     ("CRT", "crt"),
@@ -164,6 +171,14 @@ class SettingsPage(QWidget):
                   if v == self.settings.widescreen_native_wide), 0))
         self.ws_mode.currentIndexChanged.connect(self._on_ws_mode)
 
+        self.scaling = QComboBox()
+        for label, value in SCALING_MODES_UI:
+            self.scaling.addItem(label, value)
+        self.scaling.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(SCALING_MODES_UI)
+                  if v == self.settings.scaling_mode), 0))
+        self.scaling.currentIndexChanged.connect(self._on_scaling)
+
         self._sync_output_controls()
 
         return card(
@@ -180,6 +195,7 @@ class SettingsPage(QWidget):
             row("Output resolution", self.output_resolution),
             row("Gameplay aspect", self.aspect),
             row("Widescreen mode", self.ws_mode),
+            row("Image fit", self.scaling),
             dim(
                 "The 1080p, 1440p and 4K choices are exact output canvases, "
                 "independent of the aspect - 4:3 content pillarboxes inside them. "
@@ -357,6 +373,10 @@ class SettingsPage(QWidget):
 
     def _on_ws_mode(self, index: int) -> None:
         self.settings.widescreen_native_wide = self.ws_mode.itemData(index)
+        self._touch()
+
+    def _on_scaling(self, index: int) -> None:
+        self.settings.scaling_mode = self.scaling.itemData(index)
         self._touch()
 
     def _on_output_resolution(self, index: int) -> None:

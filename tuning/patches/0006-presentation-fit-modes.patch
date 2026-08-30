@@ -1,0 +1,70 @@
+--- _build/Crash2Recomp/psxrecomp/runtime/src/gpu_gl_renderer.c.sm	2026-08-30 17:14:33.840020100 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/gpu_gl_renderer.c	2026-08-30 17:14:54.657139900 +0300
+@@ -2588,6 +2588,21 @@
+  * GTE X-squash (gte_set_display_aspect) this nets a wider field of view. */
+ static int s_aspect_num = 4, s_aspect_den = 3;
+ 
++/* How the image fills the output canvas.
++ *   0 letterbox - preserve aspect, bars on the short axis (default)
++ *   1 stretch   - fill exactly, ignoring aspect (distorts)
++ *   2 fill      - preserve aspect, scale until covered, crop the overflow
++ * Only affects presentation; nothing upstream of the final blit changes. */
++#define GL_SCALE_LETTERBOX 0
++#define GL_SCALE_STRETCH   1
++#define GL_SCALE_FILL      2
++static int s_scale_mode = GL_SCALE_LETTERBOX;
++
++void gl_renderer_set_scaling_mode(int mode) {
++    s_scale_mode = (mode == GL_SCALE_STRETCH || mode == GL_SCALE_FILL)
++                   ? mode : GL_SCALE_LETTERBOX;
++}
++
+ void gl_renderer_set_display_aspect(int num, int den) {
+     if (num <= 0 || den <= 0) { num = 4; den = 3; }
+     s_aspect_num = num; s_aspect_den = den;
+@@ -2596,8 +2611,23 @@
+ /* Letterbox: largest num:den rect centered in the drawable. */
+ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
+                                   int *x, int *y, int *w, int *h) {
++    if (s_scale_mode == GL_SCALE_STRETCH) {
++        /* Fill the canvas exactly. Distorts when the canvas aspect differs
++         * from the content aspect - that is the point of the mode. */
++        *x = 0; *y = 0; *w = ww; *h = wh;
++        return;
++    }
+     int dw = ww, dh = (ww * den) / num;
+-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
++    if (s_scale_mode == GL_SCALE_FILL) {
++        /* Cover the canvas with aspect preserved, cropping the overflow: pick
++         * the axis that leaves NO gap, i.e. the opposite choice to letterbox.
++         * The rect is allowed to exceed the window; the centring offsets go
++         * negative and the excess is clipped by the viewport. */
++        if (dh < wh) { dh = wh; dw = (wh * num) / den; }
++    } else if (dh > wh) {
++        /* Letterbox: shrink until it fits entirely. */
++        dh = wh; dw = (wh * num) / den;
++    }
+     *x = (ww - dw) / 2;
+     *y = (wh - dh) / 2;
+     *w = dw; *h = dh;
+--- _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp.sm	2026-08-30 17:14:33.879030300 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp	2026-08-30 17:16:18.351725800 +0300
+@@ -12669,6 +12669,18 @@
+      * this aspect; native-wide fills it with a genuinely wider frame (no
+      * stretch), squash mode stretches the 4:3 frame into it. */
+     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
++    /* Presentation fit. Letterbox (default) preserves the aspect with bars;
++     * "stretch" fills the canvas exactly and distorts; "fill" preserves the
++     * aspect and crops the overflow. Presentation only - nothing upstream of
++     * the final blit is affected. */
++    if (const char *e = std::getenv("PSX_SCALING_MODE")) {
++        const int mode = (std::strcmp(e, "stretch") == 0) ? 1
++                       : (std::strcmp(e, "fill") == 0)    ? 2
++                       : 0;
++        gl_renderer_set_scaling_mode(mode);
++        std::fprintf(stdout, "psxrecomp: presentation fit = %s\n",
++                     mode == 1 ? "stretch" : mode == 2 ? "fill" : "letterbox");
++    }
+     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
+          * the per-frame present path engages it at game entry. */

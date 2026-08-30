@@ -189,3 +189,28 @@ also set. Verified: a 1920x1080 canvas with 4:3 content pillarboxes correctly
 instead of forcing a 1920x1440 window.
 
 Note `settings.toml` caps `window_width` at 3840 (game.toml allows 7680).
+
+### Presentation fit modes (patch 0006)
+
+`letterbox_rect_aspect()` in gpu_gl_renderer.c always shrank the image to fit,
+so a 4:3 game on a 16:9 canvas always pillarboxed with no way to opt out. Added
+a presentation-fit mode read from `PSX_SCALING_MODE`:
+
+| mode | behaviour |
+|------|-----------|
+| `letterbox` | preserve aspect, bars on the short axis (default, unchanged) |
+| `stretch`   | fill the canvas exactly, ignoring aspect (distorts) |
+| `fill`      | preserve aspect, scale until covered, crop the overflow |
+
+Env-driven rather than a config key, so it needs no config_loader changes and
+A/Bs without a rebuild. Applied at the final blit only - nothing upstream of the
+present path is touched, which keeps it clear of the black-frame flicker class
+of bug documented in ENHANCEMENTS.md R1.
+
+### Framerate: what "59.9 fps" actually measures
+
+`[FPS] game: 59.9 fps (1.00x)` comes from `s_frame_count`, incremented in the
+**present/vblank** path, with `speed = fps / 59.94`. So it reports the vblank
+rate and that the guest runs at exactly 1.00x real PS1 speed. It does NOT say
+how often the game updates its animation - a title that renders new content
+every other vblank still shows ~60 here.

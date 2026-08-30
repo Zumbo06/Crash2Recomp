@@ -23,11 +23,29 @@ ASPECTS = ("4:3", "16:9")
 # 3D gameplay uses the title's native-wide profile.
 OUTPUT_RESOLUTIONS = (
     ("Auto (fit display)", 0, 0),
+    # 4:3 - matches the console's native shape, no pillarboxing.
+    ("960 x 720 (4:3)", 960, 720),
+    ("1440 x 1080 (4:3)", 1440, 1080),
+    ("1920 x 1440 (4:3)", 1920, 1440),
+    ("2880 x 2160 (4:3)", 2880, 2160),
+    # 16:9
     ("1280 x 720 (HD)", 1280, 720),
+    ("1600 x 900 (HD+)", 1600, 900),
     ("1920 x 1080 (Full HD)", 1920, 1080),
     ("2560 x 1440 (QHD)", 2560, 1440),
+    ("3200 x 1800 (QHD+)", 3200, 1800),
     ("3840 x 2160 (4K UHD)", 3840, 2160),
+    # 16:10
+    ("1680 x 1050 (16:10)", 1680, 1050),
+    ("1920 x 1200 (16:10)", 1920, 1200),
+    ("2560 x 1600 (16:10)", 2560, 1600),
+    # Ultrawide. settings.toml caps width at 3840, so 3440 is the practical max.
+    ("2560 x 1080 (21:9 UW)", 2560, 1080),
+    ("3440 x 1440 (21:9 UW)", 3440, 1440),
 )
+
+# How the image fills the output canvas.
+SCALING_MODES = ("letterbox", "stretch", "fill")
 
 # The runtime's own cap was raised 4 -> 8 (tuning/patches/0003), but measurement
 # says 8x is not usable: it allocates and reports "internal scale 8x", then
@@ -58,6 +76,13 @@ class Settings:
     window_width: int = 0
     window_height: int = 0
     integer_scaling: bool = False
+
+    # How the image fills the output canvas:
+    #   letterbox - preserve aspect, bars on the short axis (default, no distortion)
+    #   stretch   - fill the canvas exactly, ignoring aspect (distorts)
+    #   fill      - preserve aspect and scale until the canvas is covered,
+    #               cropping the overflow (no distortion, loses edges)
+    scaling_mode: str = "letterbox"
 
     # Which widescreen implementation to use when aspect != 4:3.
     #
@@ -155,6 +180,8 @@ class Settings:
             self.texture_filter = "nearest"
         if self.crt_filter not in ("raw", "crt", "composite", "trinitron"):
             self.crt_filter = "raw"
+        if self.scaling_mode not in SCALING_MODES:
+            self.scaling_mode = "letterbox"
         # The loader rejects an output size outside these bounds; 0/0 means
         # "auto". Migrate old width-only settings by deriving the missing height
         # once, then persist an exact pair on the next save.
