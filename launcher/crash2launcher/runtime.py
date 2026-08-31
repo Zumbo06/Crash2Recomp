@@ -121,6 +121,14 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # switching back actually take effect.
     env["PSX_SCALING_MODE"] = settings.scaling_mode
 
+    # Overscan crop, in PS1 scanlines out of 240. Only emitted when non-zero so
+    # an untouched setting cannot alter the picture.
+    if any((settings.overscan_top, settings.overscan_bottom,
+            settings.overscan_left, settings.overscan_right)):
+        env["PSX_OVERSCAN_CROP"] = ",".join(str(v) for v in (
+            settings.overscan_top, settings.overscan_bottom,
+            settings.overscan_left, settings.overscan_right))
+
     return env
 
 

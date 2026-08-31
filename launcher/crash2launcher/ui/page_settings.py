@@ -51,11 +51,23 @@ WIDESCREEN_MODES = [
     ("Native-wide (needs per-game data)", True),
 ]
 
+# Overscan crop presets, in PS1 scanlines out of 240 (symmetric top/bottom).
+# Many PS1 titles draw fewer than 240 lines and leave the rest genuinely black;
+# those bars are part of the image and survive every scaling mode.
+OVERSCAN_PRESETS = [
+    ("None (0)", 0),
+    ("Slight (4)", 4),
+    ("Standard (8)", 8),
+    ("Strong (12)", 12),
+    ("Maximum (16)", 16),
+]
+
 # How the image fills the output canvas.
 SCALING_MODES_UI = [
     ("Letterbox (keep shape, bars)", "letterbox"),
     ("Stretch (fill exactly, distorts)", "stretch"),
     ("Fill (keep shape, crop edges)", "fill"),
+    ("Fit width (no side bars, bars top/bottom)", "fit_width"),
 ]
 
 CRT_FILTERS = [
@@ -171,6 +183,14 @@ class SettingsPage(QWidget):
                   if v == self.settings.widescreen_native_wide), 0))
         self.ws_mode.currentIndexChanged.connect(self._on_ws_mode)
 
+        self.overscan = QComboBox()
+        for label, value in OVERSCAN_PRESETS:
+            self.overscan.addItem(label, value)
+        self.overscan.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(OVERSCAN_PRESETS)
+                  if v == self.settings.overscan_top), 0))
+        self.overscan.currentIndexChanged.connect(self._on_overscan)
+
         self.scaling = QComboBox()
         for label, value in SCALING_MODES_UI:
             self.scaling.addItem(label, value)
@@ -196,6 +216,7 @@ class SettingsPage(QWidget):
             row("Gameplay aspect", self.aspect),
             row("Widescreen mode", self.ws_mode),
             row("Image fit", self.scaling),
+            row("Overscan crop", self.overscan),
             dim(
                 "The 1080p, 1440p and 4K choices are exact output canvases, "
                 "independent of the aspect - 4:3 content pillarboxes inside them. "
@@ -373,6 +394,13 @@ class SettingsPage(QWidget):
 
     def _on_ws_mode(self, index: int) -> None:
         self.settings.widescreen_native_wide = self.ws_mode.itemData(index)
+        self._touch()
+
+    def _on_overscan(self, index: int) -> None:
+        # Symmetric top/bottom: that is where PS1 blank scanlines live.
+        value = self.overscan.itemData(index)
+        self.settings.overscan_top = value
+        self.settings.overscan_bottom = value
         self._touch()
 
     def _on_scaling(self, index: int) -> None:

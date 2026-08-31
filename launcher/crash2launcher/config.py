@@ -45,7 +45,7 @@ OUTPUT_RESOLUTIONS = (
 )
 
 # How the image fills the output canvas.
-SCALING_MODES = ("letterbox", "stretch", "fill")
+SCALING_MODES = ("letterbox", "stretch", "fill", "fit_width")
 
 # The runtime's own cap was raised 4 -> 8 (tuning/patches/0003), but measurement
 # says 8x is not usable: it allocates and reports "internal scale 8x", then
@@ -82,7 +82,20 @@ class Settings:
     #   stretch   - fill the canvas exactly, ignoring aspect (distorts)
     #   fill      - preserve aspect and scale until the canvas is covered,
     #               cropping the overflow (no distortion, loses edges)
+    #   fit_width - width ALWAYS spans the display; bars top/bottom when the
+    #               image is shorter, cropped when taller. Never side bars.
     scaling_mode: str = "letterbox"
+
+    # Overscan crop, in PS1 scanlines out of 240 (scale independent).
+    #
+    # Many PS1 titles draw fewer than 240 lines and leave the rest genuinely
+    # black. Those bars are part of the IMAGE, not the presentation, so no
+    # scaling mode removes them - the source rect has to be trimmed instead.
+    # Crash 2 leaves roughly 8 lines top and bottom.
+    overscan_top: int = 0
+    overscan_bottom: int = 0
+    overscan_left: int = 0
+    overscan_right: int = 0
 
     # Which widescreen implementation to use when aspect != 4:3.
     #
@@ -182,6 +195,10 @@ class Settings:
             self.crt_filter = "raw"
         if self.scaling_mode not in SCALING_MODES:
             self.scaling_mode = "letterbox"
+        # Cropping more than a quarter of the frame is a mistake, not a setting.
+        for name in ("overscan_top", "overscan_bottom",
+                     "overscan_left", "overscan_right"):
+            setattr(self, name, max(0, min(60, int(getattr(self, name) or 0))))
         # The loader rejects an output size outside these bounds; 0/0 means
         # "auto". Migrate old width-only settings by deriving the missing height
         # once, then persist an exact pair on the next save.
