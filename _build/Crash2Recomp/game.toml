@@ -1,0 +1,37 @@
+[game]
+name = "Crash Bandicoot 2"
+id = "SCUS-94154"
+exe = "input/SCUS_941.54"
+disc = "c:/Users/yhgoz/Desktop/Crash2_Rcomp/Crash Bandicoot 2 - Cortex Strikes Back (USA)/Crash Bandicoot 2 - Cortex Strikes Back (USA).cue"
+load_address = "0x80010000"
+entry_pc = "0x80049B2C"
+text_size = "0x50000"
+stack_base = "0x801FFFF0"
+
+[recompiler]
+seeds = "seeds/functions.txt"
+bios_config = "psxrecomp/bios/OpenBIOS.toml"
+strict = true
+out_dir = "generated"
+
+[runtime]
+window_title = "Crash Bandicoot 2 Recompiled"
+bios_hle = false
+overlay_cache = true
+overlay_backend = "auto"
+overlay_autocompile_cmd = "\"C:\\Python313\\python.exe\" \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\psxrecomp-src\\tools\\compile_overlays.py\" --captures \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\build-clang\\overlay_captures.json\" --game-toml \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\game.toml\" --recompiler \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\psxrecomp-cli\\libexec\\psxrecomp-game.exe\" --runtime-include \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\psxrecomp\\runtime\\include\" --out-dir \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\build-clang\\cache\""
+
+[video]
+renderer = "opengl"
+supersampling = 5
+aspect_ratio = "4:3"
+
+[controller]
+p1_device = "auto"
+
+[widescreen]
+offer = true
+offer_ultrawide = false
+native_wide = true
+gte_game_mode = true
+precise_nclip = true

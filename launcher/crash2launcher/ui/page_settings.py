@@ -34,6 +34,21 @@ from ..config import (
 )
 from .common import card, dim, heading, row, section
 
+# Crash 2's own framebuffer, measured from the runtime's gpu_state. The
+# supersampling multiplier scales THIS, not the 320x240 the PS1 is usually
+# quoted at, so the internal resolution is wider than a naive label suggests.
+GAME_FB_W, GAME_FB_H = 512, 240
+
+# Where the integer multiples land against familiar display resolutions.
+# Nothing here hits 1920x1080 or 2560x1440 exactly: those need non-uniform
+# scaling (3.75x/4.5x and 5x/6x respectively) and the renderer's set_scale
+# takes a single integer.
+SCALE_NOTES = {
+    3: "- 720p height",
+    5: "- 2560 wide, matches a 1440p panel horizontally",
+    6: "- 1440p height, exceeds 1440p width",
+}
+
 FULLSCREEN_MODES = [
     ("Windowed", 0),
     ("Borderless fullscreen (desktop resolution)", 1),
@@ -141,9 +156,17 @@ class SettingsPage(QWidget):
 
         self.scale = QComboBox()
         for n in range(1, MAX_SUPERSAMPLING + 1):
-            label = f"{n}x  ({320 * n}x{240 * n} internal)"
+            # Label the resolution this ACTUALLY produces. The multiplier
+            # applies to the game's own framebuffer, which Crash 2 runs at
+            # 512x240 - not the 320x240 the PS1 is usually quoted at, so a
+            # 320-based label understates the width by 60%.
+            label = "%dx  (%dx%d internal)" % (
+                n, GAME_FB_W * n, GAME_FB_H * n)
             if n == RECOMMENDED_SUPERSAMPLING:
                 label += "   - recommended"
+            note = SCALE_NOTES.get(n)
+            if note:
+                label += "   " + note
             self.scale.addItem(label, n)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
         self.scale.currentIndexChanged.connect(self._on_scale)

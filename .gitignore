@@ -78,11 +78,26 @@ toolchain/
 # --------------------------------------------------------------------------
 # 3. Build output
 # --------------------------------------------------------------------------
-# Ignore the scratch build area, but keep the scripts we actually wrote.
-# (Pattern must be `_build/*`, not `_build/`, for the negations to apply.)
+# Ignore the scratch build area, but keep the scripts and the small,
+# hand-maintained project inputs someone needs to reproduce this build.
+# (Pattern must be `_build/*`, not `_build/`, for the negations to apply, and
+# each parent directory has to be re-included before its children.)
 _build/*
 !_build/*.ps1
+!_build/*.py
 !_build/padprobe.c
+
+# The generated project: keep ONLY the reproducible inputs. Everything derived
+# from the disc stays out - see section 1.
+!_build/Crash2Recomp/
+_build/Crash2Recomp/*
+!_build/Crash2Recomp/game.toml
+!_build/Crash2Recomp/CMakeLists.txt
+!_build/Crash2Recomp/build.ps1
+!_build/Crash2Recomp/build.sh
+!_build/Crash2Recomp/README.md
+!_build/Crash2Recomp/seeds/
+!_build/Crash2Recomp/seeds/*.txt
 
 build/
 build-clang/

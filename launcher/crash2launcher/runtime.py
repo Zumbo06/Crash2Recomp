@@ -62,12 +62,44 @@ def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
     env = _build_env(settings)
     env.update(overlay_env(layout, settings))
 
+    program = _runtime_for(layout, settings)
+
     return LaunchPlan(
-        program=layout.runtime_exe,
+        program=program,
         args=args,
-        cwd=layout.runtime_exe.parent,
+        cwd=program.parent,
         env=env,
     )
+
+
+def _settings_targets(layout: Layout) -> list[Path]:
+    """Every build directory that could be launched, newest-relevant first.
+
+    Deduplicated and existence-checked, so this stays correct whether or not the
+    diagnostics tree has been built.
+    """
+    dirs: list[Path] = []
+    for candidate in (layout.runtime_exe.parent,
+                      layout.project / "build-clang",
+                      layout.project / "build-debugtools"):
+        if candidate.is_dir() and candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
+
+
+def _runtime_for(layout: Layout, settings: Settings) -> Path:
+    """Pick the binary that can actually honour the requested settings.
+
+    The release build is compiled with PSX_NO_DEBUG_TOOLS, which strips the TCP
+    debug server entirely - so ``--debug-port`` is accepted and then silently
+    listens on nothing. Asking for a debug port has to mean the debugtools
+    build, or the setting is a trap.
+    """
+    if settings.debug_port:
+        debug_exe = layout.project / "build-debugtools" / layout.runtime_exe.name
+        if debug_exe.is_file():
+            return debug_exe
+    return layout.runtime_exe
 
 
 def _build_env(settings: Settings) -> dict[str, str]:
@@ -120,6 +152,19 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # runtime default, so we still pass it explicitly to make a relaunch after
     # switching back actually take effect.
     env["PSX_SCALING_MODE"] = settings.scaling_mode
+
+    # How the internal buffer is resampled down to the window.
+    env["PSX_PRESENT_FILTER"] = settings.present_filter
+
+    # PGXP sub-pixel geometry. These have settings.toml equivalents, but the
+    # env vars let a relaunch A/B them without rewriting config.
+    if settings.geometry_correction:
+        env["PSX_GEOMETRY_CORRECTION"] = "1"
+        # Coverage must match the correction, or vertices pop between precise
+        # and rounded positions - see Settings.pgxp_cpu_mode.
+        env["PSX_PGXP_CPU_MODE"] = "1" if settings.pgxp_cpu_mode else "0"
+    if settings.perspective_texturing:
+        env["PSX_PERSPECTIVE_TEXTURING"] = "1"
 
     # Overscan crop, in PS1 scanlines out of 240. Only emitted when non-zero so
     # an untouched setting cannot alter the picture.
@@ -205,9 +250,17 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
         return
 
     # settings.toml sits beside the runtime executable and layers over
-    # game.toml. Fullscreen mode, window width, CRT and texture filtering exist
+    # game.toml. Fullscreen mode, window size, CRT and texture filtering exist
     # ONLY here - there is no game.toml key or env override for them.
-    usersettings.save(layout.runtime_exe.parent / "settings.toml", settings)
+    #
+    # The runtime reads it from ITS OWN exe directory, and we may launch either
+    # tree (a debug port selects build-debugtools). Writing only next to the
+    # release binary meant that, with a debug port set, every setting landed in
+    # a file the running game never opened - so nothing applied at all. Write to
+    # every tree that exists; they are alternate builds of one game, not
+    # independent installs.
+    for build_dir in _settings_targets(layout):
+        usersettings.save(build_dir / "settings.toml", settings)
 
     gametoml.update(
         layout.game_toml,

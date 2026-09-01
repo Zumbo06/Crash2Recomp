@@ -59,12 +59,64 @@ def render(settings: Settings) -> str:
         f"frame_interpolation = {'true' if settings.frame_interpolation else 'false'}",
         f"frame_interpolation_fps = {settings.frame_interpolation_fps}",
     ]
-    # 0/0 means "let the runtime pick"; only pin an exact pair when requested.
-    if settings.window_width and settings.window_height:
-        lines.append(f"window_width      = {settings.window_width}")
-        lines.append(f"window_height     = {settings.window_height}")
+    width, height = settings.window_width, settings.window_height
+    if not (width and height) and settings.fullscreen_mode == FULLSCREEN_WINDOWED:
+        # "Auto" must not reach the runtime in windowed mode. With no explicit
+        # width the runtime calls SDL_MaximizeWindow(), and a maximised window
+        # on a single-monitor desktop is indistinguishable from fullscreen - so
+        # picking Windowed + Auto looked like the mode was ignored. Resolve Auto
+        # to a real window that leaves the desktop visible.
+        width, height = _auto_windowed_size(settings.aspect)
+
+    if width and height:
+        lines.append(f"window_width      = {width}")
+        lines.append(f"window_height     = {height}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _auto_windowed_size(aspect: str = "16:9") -> tuple[int, int]:
+    """A sensible windowed size: the largest box of the right SHAPE that fits
+    in ~80% of the desktop.
+
+    Deriving width and height independently from the desktop produces the wrong
+    shape (a 640x640 square on one test box), so fit the configured aspect
+    instead and let the short axis follow. Falls back to a 1280-wide window when
+    Qt cannot be queried - a frozen build, or no display attached.
+    """
+    try:
+        num, den = (int(part) for part in aspect.split(":"))
+        if num <= 0 or den <= 0:
+            raise ValueError
+    except Exception:
+        num, den = 16, 9
+
+    # Default to a 1600x900-class window. Only trust a queried screen when it
+    # is plausibly a real desktop: the offscreen Qt platform reports a tiny
+    # surface, which used to collapse this to the 640x480 minimum.
+    avail_w, avail_h = 1600, 900
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            if area.width() >= 1024 and area.height() >= 768:
+                avail_w = int(area.width() * 0.8)
+                avail_h = int(area.height() * 0.8)
+    except Exception:
+        pass
+
+    # Fit the aspect box inside the available area.
+    width = avail_w
+    height = width * den // num
+    if height > avail_h:
+        height = avail_h
+        width = height * num // den
+
+    width = max(MIN_WINDOW_WIDTH, min(MAX_WINDOW_WIDTH, width))
+    height = max(MIN_WINDOW_HEIGHT, min(MAX_WINDOW_HEIGHT, height))
+    return width, height
 
 
 def save(path: Path, settings: Settings) -> None:

@@ -112,9 +112,25 @@ class Settings:
     # --- image quality (settings.toml only - no env override exists) -------
     texture_filter: str = "nearest"     # nearest | bilinear
     crt_filter: str = "raw"             # raw | crt | composite | trinitron
+
+    # Present-time reconstruction, i.e. how the internal buffer is resampled
+    # down to the window. "plain" is a single tap that averages only 2x2 texels
+    # no matter how far the image is being shrunk, so most supersampled detail
+    # is thrown away and the surviving samples shift under motion - the usual
+    # cause of texture shimmer at high internal resolution. "bicubic" is the
+    # Catmull-Rom path already in the present shader.
+    present_filter: str = "bicubic"   # plain | sharp | bicubic
     antialiasing: bool = False
     geometry_correction: bool = False
     perspective_texturing: bool = False
+
+    # PGXP tier-2: propagate sub-pixel precision through CPU arithmetic, not
+    # just the GTE. The framework defaults this OFF, which only bounds
+    # *coverage* - but partial coverage is what causes geometry to pop between
+    # precise and rounded positions on an engine like Crash 2 that does a lot of
+    # its transform work on the CPU. Enable it whenever geometry_correction is
+    # on, or the correction is worse than leaving it off.
+    pgxp_cpu_mode: bool = True
 
     # Internal-resolution supersampling (SSAA). Goes into game.toml as
     # [runtime] video_supersampling, NOT an env var. The runtime clamps to
@@ -193,6 +209,8 @@ class Settings:
             self.texture_filter = "nearest"
         if self.crt_filter not in ("raw", "crt", "composite", "trinitron"):
             self.crt_filter = "raw"
+        if self.present_filter not in ("plain", "sharp", "bicubic"):
+            self.present_filter = "bicubic"
         if self.scaling_mode not in SCALING_MODES:
             self.scaling_mode = "letterbox"
         # Cropping more than a quarter of the frame is a mistake, not a setting.
