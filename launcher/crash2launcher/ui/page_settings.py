@@ -376,13 +376,43 @@ class SettingsPage(QWidget):
         self.merge_input.setChecked(self.settings.merge_all_input)
         self.merge_input.toggled.connect(self._on_merge)
 
+        self.quick_save_slot = QComboBox()
+        for n in range(12):
+            self.quick_save_slot.addItem("Slot %d" % (n + 1), n)
+        self.quick_save_slot.setCurrentIndex(self.settings.quick_save_slot)
+        self.quick_save_slot.currentIndexChanged.connect(self._on_quick_slot)
+
+        keys = QLabel(
+            "<table cellpadding='3'>"
+            "<tr><td><b>F5</b></td><td>Quick save</td></tr>"
+            "<tr><td><b>F9</b></td><td>Quick load</td></tr>"
+            "<tr><td><b>F7</b></td><td>Save state menu (all slots)</td></tr>"
+            "<tr><td><b>F8</b></td><td>Rewind</td></tr>"
+            "<tr><td><b>Alt+Enter</b></td><td>Toggle fullscreen</td></tr>"
+            "<tr><td><b>Tab</b></td><td>Fast-forward (hold)</td></tr>"
+            "</table>"
+        )
+        keys.setTextFormat(Qt.TextFormat.RichText)
+
         return self._wrap(
             card(
-                section("Input"),
+                section("Controls"),
                 self.merge_input,
                 dim("Leave this on. A release build of the runtime pins player 1 "
                     "to \"keyboard\" and never opens a gamepad, because it "
                     "expects its own built-in launcher to assign a device."),
+            ),
+            card(
+                section("Save states"),
+                row("Quick save slot", self.quick_save_slot),
+                dim("The quick keys act on this slot. It is an ordinary slot, so "
+                    "a quick save still shows in the F7 menu with its thumbnail - "
+                    "point it somewhere else if you want your manual saves left "
+                    "untouched."),
+            ),
+            card(
+                section("Keys while playing"),
+                keys,
             ),
         )
 
@@ -576,6 +606,10 @@ class SettingsPage(QWidget):
 
     def _on_merge(self, on: bool) -> None:
         self.settings.merge_all_input = on
+        self._touch()
+
+    def _on_quick_slot(self, index: int) -> None:
+        self.settings.quick_save_slot = self.quick_save_slot.itemData(index)
         self._touch()
 
     def _on_vsync(self, index: int) -> None:

@@ -180,6 +180,11 @@ class Settings:
     # and never opens a gamepad, so a pad would appear dead.
     merge_all_input: bool = True
 
+    # Which numbered savestate slot the quick save/load keys use. It is an
+    # ordinary slot, so a quick save still appears in the in-game slot menu
+    # with its thumbnail - the keys are a shortcut, not a separate store.
+    quick_save_slot: int = 0
+
     # --- mods -------------------------------------------------------------
     enabled_mods: list[str] = field(default_factory=list)
 
@@ -234,6 +239,8 @@ class Settings:
         fps = int(self.frame_interpolation_fps or 0)
         self.frame_interpolation_fps = fps if (fps == 0 or fps >= 90) else 0
         self.debug_port = max(0, min(65535, int(self.debug_port or 0)))
+        # The runtime exposes 12 slots.
+        self.quick_save_slot = max(0, min(11, int(self.quick_save_slot or 0)))
         return self
 
 

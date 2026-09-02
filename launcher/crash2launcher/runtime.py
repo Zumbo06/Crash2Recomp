@@ -156,6 +156,9 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # How the internal buffer is resampled down to the window.
     env["PSX_PRESENT_FILTER"] = settings.present_filter
 
+    # Slot for the quick save/load keys (F5 / F9 by default).
+    env["PSX_QUICK_SLOT"] = str(settings.quick_save_slot)
+
     # PGXP sub-pixel geometry. These have settings.toml equivalents, but the
     # env vars let a relaunch A/B them without rewriting config.
     if settings.geometry_correction:
