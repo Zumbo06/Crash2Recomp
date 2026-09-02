@@ -47,12 +47,11 @@ OUTPUT_RESOLUTIONS = (
 # How the image fills the output canvas.
 SCALING_MODES = ("letterbox", "stretch", "fill", "fit_width")
 
-# The runtime's own cap was raised 4 -> 8 (tuning/patches/0003), but measurement
-# says 8x is not usable: it allocates and reports "internal scale 8x", then
-# produces no frames at all. 6x averages 60 fps with occasional dips to ~53;
-# 5x is clean (min 59.6 over 68 samples). So the UI stops at 6 and treats 5 as
-# the sweet spot. The config loader throws above the runtime cap, so this must
-# never exceed it.
+# The runtime's own cap was raised 4 -> 8 (tuning/patches/0003). The UI stops
+# at 6: on the hardware this was developed against, 8x allocated and reported
+# "internal scale 8x" but then produced no frames at all, which looks like an
+# implementation ceiling rather than a performance one. The config loader
+# throws above the runtime cap, so this must never exceed it.
 MAX_SUPERSAMPLING = 6
 RECOMMENDED_SUPERSAMPLING = 5
 
@@ -251,6 +250,142 @@ def load(path: Path) -> Settings:
 
     known = {f.name for f in fields(Settings)}
     return Settings(**{k: v for k, v in raw.items() if k in known}).clamp()
+
+
+# --------------------------------------------------------------------------
+# Diagnostics
+#
+# These change the runtime's behaviour for MEASUREMENT, not for playing, and
+# some of them actively degrade the game. `audio_legacy` disables the audio
+# bridge (no rate control, no fill target) and produced 146 underruns in a
+# 20-second window - audible gaps that looked exactly like an SPU bug and cost
+# a long investigation. It was exposed next to Volume as though it were an
+# ordinary quality option.
+#
+# Nothing here belongs on a normal settings page. The UI keeps them on their own
+# page behind a warning, and the Play page reports whenever any is active.
+# --------------------------------------------------------------------------
+DIAGNOSTIC_SETTINGS: dict[str, str] = {
+    "audio_legacy": (
+        "Disables the audio bridge and falls back to blind queue pushing - "
+        "no rate control, no buffer target. Causes audible dropouts."
+    ),
+    "audio_shadow": (
+        "Substitutes an alternate float SPU mix. Changes how the game sounds."
+    ),
+    "debug_port": (
+        "Opens the TCP debug server, which only exists in the debugtools build "
+        "- so the launcher runs that build instead of the release one, with "
+        "tracing overhead."
+    ),
+    "fps_telemetry": (
+        "Prints per-second frame statistics to the log. Harmless, but noisy."
+    ),
+}
+
+
+def _diagnostic_default(name: str) -> Any:
+    """The value a diagnostic has when it is switched off."""
+    for f in fields(Settings):
+        if f.name == name:
+            return f.default
+    return None
+
+
+def active_diagnostics(settings: Settings) -> list[str]:
+    """Diagnostics currently deviating from their default (i.e. switched on)."""
+    return [
+        name
+        for name in DIAGNOSTIC_SETTINGS
+        if getattr(settings, name, None) != _diagnostic_default(name)
+    ]
+
+
+def reset_diagnostics(settings: Settings) -> Settings:
+    """Return every diagnostic to its default. One click back to normal play."""
+    for name in DIAGNOSTIC_SETTINGS:
+        setattr(settings, name, _diagnostic_default(name))
+    return settings
+
+
+# --------------------------------------------------------------------------
+# Presets
+#
+# Gameplay settings only - never diagnostics, so applying a preset can never
+# switch on something that degrades the game.
+# --------------------------------------------------------------------------
+PRESETS: dict[str, dict[str, Any]] = {
+    "Authentic": {
+        "supersampling": 1,
+        "aspect": "4:3",
+        "scaling_mode": "letterbox",
+        "texture_filter": "nearest",
+        "present_filter": "plain",
+        "crt_filter": "raw",
+        "antialiasing": False,
+        "frame_interpolation": False,
+        "frame_interpolation_fps": 0,
+        "overscan_top": 0,
+        "overscan_bottom": 0,
+        "geometry_correction": False,
+        "perspective_texturing": False,
+    },
+    "Enhanced": {
+        "supersampling": RECOMMENDED_SUPERSAMPLING,
+        "aspect": "16:9",
+        "widescreen_native_wide": False,
+        "scaling_mode": "fill",
+        "texture_filter": "bilinear",
+        "present_filter": "bicubic",
+        "crt_filter": "raw",
+        "antialiasing": True,
+        "frame_interpolation": True,
+        "frame_interpolation_fps": 0,
+        "overscan_top": 16,
+        "overscan_bottom": 16,
+        # PGXP stays off: on this engine it trades texture shimmer for
+        # geometry pop-in and seam lines.
+        "geometry_correction": False,
+        "perspective_texturing": False,
+    },
+    "Performance": {
+        "supersampling": 2,
+        "aspect": "16:9",
+        "widescreen_native_wide": False,
+        "scaling_mode": "fill",
+        "texture_filter": "nearest",
+        "present_filter": "plain",
+        "crt_filter": "raw",
+        "antialiasing": False,
+        "frame_interpolation": False,
+        "frame_interpolation_fps": 0,
+        "overscan_top": 16,
+        "overscan_bottom": 16,
+        "geometry_correction": False,
+        "perspective_texturing": False,
+    },
+}
+
+PRESET_NOTES: dict[str, str] = {
+    "Authentic": "Original 4:3 presentation, unfiltered - as the console output it.",
+    "Enhanced": "Widescreen, sharper image, smoother motion. A good default.",
+    "Performance": "Lower internal resolution for weaker GPUs.",
+}
+
+
+def apply_preset(settings: Settings, name: str) -> Settings:
+    """Apply a preset over the current settings, leaving diagnostics alone."""
+    for key, value in PRESETS.get(name, {}).items():
+        setattr(settings, key, value)
+    return settings.clamp()
+
+
+def matching_preset(settings: Settings) -> str | None:
+    """Which preset the current settings correspond to, if any."""
+    for name, values in PRESETS.items():
+        if all(getattr(settings, k, None) == v for k, v in values.items()):
+            return name
+    return None
 
 
 def save(path: Path, settings: Settings) -> None:

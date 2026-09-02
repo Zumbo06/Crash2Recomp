@@ -320,6 +320,43 @@ def effective_scale_from_log(line: str) -> int | None:
 
 _SCALE_RE = re.compile(r"internal scale\s+(\d+)x")
 
+# "psxrecomp: widescreen 16:9 (GTE X-squash + stretched present; ...)"
+_WIDESCREEN_RE = re.compile(r"widescreen\s+(\d+:\d+)")
+# "psxrecomp: presentation fit = fill"
+_FIT_RE = re.compile(r"presentation fit = (\S+)")
+# "psxrecomp: overlay autocompile enabled (gcc); ..."
+_OVERLAY_RE = re.compile(r"overlay autocompile enabled \((\w+)\)")
+# "GL temporal frame blending enabled: 240.0 presents/s ..."
+_BLEND_RE = re.compile(r"frame blending enabled:\s*([\d.]+)\s*presents/s")
+
+
+def observed_from_log(line: str) -> tuple[str, str] | None:
+    """Pull a (label, value) the runtime reports about itself.
+
+    The launcher can only ever show what it REQUESTED; these are what the
+    runtime actually did. Where the two differ - the renderer clamps the
+    internal scale, widescreen falls back, the overlay tier drops to the
+    interpreter - the log is the only trustworthy source.
+    """
+    m = _SCALE_RE.search(line)
+    if m:
+        return ("Internal scale", m.group(1) + "x")
+    m = _WIDESCREEN_RE.search(line)
+    if m:
+        return ("Widescreen", m.group(1))
+    m = _FIT_RE.search(line)
+    if m:
+        return ("Image fit", m.group(1))
+    m = _OVERLAY_RE.search(line)
+    if m:
+        return ("Overlay tier", m.group(1))
+    m = _BLEND_RE.search(line)
+    if m:
+        return ("Presents/s", m.group(1))
+    if "overlay gaps -> interpreter" in line:
+        return ("Overlay tier", "interpreter (slow)")
+    return None
+
 
 def _resolve_disc(layout: Layout, settings: Settings) -> Path | None:
     if settings.disc_path and Path(settings.disc_path).is_file():

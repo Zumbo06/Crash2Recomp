@@ -1,25 +1,28 @@
-"""Settings - every knob that affects a run.
+"""Settings - presets on top, one section at a time below.
 
-This page exists to make A/B testing fast, so it is organised by *what you are
-testing*, not by Qt convenience. Each control writes straight back into the
-Settings dataclass and reports the change, which lets the Play page light up its
-Relaunch button.
+Everything used to live on a single scrolling page with roughly thirty controls
+stacked in six cards, which made it hard to find anything and easy to change
+something by accident. Now a preset covers the common cases in one click, and
+each section holds a handful of related controls.
 
-Two delivery routes are deliberately visible here because they behave
-differently:
-
-* **environment variables** - applied on the next launch, no files touched
-* **game.toml** - supersampling only; the runtime has no env override for it
+Diagnostics are NOT here: they live on the Advanced page, because one of them
+(the legacy audio path) degrades playback and was previously indistinguishable
+from a quality option.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
     QScrollArea,
-    QSpinBox,
+    QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,26 +31,35 @@ from ..config import (
     ASPECTS,
     MAX_SUPERSAMPLING,
     OUTPUT_RESOLUTIONS,
-    RECOMMENDED_SUPERSAMPLING,
+    PRESET_NOTES,
+    PRESETS,
     RENDERERS,
     Settings,
+    apply_preset,
+    matching_preset,
 )
 from .common import card, dim, heading, row, section
+from .theme import ACCENT, TEXT_DIM
 
 # Crash 2's own framebuffer, measured from the runtime's gpu_state. The
 # supersampling multiplier scales THIS, not the 320x240 the PS1 is usually
 # quoted at, so the internal resolution is wider than a naive label suggests.
 GAME_FB_W, GAME_FB_H = 512, 240
 
-# Where the integer multiples land against familiar display resolutions.
-# Nothing here hits 1920x1080 or 2560x1440 exactly: those need non-uniform
-# scaling (3.75x/4.5x and 5x/6x respectively) and the renderer's set_scale
-# takes a single integer.
-SCALE_NOTES = {
-    3: "- 720p height",
-    5: "- 2560 wide, matches a 1440p panel horizontally",
-    6: "- 1440p height, exceeds 1440p width",
-}
+def scale_cost(n: int) -> str:
+    """A GPU-cost hint that holds on any machine.
+
+    Deliberately relative, not absolute: the right ceiling depends on the GPU,
+    the display and the level, so quoting frame rates measured on one machine
+    would mislead everyone else.
+    """
+    if n <= 2:
+        return "very light"
+    if n <= 4:
+        return "moderate"
+    if n == 5:
+        return "demanding"
+    return "very demanding"
 
 FULLSCREEN_MODES = [
     ("Windowed", 0),
@@ -56,19 +68,28 @@ FULLSCREEN_MODES = [
 ]
 
 TEXTURE_FILTERS = [
-    ("Nearest (sharp, authentic)", "nearest"),
-    ("Bilinear (smooth)", "bilinear"),
+    ("Nearest - sharp, authentic", "nearest"),
+    ("Bilinear - smoother, less texel crawl", "bilinear"),
 ]
 
-# Which widescreen implementation runs when the aspect is not 4:3.
+PRESENT_FILTERS = [
+    ("Bicubic - best when downsampling", "bicubic"),
+    ("Sharp bilinear", "sharp"),
+    ("Plain - single tap", "plain"),
+]
+
 WIDESCREEN_MODES = [
-    ("Projection hack (works on any title)", False),
-    ("Native-wide (needs per-game data)", True),
+    ("Projection hack - works on any title", False),
+    ("Native-wide - needs per-game data", True),
 ]
 
-# Overscan crop presets, in PS1 scanlines out of 240 (symmetric top/bottom).
-# Many PS1 titles draw fewer than 240 lines and leave the rest genuinely black;
-# those bars are part of the image and survive every scaling mode.
+SCALING_MODES_UI = [
+    ("Letterbox - keep shape, bars", "letterbox"),
+    ("Fill - keep shape, crop edges", "fill"),
+    ("Fit width - no side bars", "fit_width"),
+    ("Stretch - fill exactly, distorts", "stretch"),
+]
+
 OVERSCAN_PRESETS = [
     ("None (0)", 0),
     ("Slight (4)", 4),
@@ -77,22 +98,13 @@ OVERSCAN_PRESETS = [
     ("Maximum (16)", 16),
 ]
 
-# How the image fills the output canvas.
-SCALING_MODES_UI = [
-    ("Letterbox (keep shape, bars)", "letterbox"),
-    ("Stretch (fill exactly, distorts)", "stretch"),
-    ("Fill (keep shape, crop edges)", "fill"),
-    ("Fit width (no side bars, bars top/bottom)", "fit_width"),
-]
-
 CRT_FILTERS = [
-    ("Off (raw)", "raw"),
+    ("Off", "raw"),
     ("CRT", "crt"),
     ("Composite", "composite"),
     ("Trinitron", "trinitron"),
 ]
 
-# label -> stored value
 VSYNC_MODES = [
     ("Off - wall-clock pacer (best on high-refresh)", 0),
     ("On - vsync (only clocks ~60 Hz panels)", 1),
@@ -108,6 +120,23 @@ INTERP_TARGETS = [
     ("280 fps", 280),
 ]
 
+SECTIONS = ["Display", "Image", "Audio", "Input", "Performance"]
+
+
+def _native_resolution() -> tuple[int, int] | None:
+    """The desktop resolution of the machine running the launcher, if known."""
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            size = screen.size()
+            if size.width() > 0 and size.height() > 0:
+                return size.width(), size.height()
+    except Exception:
+        pass
+    return None
+
 
 class SettingsPage(QWidget):
     changed = Signal()
@@ -117,38 +146,87 @@ class SettingsPage(QWidget):
         self.settings = settings
         self._loading = True
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 24)
+        root.setSpacing(14)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        outer.addWidget(scroll)
-
-        body = QWidget()
-        lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 24, 28, 24)
-        lay.setSpacing(16)
-        scroll.setWidget(body)
-
-        lay.addWidget(heading(
+        root.addWidget(heading(
             "Settings",
-            "Changes apply on the next launch. Use Relaunch on the Play page to "
-            "restart with them.",
+            "Changes apply on the next launch - use Relaunch on the Play page.",
         ))
+        root.addWidget(self._preset_bar())
 
-        lay.addWidget(self._video_card())
-        lay.addWidget(self._quality_card())
-        lay.addWidget(self._pacing_card())
-        lay.addWidget(self._input_card())
-        lay.addWidget(self._audio_card())
-        lay.addWidget(self._diagnostics_card())
-        lay.addStretch(1)
+        split = QHBoxLayout()
+        split.setSpacing(16)
+        split.addWidget(self._section_list(), 0)
+
+        self.stack = QStackedWidget()
+        for builder in (self._display_page, self._image_page, self._audio_page,
+                        self._input_page, self._performance_page):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            scroll.setWidget(builder())
+            self.stack.addWidget(scroll)
+        split.addWidget(self.stack, 1)
+        root.addLayout(split, 1)
 
         self._loading = False
+        self._sync_dependent_controls()
+        self._refresh_preset_label()
 
-    # -- cards -------------------------------------------------------------
-    def _video_card(self) -> QWidget:
+    # -- chrome ------------------------------------------------------------
+    def _preset_bar(self) -> QWidget:
+        buttons = QWidget()
+        lay = QHBoxLayout(buttons)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        self.preset_buttons: dict[str, QPushButton] = {}
+        for name in PRESETS:
+            btn = QPushButton(name)
+            btn.setToolTip(PRESET_NOTES.get(name, ""))
+            btn.clicked.connect(lambda _=False, n=name: self._apply_preset(n))
+            lay.addWidget(btn)
+            self.preset_buttons[name] = btn
+
+        self.preset_lbl = QLabel()
+        self.preset_lbl.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(self.preset_lbl, 1)
+
+        return card(
+            section("Preset"),
+            dim("A starting point for the common cases. Presets never change "
+                "anything on the Advanced page."),
+            buttons,
+        )
+
+    def _section_list(self) -> QWidget:
+        box = QWidget()
+        box.setFixedWidth(150)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+
+        self.section_group = QButtonGroup(self)
+        self.section_group.setExclusive(True)
+        for i, name in enumerate(SECTIONS):
+            btn = QPushButton(name)
+            btn.setObjectName("NavButton")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.section_group.addButton(btn, i)
+            lay.addWidget(btn)
+        self.section_group.idClicked.connect(self._select_section)
+        self.section_group.button(0).setChecked(True)
+        lay.addStretch(1)
+        return box
+
+    def _select_section(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+
+    # -- sections ----------------------------------------------------------
+    def _display_page(self) -> QWidget:
         self.renderer = QComboBox()
         self.renderer.addItems(RENDERERS)
         self.renderer.setCurrentText(self.settings.renderer)
@@ -156,244 +234,278 @@ class SettingsPage(QWidget):
 
         self.scale = QComboBox()
         for n in range(1, MAX_SUPERSAMPLING + 1):
-            # Label the resolution this ACTUALLY produces. The multiplier
-            # applies to the game's own framebuffer, which Crash 2 runs at
-            # 512x240 - not the 320x240 the PS1 is usually quoted at, so a
-            # 320-based label understates the width by 60%.
-            label = "%dx  (%dx%d internal)" % (
-                n, GAME_FB_W * n, GAME_FB_H * n)
-            if n == RECOMMENDED_SUPERSAMPLING:
-                label += "   - recommended"
-            note = SCALE_NOTES.get(n)
-            if note:
-                label += "   " + note
+            label = "%dx  -  %d x %d  (%s)" % (
+                n, GAME_FB_W * n, GAME_FB_H * n, scale_cost(n))
             self.scale.addItem(label, n)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
+        self.scale.setToolTip(
+            "The game is rendered at this multiple of its own resolution and "
+            "scaled down to your window, which sharpens the image.\n\n"
+            "Higher values cost GPU performance. If the game stutters or drops "
+            "below full speed, lower it - the Play page shows the live frame "
+            "rate while you test.")
         self.scale.currentIndexChanged.connect(self._on_scale)
 
-        self.fullscreen = QComboBox()
-        for label, value in FULLSCREEN_MODES:
-            self.fullscreen.addItem(label, value)
-        self.fullscreen.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(FULLSCREEN_MODES)
-                  if v == self.settings.fullscreen_mode), 0))
-        self.fullscreen.currentIndexChanged.connect(self._on_fullscreen)
-
+        self.fullscreen = self._combo(FULLSCREEN_MODES,
+                                      self.settings.fullscreen_mode,
+                                      self._on_fullscreen)
         self.output_resolution = QComboBox()
-        for label, width, height in OUTPUT_RESOLUTIONS:
-            self.output_resolution.addItem(label, (width, height))
+        native = _native_resolution()
+        for label, w, h in OUTPUT_RESOLUTIONS:
+            # Mark whichever entry matches the machine actually running this,
+            # instead of assuming any particular display.
+            if native and (w, h) == native:
+                label += "   - your display"
+            self.output_resolution.addItem(label, (w, h))
         self.output_resolution.setCurrentIndex(next(
-            (i for i, (_, width, height) in enumerate(OUTPUT_RESOLUTIONS)
-             if (width, height) == (
-                 self.settings.window_width, self.settings.window_height
-             )),
-            0,
-        ))
-        self.output_resolution.currentIndexChanged.connect(
-            self._on_output_resolution
-        )
+            (i for i, (_, w, h) in enumerate(OUTPUT_RESOLUTIONS)
+             if (w, h) == (self.settings.window_width, self.settings.window_height)), 0))
+        self.output_resolution.currentIndexChanged.connect(self._on_output_resolution)
 
         self.aspect = QComboBox()
         self.aspect.addItems(ASPECTS)
         self.aspect.setCurrentText(self.settings.aspect)
         self.aspect.currentTextChanged.connect(self._on_aspect)
 
-        self.ws_mode = QComboBox()
-        for label, value in WIDESCREEN_MODES:
-            self.ws_mode.addItem(label, value)
-        self.ws_mode.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(WIDESCREEN_MODES)
-                  if v == self.settings.widescreen_native_wide), 0))
-        self.ws_mode.currentIndexChanged.connect(self._on_ws_mode)
+        self.ws_mode = self._combo(WIDESCREEN_MODES,
+                                   self.settings.widescreen_native_wide,
+                                   self._on_ws_mode)
+        self.scaling = self._combo(SCALING_MODES_UI, self.settings.scaling_mode,
+                                   self._on_scaling)
 
-        self.overscan = QComboBox()
-        for label, value in OVERSCAN_PRESETS:
-            self.overscan.addItem(label, value)
-        self.overscan.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(OVERSCAN_PRESETS)
-                  if v == self.settings.overscan_top), 0))
-        self.overscan.currentIndexChanged.connect(self._on_overscan)
-
-        self.scaling = QComboBox()
-        for label, value in SCALING_MODES_UI:
-            self.scaling.addItem(label, value)
-        self.scaling.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(SCALING_MODES_UI)
-                  if v == self.settings.scaling_mode), 0))
-        self.scaling.currentIndexChanged.connect(self._on_scaling)
-
-        self._sync_output_controls()
-
-        return card(
-            section("Display"),
-            row("Renderer", self.renderer),
-            row("Internal resolution", self.scale),
-            dim(
-                f"Measured on this machine: 5x is clean, 6x dips to ~53 fps, and "
-                f"8x produces no frames at all - so the list stops at "
-                f"{MAX_SUPERSAMPLING}x. The Play page shows the scale the renderer "
-                "actually used, which is the only trustworthy number."
+        return self._wrap(
+            card(
+                section("Output"),
+                row("Renderer", self.renderer),
+                row("Fullscreen", self.fullscreen),
+                row("Output resolution", self.output_resolution),
+                row("Image fit", self.scaling),
+                dim("Alt+Enter or Ctrl+F toggles fullscreen while playing."),
             ),
-            row("Fullscreen", self.fullscreen),
-            row("Output resolution", self.output_resolution),
-            row("Gameplay aspect", self.aspect),
-            row("Widescreen mode", self.ws_mode),
-            row("Image fit", self.scaling),
-            row("Overscan crop", self.overscan),
-            dim(
-                "The 1080p, 1440p and 4K choices are exact output canvases, "
-                "independent of the aspect - 4:3 content pillarboxes inside them. "
-                "Borderless always uses the desktop resolution, and Alt+Enter or "
-                "Ctrl+F toggles fullscreen while playing.\n\n"
-                "Leave Widescreen mode on the projection hack: native-wide needs "
-                "per-game viewport data that Crash 2 does not have, and without it "
-                "nothing widens at all."
+            card(
+                section("Rendering"),
+                row("Internal resolution", self.scale),
+                row("Gameplay aspect", self.aspect),
+                row("Widescreen mode", self.ws_mode),
+                dim("Leave Widescreen mode on the projection hack - native-wide "
+                    "needs per-game data Crash 2 does not have, and without it "
+                    "nothing widens at all."),
             ),
         )
 
-    def _quality_card(self) -> QWidget:
-        self.tex_filter = QComboBox()
-        for label, value in TEXTURE_FILTERS:
-            self.tex_filter.addItem(label, value)
-        self.tex_filter.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(TEXTURE_FILTERS)
-                  if v == self.settings.texture_filter), 0))
-        self.tex_filter.currentIndexChanged.connect(self._on_tex_filter)
+    def _image_page(self) -> QWidget:
+        self.tex_filter = self._combo(TEXTURE_FILTERS,
+                                      self.settings.texture_filter,
+                                      self._on_tex_filter)
+        self.present_filter = self._combo(PRESENT_FILTERS,
+                                          self.settings.present_filter,
+                                          self._on_present_filter)
+        self.crt = self._combo(CRT_FILTERS, self.settings.crt_filter, self._on_crt)
+        self.overscan = self._combo(OVERSCAN_PRESETS, self.settings.overscan_top,
+                                    self._on_overscan)
 
-        self.crt = QComboBox()
-        for label, value in CRT_FILTERS:
-            self.crt.addItem(label, value)
-        self.crt.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(CRT_FILTERS)
-                  if v == self.settings.crt_filter), 0))
-        self.crt.currentIndexChanged.connect(self._on_crt)
-
-        self.aa = QCheckBox("Anti-aliasing")
+        self.aa = QCheckBox("Anti-aliasing (smooths the supersample downscale)")
         self.aa.setChecked(self.settings.antialiasing)
         self.aa.toggled.connect(self._on_aa)
 
-        self.geom = QCheckBox("Geometry correction (reduces PS1 vertex wobble)")
+        self.geom = QCheckBox("Geometry correction (PGXP)")
         self.geom.setChecked(self.settings.geometry_correction)
         self.geom.toggled.connect(self._on_geom)
 
-        self.persp = QCheckBox("Perspective-correct texturing (reduces warping)")
+        self.persp = QCheckBox("Perspective-correct texturing (PGXP)")
         self.persp.setChecked(self.settings.perspective_texturing)
         self.persp.toggled.connect(self._on_persp)
 
-        return card(
-            section("Image quality"),
-            row("Texture filtering", self.tex_filter),
-            row("CRT filter", self.crt),
-            self.aa,
-            self.geom,
-            self.persp,
-            dim(
-                "These live in settings.toml beside the game executable - there is "
-                "no environment override, so they apply on the next launch."
+        return self._wrap(
+            card(
+                section("Filtering"),
+                row("Texture filtering", self.tex_filter),
+                row("Downsample filter", self.present_filter),
+                row("CRT filter", self.crt),
+                self.aa,
+            ),
+            card(
+                section("Framing"),
+                row("Overscan crop", self.overscan),
+                dim("PS1 games often draw fewer than 240 scanlines and leave "
+                    "the rest black. Those bars are part of the image, so no "
+                    "image-fit mode can remove them - only this can."),
+            ),
+            card(
+                section("Geometry (PGXP)"),
+                self.geom,
+                self.persp,
+                dim("Measured on this port: PGXP trades texture shimmer for "
+                    "geometry pop-in and seam lines. Both are off in every "
+                    "preset for that reason - try them, but expect that "
+                    "trade."),
             ),
         )
 
-    def _pacing_card(self) -> QWidget:
-        self.vsync = QComboBox()
-        for label, value in VSYNC_MODES:
-            self.vsync.addItem(label, value)
-        self.vsync.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(VSYNC_MODES) if v == self.settings.vsync), 0)
-        )
-        self.vsync.currentIndexChanged.connect(self._on_vsync)
+    def _audio_page(self) -> QWidget:
+        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(self.settings.volume)
+        self.volume.valueChanged.connect(self._on_volume)
+        self.volume_lbl = QLabel("%d%%" % self.settings.volume)
+        self.volume_lbl.setFixedWidth(48)
 
-        self.interp = QCheckBox("High-refresh presentation interpolation (OpenGL)")
-        self.interp.setChecked(self.settings.frame_interpolation)
-        self.interp.toggled.connect(self._on_interp)
+        vol_row = QWidget()
+        vl = QHBoxLayout(vol_row)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.addWidget(self.volume, 1)
+        vl.addWidget(self.volume_lbl)
 
-        self.interp_fps = QComboBox()
-        for label, value in INTERP_TARGETS:
-            self.interp_fps.addItem(label, value)
-        self.interp_fps.setCurrentIndex(
-            next((i for i, (_, v) in enumerate(INTERP_TARGETS)
-                  if v == self.settings.frame_interpolation_fps), 0)
-        )
-        self.interp_fps.currentIndexChanged.connect(self._on_interp_fps)
-        self._sync_interpolation_controls()
+        self.mute = QCheckBox("Mute")
+        self.mute.setChecked(self.settings.mute)
+        self.mute.toggled.connect(self._on_mute)
 
-        self.blend = QCheckBox("Temporal frame blending")
-        self.blend.setChecked(self.settings.frame_blend)
-        self.blend.toggled.connect(self._on_blend)
-
-        return card(
-            section("Frame pacing and high refresh"),
-            dim(
-                "Crash 2 gameplay now updates and renders at a native 59.94 fps "
-                "instead of repeating each frame twice. Targets above 60 are "
-                "presentation interpolation only; they do not accelerate gameplay "
-                "and can introduce blending artifacts."
+        return self._wrap(
+            card(
+                section("Audio"),
+                row("Volume", vol_row),
+                self.mute,
+                dim("Audio diagnostics live on the Advanced page. If sound is "
+                    "dropping out, check there first - the legacy audio path "
+                    "disables the buffer's rate control and causes underruns."),
             ),
-            row("V-sync", self.vsync),
-            self.interp,
-            row("Interpolation target", self.interp_fps),
-            self.blend,
         )
 
-    def _input_card(self) -> QWidget:
-        self.merge_input = QCheckBox(
-            "Player 1 reads keyboard and all controllers"
-        )
+    def _input_page(self) -> QWidget:
+        self.merge_input = QCheckBox("Player 1 reads keyboard and all controllers")
         self.merge_input.setChecked(self.settings.merge_all_input)
         self.merge_input.toggled.connect(self._on_merge)
 
-        return card(
-            section("Input"),
-            self.merge_input,
-            dim(
-                "Leave this on. A release build of the runtime pins player 1 to "
-                "\"keyboard\" and never opens a gamepad, because it expects its own "
-                "built-in launcher to assign a device. This setting works around that."
+        return self._wrap(
+            card(
+                section("Input"),
+                self.merge_input,
+                dim("Leave this on. A release build of the runtime pins player 1 "
+                    "to \"keyboard\" and never opens a gamepad, because it "
+                    "expects its own built-in launcher to assign a device."),
             ),
         )
 
-    def _audio_card(self) -> QWidget:
-        self.audio_legacy = QCheckBox("Legacy audio path (PSXRECOMP_AUDIO_LEGACY)")
-        self.audio_legacy.setChecked(self.settings.audio_legacy)
-        self.audio_legacy.toggled.connect(self._on_audio_legacy)
+    def _performance_page(self) -> QWidget:
+        self.vsync = self._combo(VSYNC_MODES, self.settings.vsync, self._on_vsync)
 
-        self.audio_shadow = QCheckBox("SPU shadow comparison (PSX_AUDIO_SHADOW)")
-        self.audio_shadow.setChecked(self.settings.audio_shadow)
-        self.audio_shadow.toggled.connect(self._on_audio_shadow)
+        self.interp = QCheckBox("Frame interpolation")
+        self.interp.setChecked(self.settings.frame_interpolation)
+        self.interp.toggled.connect(self._on_interp)
 
-        return card(
-            section("Audio"),
-            dim("Diagnostic switches for the sound cut-off investigation."),
-            self.audio_legacy,
-            self.audio_shadow,
-        )
+        self.interp_fps = self._combo(INTERP_TARGETS,
+                                      self.settings.frame_interpolation_fps,
+                                      self._on_interp_fps)
 
-    def _diagnostics_card(self) -> QWidget:
-        self.debug_port = QSpinBox()
-        self.debug_port.setRange(0, 65535)
-        self.debug_port.setSpecialValueText("Disabled")
-        self.debug_port.setValue(self.settings.debug_port)
-        self.debug_port.valueChanged.connect(self._on_debug_port)
+        self.native_overlays = QCheckBox("Compile level code natively")
+        self.native_overlays.setChecked(self.settings.native_overlays)
+        self.native_overlays.toggled.connect(self._on_native_overlays)
 
-        self.telemetry = QCheckBox("Print fps telemetry to the log")
-        self.telemetry.setChecked(self.settings.fps_telemetry)
-        self.telemetry.toggled.connect(self._on_telemetry)
-
-        return card(
-            section("Diagnostics"),
-            row("Debug server port", self.debug_port),
-            dim(
-                "A non-zero port opens the runtime's TCP debug server, which serves "
-                "spu_events, spu_voices and spu_status - the SPU event ring used to "
-                "diagnose the sound cut-off. 28000 is a fine choice."
+        return self._wrap(
+            card(
+                section("Frame pacing"),
+                row("V-sync", self.vsync),
+                self.interp,
+                row("Interpolation target", self.interp_fps),
+                dim("The game simulates at a fixed 59.94 Hz. Interpolation only "
+                    "changes how many frames are PRESENTED - it blends between "
+                    "real frames rather than adding simulation, so judge it by "
+                    "eye."),
             ),
-            self.telemetry,
+            card(
+                section("Execution"),
+                self.native_overlays,
+                dim("Crash 2 streams level code from disc. Without this it runs "
+                    "on the MIPS interpreter - correct, but far slower."),
+            ),
         )
 
-    # -- handlers ----------------------------------------------------------
+    # -- helpers -----------------------------------------------------------
+    def _combo(self, items, current, handler) -> QComboBox:
+        box = QComboBox()
+        for label, value in items:
+            box.addItem(label, value)
+        box.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(items) if v == current), 0))
+        box.currentIndexChanged.connect(handler)
+        return box
+
+    def _wrap(self, *cards: QWidget) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        for c in cards:
+            lay.addWidget(c)
+        lay.addStretch(1)
+        return page
+
+    def _sync_dependent_controls(self) -> None:
+        """Grey out controls that cannot take effect, rather than hiding them."""
+        # Both fullscreen modes take the desktop resolution; only windowed uses
+        # an explicit canvas.
+        windowed = self.settings.fullscreen_mode == 0
+        self.output_resolution.setEnabled(windowed)
+        self.output_resolution.setToolTip(
+            "" if windowed
+            else "Fullscreen always uses the desktop resolution.")
+
+        on = self.settings.frame_interpolation
+        self.interp_fps.setEnabled(on)
+        self.interp_fps.setToolTip(
+            "" if on else "Enable frame interpolation to choose a target.")
+
+    def _refresh_preset_label(self) -> None:
+        name = matching_preset(self.settings)
+        for label, btn in self.preset_buttons.items():
+            btn.setProperty("active", label == name)
+        if name:
+            self.preset_lbl.setText(
+                f'<span style="color:{ACCENT}">&nbsp;&nbsp;{name}</span>')
+        else:
+            self.preset_lbl.setText(
+                f'<span style="color:{TEXT_DIM}">&nbsp;&nbsp;Custom</span>')
+
+    def _apply_preset(self, name: str) -> None:
+        apply_preset(self.settings, name)
+        self.changed.emit()          # persist + push to the runtime config
+        self._rebuild_from_settings()
+
+    def _rebuild_from_settings(self) -> None:
+        """Push the dataclass back into the widgets after a bulk change."""
+        self._loading = True
+        self.renderer.setCurrentText(self.settings.renderer)
+        self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
+        self.aspect.setCurrentText(self.settings.aspect)
+        for box, value in (
+            (self.fullscreen, self.settings.fullscreen_mode),
+            (self.ws_mode, self.settings.widescreen_native_wide),
+            (self.scaling, self.settings.scaling_mode),
+            (self.tex_filter, self.settings.texture_filter),
+            (self.present_filter, self.settings.present_filter),
+            (self.crt, self.settings.crt_filter),
+            (self.overscan, self.settings.overscan_top),
+            (self.vsync, self.settings.vsync),
+            (self.interp_fps, self.settings.frame_interpolation_fps),
+        ):
+            idx = box.findData(value)
+            if idx >= 0:
+                box.setCurrentIndex(idx)
+        self.aa.setChecked(self.settings.antialiasing)
+        self.geom.setChecked(self.settings.geometry_correction)
+        self.persp.setChecked(self.settings.perspective_texturing)
+        self.interp.setChecked(self.settings.frame_interpolation)
+        self._loading = False
+        self._sync_dependent_controls()
+        self._refresh_preset_label()
+
     def _touch(self) -> None:
+        self._sync_dependent_controls()
+        self._refresh_preset_label()
         if not self._loading:
             self.changed.emit()
 
+    # -- handlers ----------------------------------------------------------
     def _on_renderer(self, value: str) -> None:
         self.settings.renderer = value
         self._touch()
@@ -404,11 +516,11 @@ class SettingsPage(QWidget):
 
     def _on_fullscreen(self, index: int) -> None:
         self.settings.fullscreen_mode = self.fullscreen.itemData(index)
-        self._sync_output_controls()
         self._touch()
 
-    def _on_win_width(self, index: int) -> None:
-        self.settings.window_width = self.win_width.itemData(index)
+    def _on_output_resolution(self, index: int) -> None:
+        self.settings.window_width, self.settings.window_height = \
+            self.output_resolution.itemData(index)
         self._touch()
 
     def _on_aspect(self, value: str) -> None:
@@ -419,50 +531,26 @@ class SettingsPage(QWidget):
         self.settings.widescreen_native_wide = self.ws_mode.itemData(index)
         self._touch()
 
-    def _on_overscan(self, index: int) -> None:
-        # Symmetric top/bottom: that is where PS1 blank scanlines live.
-        value = self.overscan.itemData(index)
-        self.settings.overscan_top = value
-        self.settings.overscan_bottom = value
-        self._touch()
-
     def _on_scaling(self, index: int) -> None:
         self.settings.scaling_mode = self.scaling.itemData(index)
         self._touch()
-
-    def _on_output_resolution(self, index: int) -> None:
-        width, height = self.output_resolution.itemData(index)
-        self.settings.window_width = width
-        self.settings.window_height = height
-        self._sync_output_controls()
-        self._touch()
-
-    def _sync_interpolation_controls(self) -> None:
-        """The interpolation target only means anything while interpolation is
-        on, and the runtime ignores any value below 90."""
-        on = self.settings.frame_interpolation
-        self.interp_fps.setEnabled(on)
-        self.interp_fps.setToolTip(
-            "" if on else "Enable frame interpolation to choose a target."
-        )
-
-    def _sync_output_controls(self) -> None:
-        """Borderless fullscreen always uses the desktop resolution, so an
-        explicit output canvas cannot apply - say so rather than letting the
-        control look effective."""
-        borderless = self.settings.fullscreen_mode == 1
-        self.output_resolution.setEnabled(not borderless)
-        self.output_resolution.setToolTip(
-            "Borderless fullscreen always uses the desktop resolution."
-            if borderless else ""
-        )
 
     def _on_tex_filter(self, index: int) -> None:
         self.settings.texture_filter = self.tex_filter.itemData(index)
         self._touch()
 
+    def _on_present_filter(self, index: int) -> None:
+        self.settings.present_filter = self.present_filter.itemData(index)
+        self._touch()
+
     def _on_crt(self, index: int) -> None:
         self.settings.crt_filter = self.crt.itemData(index)
+        self._touch()
+
+    def _on_overscan(self, index: int) -> None:
+        value = self.overscan.itemData(index)
+        self.settings.overscan_top = value
+        self.settings.overscan_bottom = value
         self._touch()
 
     def _on_aa(self, on: bool) -> None:
@@ -477,43 +565,31 @@ class SettingsPage(QWidget):
         self.settings.perspective_texturing = on
         self._touch()
 
-    def _on_vsync(self, index: int) -> None:
-        self.settings.vsync = self.vsync.itemData(index)
+    def _on_volume(self, value: int) -> None:
+        self.settings.volume = value
+        self.volume_lbl.setText("%d%%" % value)
         self._touch()
 
-    def _on_interp(self, on: bool) -> None:
-        self.settings.frame_interpolation = on
-        self.interp_fps.setEnabled(on)
-        self._touch()
-
-    def _on_interp_fps(self, index: int) -> None:
-        self.settings.frame_interpolation_fps = self.interp_fps.itemData(index)
-        self._touch()
-
-    def _on_smooth(self, on: bool) -> None:
-        self.settings.smooth_60fps = on
-        self._touch()
-
-    def _on_blend(self, on: bool) -> None:
-        self.settings.frame_blend = on
+    def _on_mute(self, on: bool) -> None:
+        self.settings.mute = on
         self._touch()
 
     def _on_merge(self, on: bool) -> None:
         self.settings.merge_all_input = on
         self._touch()
 
-    def _on_audio_legacy(self, on: bool) -> None:
-        self.settings.audio_legacy = on
+    def _on_vsync(self, index: int) -> None:
+        self.settings.vsync = self.vsync.itemData(index)
         self._touch()
 
-    def _on_audio_shadow(self, on: bool) -> None:
-        self.settings.audio_shadow = on
+    def _on_interp(self, on: bool) -> None:
+        self.settings.frame_interpolation = on
         self._touch()
 
-    def _on_debug_port(self, value: int) -> None:
-        self.settings.debug_port = value
+    def _on_interp_fps(self, index: int) -> None:
+        self.settings.frame_interpolation_fps = self.interp_fps.itemData(index)
         self._touch()
 
-    def _on_telemetry(self, on: bool) -> None:
-        self.settings.fps_telemetry = on
+    def _on_native_overlays(self, on: bool) -> None:
+        self.settings.native_overlays = on
         self._touch()

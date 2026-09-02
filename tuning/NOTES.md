@@ -214,3 +214,55 @@ of bug documented in ENHANCEMENTS.md R1.
 rate and that the guest runs at exactly 1.00x real PS1 speed. It does NOT say
 how often the game updates its animation - a title that renders new content
 every other vblank still shows ~60 here.
+
+## Audio dropouts — ROOT CAUSE FOUND (launcher, not the SPU)
+
+Symptom: sound effects worked "but not always" - crate smash, HP up and fruit
+pickups dropping, worst in dense levels (Un-Bearable, Crash Crush).
+
+**Cause: the launcher was forcing `PSXRECOMP_AUDIO_LEGACY=1`.** That flag
+disables the audio bridge at device-open time - no DRC callback, no rate
+control, no fill target - leaving blind `SDL_QueueAudio` pushing. When the
+queue ran dry the device silence-filled, i.e. an audible gap.
+
+Measured before and after, same 20s window, via `audio_stats`:
+
+| | legacy-push | bridge-pull |
+|---|---|---|
+| underruns | **146** | **0** |
+| target_ms | 0.0 | 180.0 |
+| fill_ms | 20.0 | 178.1 |
+| overflow drops | 0 | 0 |
+
+`audio_legacy` is a DIAGNOSTIC - the runtime's own comment says it exists so
+"the underrun baseline can be measured against the bridge". It had been exposed
+in the launcher next to Volume, indistinguishable from a quality option.
+
+### Wrong turns, for the record
+
+Three SPU theories were pursued and all died against captures:
+
+1. *Silent key-ons* - 0 key-ons had both volumes zero.
+2. *Samples ending instantly* - 0 KEYON->END_STOP within a frame.
+3. *Release envelopes stuck* - `watch` proved decay runs; voices holding a high
+   envelope had all been given `Rr=31`, the slowest rate, by the game itself.
+
+Also wrongly claimed at one point: that `v->active` is never cleared on
+END_STOP. It is - `spu.c:890`.
+
+The SPU was never broken. The tell was "not consistent": a deterministic bug
+cannot produce intermittent dropouts. That should have redirected the search to
+the output pipeline several rounds earlier than it did.
+
+### Still open
+
+Whether voice STEALING is a separate, real problem. Captures showed
+KEYON->KEYON with no end between (4 and 10 in two Un-Bearable captures), which
+truncates a sounding voice. If dropouts persist now that underruns are zero,
+that is the remaining lead - `spu_capture.py attach` is the capture for it.
+
+### Guard
+
+`launcher/test_settings_coverage.py` now asserts no diagnostic is reachable from
+the ordinary settings page, none is enabled by default, and no preset can turn
+one on. It caught a naming inconsistency on its first run.

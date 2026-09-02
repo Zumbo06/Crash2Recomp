@@ -21,14 +21,20 @@ from PySide6.QtWidgets import (
 from .. import config
 from ..paths import Layout, Mode
 from ..runtime import GameSession, apply_config_settings
+from .page_advanced import AdvancedPage
 from .page_log import LogPage
 from .page_play import PlayPage
 from .page_settings import SettingsPage
+from .page_setup import SetupPage
 
+# Advanced sits last and apart: it holds diagnostics that change how the game
+# behaves, not quality options.
 PAGES = [
+    ("setup", "Setup"),
     ("play", "Play"),
     ("settings", "Settings"),
     ("log", "Log"),
+    ("advanced", "Advanced"),
 ]
 
 
@@ -52,21 +58,28 @@ class MainWindow(QWidget):
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
 
+        self.setup_page = SetupPage(layout_, settings)
         self.play_page = PlayPage(layout_, settings, self.session)
         self.settings_page = SettingsPage(settings)
         self.log_page = LogPage()
+        self.advanced_page = AdvancedPage(settings)
 
+        self.stack.addWidget(self.setup_page)
         self.stack.addWidget(self.play_page)
         self.stack.addWidget(self.settings_page)
         self.stack.addWidget(self.log_page)
+        self.stack.addWidget(self.advanced_page)
 
+        self.setup_page.ready.connect(self._on_build_ready)
         self.settings_page.changed.connect(self._on_settings_changed)
+        self.advanced_page.changed.connect(self._on_settings_changed)
         self.session.output.connect(self.log_page.append)
         self.session.failed.connect(self.log_page.append)
 
         # Restore the page and geometry the user left on.
+        start = settings.last_page if layout_.has_runtime else "setup"
         index = next((i for i, (key, _) in enumerate(PAGES)
-                      if key == settings.last_page), 0)
+                      if key == start), 0)
         self._select(index)
         if settings.window_geometry:
             self.restoreGeometry(QByteArray.fromBase64(
@@ -121,6 +134,11 @@ class MainWindow(QWidget):
         apply_config_settings(self.layout_, self.settings)
         config.save(self.layout_.settings_file, self.settings)
         self.play_page.mark_settings_changed()
+
+    def _on_build_ready(self) -> None:
+        """The game just finished building - Play becomes usable."""
+        self.play_page.refresh()
+        self._select(next(i for i, (k, _) in enumerate(PAGES) if k == "play"))
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.session.running:

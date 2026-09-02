@@ -366,9 +366,14 @@ def audio_report(seconds: float = 20.0) -> int:
         print("   did not reach the device - that drops sounds intermittently")
         print("   no matter how correct the SPU is. This is the lead to pull.")
     else:
-        print(">> No underruns or pump skips. The output pipeline delivered")
-        print("   everything the SPU produced, so the dropouts are upstream")
-        print("   of it (voice allocation or the game itself).")
+        print(">> No underruns or pump skips: the output pipeline delivered")
+        print("   everything the SPU produced. Nothing was lost on the way to")
+        print("   the speakers during this window.")
+        print()
+        print("   If sound is now correct, that was the whole problem.")
+        print("   If sounds STILL drop, the cause is upstream of the output -")
+        print("   voice allocation or the game itself - and 'attach' is the")
+        print("   next capture to run.")
     return 0
 
 
