@@ -1,0 +1,27 @@
+--- _build/psxrecomp-src/runtime/src/host_osd.c	2026-08-29 15:55:15.130241600 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/host_osd.c	2026-09-02 17:07:21.060851200 +0300
+@@ -11,10 +11,21 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-#if defined(RECOMP_LAUNCHER)
+-#define HOST_OSD_VISUAL 1
+-#else
++/* The visual OSD used to be gated on RECOMP_LAUNCHER, which meant a build made
++ * with PSX_RECOMP_UI=OFF silently lost every toast - including savestate
++ * feedback, so a quick save gave no indication it had happened.
++ *
++ * That gate was unnecessary: this file draws itself. It carries its own 8x8
++ * font and pixel buffers and includes nothing from recomp-ui, and BOTH present
++ * paths already consume it - host_osd_draw_sdl() for the SDL renderer, and
++ * gl_swap_with_osd() -> host_osd_image() for the OpenGL one. Only the producer
++ * was compiled out.
++ *
++ * Default on; define HOST_OSD_NO_VISUAL for a genuinely headless build. */
++#if defined(HOST_OSD_NO_VISUAL)
+ #define HOST_OSD_VISUAL 0
++#else
++#define HOST_OSD_VISUAL 1
+ #endif
+ 
+ #define OSD_MAX_CHARS  64

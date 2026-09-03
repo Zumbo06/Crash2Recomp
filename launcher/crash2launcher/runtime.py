@@ -147,6 +147,8 @@ def _build_env(settings: Settings) -> dict[str, str]:
 
     if settings.fps_telemetry:
         env["PSX_FPS_TELEMETRY"] = "1"
+    if settings.voice_alloc_trace:
+        env["PSX_VOICE_ALLOC_TRACE"] = "1"
 
     # Presentation fit. Only "stretch"/"fill" change anything; letterbox is the
     # runtime default, so we still pass it explicitly to make a relaunch after

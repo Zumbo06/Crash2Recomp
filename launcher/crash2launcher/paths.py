@@ -115,6 +115,21 @@ class Layout:
 
     @property
     def recompiler_exe(self) -> Path:
+        """The emitter that turns overlay captures into native shards.
+
+        compile_overlays.py refuses to emit unless this binary's baked codegen
+        hash equals the one the runtime tree stamps into
+        overlay_codegen_hash.h. Our patch 0002 edits cpu_state.h and
+        psx_cycles.h, both listed in codegen_hash_sources.cmake, so the
+        prebuilt psxrecomp-cli binary can never match our tree - it was built
+        from unpatched sources. Prefer a recompiler built from the vendored
+        tree (_build/build_recompiler.ps1); fall back to the prebuilt one so a
+        checkout that has not built it still runs, just interpreted.
+        """
+        local = (self.project.parent / "build-recompiler"
+                 / f"psxrecomp-game{_EXE_SUFFIX}")
+        if local.is_file():
+            return local
         return self.cli_exe.parent / "libexec" / f"psxrecomp-game{_EXE_SUFFIX}"
 
     @property

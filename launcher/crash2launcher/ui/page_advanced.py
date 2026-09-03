@@ -128,6 +128,10 @@ class AdvancedPage(QWidget):
         self.fps_telemetry.setChecked(self.settings.fps_telemetry)
         self.fps_telemetry.toggled.connect(self._on_telemetry)
 
+        self.voice_alloc_trace = QCheckBox("Trace SPU voice allocation")
+        self.voice_alloc_trace.setChecked(self.settings.voice_alloc_trace)
+        self.voice_alloc_trace.toggled.connect(self._on_voice_alloc_trace)
+
         self.build_lbl = QLabel()
         self.build_lbl.setWordWrap(True)
         self.build_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -142,6 +146,8 @@ class AdvancedPage(QWidget):
             ),
             self.build_lbl,
             self.fps_telemetry,
+            self.voice_alloc_trace,
+            dim(DIAGNOSTIC_SETTINGS["voice_alloc_trace"]),
         )
 
     def _reset_card(self) -> QWidget:
@@ -200,6 +206,10 @@ class AdvancedPage(QWidget):
 
     def _on_telemetry(self, on: bool) -> None:
         self.settings.fps_telemetry = on
+        self._touch()
+
+    def _on_voice_alloc_trace(self, on: bool) -> None:
+        self.settings.voice_alloc_trace = on
         self._touch()
 
     def _on_reset(self) -> None:

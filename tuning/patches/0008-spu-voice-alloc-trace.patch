@@ -1,0 +1,189 @@
+--- _build/psxrecomp-src/runtime/src/spu.c	2026-08-29 15:55:15.186295500 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/spu.c	2026-09-03 15:04:25.739994900 +0300
+@@ -909,10 +909,133 @@
+     return (int16_t)shaped;
+ }
+ 
++/* ---- voice-allocation trace (PSX_VOICE_ALLOC_TRACE=1) -------------------
++ *
++ * Answers one question that everything else about dropped sound effects hangs
++ * on: HOW does the game decide a voice is free? Two candidates are observable
++ * from here - it polls ENDX (0x1F801D9C/9E), or it polls each voice's live
++ * envelope through CURVOL (voice register 6). Which one it actually uses, and
++ * what it sees when it picks, determines where a fix belongs.
++ *
++ * Counters only, summarised periodically: the poll rate is far too high to log
++ * every read. */
++static int      s_alloc_trace = -1;
++static uint64_t s_endx_polls;
++static uint64_t s_curvol_polls[SPU_VOICE_COUNT];
++static uint64_t s_curvol_saw_free[SPU_VOICE_COUNT];  /* read returned env == 0 */
++static uint64_t s_alloc_keyons;
++static uint64_t s_alloc_keyon_voice[SPU_VOICE_COUNT]; /* key-ons per voice index */
++static uint32_t s_alloc_last_report;
++
++/* What a key-on lands on. The game holds voices deliberately (release rates 30
++ * and 31 never decay), so it reclaims them by stealing rather than by waiting.
++ * A steal onto a voice still in Attack/Decay/Sustain at an audible level cuts a
++ * sound off mid-playback - which is what "the first box hit plays, the next one
++ * doesn't" sounds like. Splitting key-ons three ways says how often that
++ * happens versus ordinary reuse of a finished or released voice. */
++static uint64_t s_keyon_onto_silent;   /* voice free / already decayed - fine */
++static uint64_t s_keyon_onto_released; /* keyed off, still audible - tail cut */
++static uint64_t s_keyon_onto_live;     /* still in A/D/S, audible - SFX cut off */
++static uint64_t s_keyon_live_voice[SPU_VOICE_COUNT];
++
++static int alloc_trace_on(void) {
++    if (s_alloc_trace < 0) {
++        const char *e = getenv("PSX_VOICE_ALLOC_TRACE");
++        s_alloc_trace = (e && *e && *e != '0') ? 1 : 0;
++    }
++    return s_alloc_trace;
++}
++
++static void spu_alloc_trace_endx(void) {
++    if (alloc_trace_on()) s_endx_polls++;
++}
++
++static void spu_alloc_trace_curvol(int voice, uint16_t env) {
++    if (!alloc_trace_on()) return;
++    if (voice < 0 || voice >= SPU_VOICE_COUNT) return;
++    s_curvol_polls[voice]++;
++    if (env == 0) s_curvol_saw_free[voice]++;
++}
++
++/* Called once per rendered frame from the mixer. */
++void spu_alloc_trace_tick(uint32_t frame) {
++    if (!alloc_trace_on()) return;
++    if (frame - s_alloc_last_report < 300u) return;   /* ~5s at 60Hz */
++    s_alloc_last_report = frame;
++
++    uint64_t curvol_total = 0, free_total = 0;
++    int voices_polled = 0;
++    for (int i = 0; i < SPU_VOICE_COUNT; i++) {
++        curvol_total += s_curvol_polls[i];
++        free_total   += s_curvol_saw_free[i];
++        if (s_curvol_polls[i]) voices_polled++;
++    }
++
++    fprintf(stdout,
++            "[VOICEALLOC] keyons=%llu  ENDX polls=%llu  CURVOL polls=%llu "
++            "across %d voices (saw-free %llu)\n",
++            (unsigned long long)s_alloc_keyons,
++            (unsigned long long)s_endx_polls,
++            (unsigned long long)curvol_total, voices_polled,
++            (unsigned long long)free_total);
++
++    fprintf(stdout,
++            "[VOICEALLOC] keyon lands on: silent=%llu  released=%llu  "
++            "LIVE=%llu (%.1f%% of key-ons cut a sound off mid-playback)\n",
++            (unsigned long long)s_keyon_onto_silent,
++            (unsigned long long)s_keyon_onto_released,
++            (unsigned long long)s_keyon_onto_live,
++            s_alloc_keyons ? (100.0 * (double)s_keyon_onto_live
++                              / (double)s_alloc_keyons) : 0.0);
++
++    /* Per-voice picture. `keyons` says which indices the game is still willing
++     * to allocate; `env` + phase say why it skips the rest. A pool that is
++     * leaking shows key-ons collapsing onto a shrinking set of indices while
++     * the others sit in R (release) at a high env that never moves. */
++    fprintf(stdout, "[VOICEALLOC] v: ");
++    for (int i = 0; i < SPU_VOICE_COUNT; i++) {
++        const SpuVoice *v = &voices[i];
++        char ph = (v->adsr_phase == ADSR_ATTACK)  ? 'A'
++                : (v->adsr_phase == ADSR_DECAY)   ? 'D'
++                : (v->adsr_phase == ADSR_SUSTAIN) ? 'S' : 'R';
++        int parked = (v->active && v->adsr_phase == ADSR_RELEASE
++                      && v->env_level > 0x0100);
++        fprintf(stdout, "%d:%llu%c%04X", i,
++                (unsigned long long)s_alloc_keyon_voice[i],
++                v->active ? ph : '-', v->env_level);
++        if (parked) {
++            /* Rr is the release rate actually programmed. 30 and 31 never
++             * decay (divinco 1 and 0), so those voices are held on purpose and
++             * can only be reclaimed by stealing; 12-15 release in 1-5s. */
++            int rr = (int)spu_regs[(uint32_t)i * 8u + 5u] & 0x1F;
++            fprintf(stdout, "!r%d", rr);
++        }
++        /* x<n> = key-ons that landed on this voice while it was still audibly
++         * playing, i.e. sounds cut off on this voice. */
++        if (s_keyon_live_voice[i])
++            fprintf(stdout, "x%llu",
++                    (unsigned long long)s_keyon_live_voice[i]);
++        fprintf(stdout, " ");
++    }
++    fprintf(stdout, "\n");
++    fflush(stdout);
++}
++
+ static void key_on(uint32_t mask) {
+     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
+         if (!(mask & (1u << i))) continue;
+         SpuVoice *v = &voices[i];
++        /* Classify what this key-on is displacing, before memset wipes it. */
++        if (alloc_trace_on()) {
++            if (!v->active || v->env_level <= 0x0100) {
++                s_keyon_onto_silent++;
++            } else if (v->adsr_phase == ADSR_RELEASE) {
++                s_keyon_onto_released++;
++            } else {
++                s_keyon_onto_live++;
++                s_keyon_live_voice[i]++;
++            }
++        }
+         memset(v, 0, sizeof(*v));
+         v->active = 1;
+         /* Address registers count 8-byte units but hardware ignores bit0
+@@ -927,6 +1050,8 @@
+         v->adsr_divider = 0;
+         v->adsr_phase = ADSR_ATTACK;
+         key_on_count++;
++        s_alloc_keyons++;
++        s_alloc_keyon_voice[i]++;
+         endx_latch &= ~(1u << i);  /* KEYON clears ENDX bit on real hw */
+         spu_event_record(SPU_EV_KEYON, i, v->cur_addr);
+     }
+@@ -939,7 +1064,10 @@
+ static void key_off(uint32_t mask) {
+     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
+         if (!(mask & (1u << i))) continue;
+-        if (!voices[i].active) continue;
++        /* No `active` guard: hardware has no such concept — every voice always
++         * has a live ADSR state machine, so KEYOFF always enters Release. An
++         * already-decayed voice sits at env 0 and stays silent either way; the
++         * guard only made the traced phase disagree with the hardware's. */
+         spu_event_record(SPU_EV_KEYOFF, i, voices[i].cur_addr);
+         voices[i].adsr_phase = ADSR_RELEASE;
+         voices[i].adsr_divider = 0;
+@@ -1297,6 +1425,7 @@
+         }
+     }
+     render_frames += (uint64_t)frames;
++    spu_alloc_trace_tick((uint32_t)(render_frames / 735u));  /* ~1 per 60Hz frame */
+     last_peak = block_peak;
+     if (block_peak > peak) peak = block_peak;
+ 
+@@ -1392,9 +1521,11 @@
+              * for a sample to finish never advance and downstream voices
+              * never get keyed on. */
+             if (addr == 0x1F801D9Cu) {
++                spu_alloc_trace_endx();
+                 return endx_latch & 0xFFFFu;
+             }
+             if (addr == 0x1F801D9Eu) {
++                spu_alloc_trace_endx();
+                 return (endx_latch >> 16) & 0xFFu;
+             }
+             /* Voice register 6 (byte offset 0x0C) is CURVOL / ADSR_LEVEL —
+@@ -1405,8 +1536,10 @@
+             if (addr >= 0x1F801C00u && addr < 0x1F801D80u
+                 && (idx & 7u) == 6u) {
+                 int v = (int)(idx >> 3);
+-                if (v >= 0 && v < SPU_VOICE_COUNT)
++                if (v >= 0 && v < SPU_VOICE_COUNT) {
++                    spu_alloc_trace_curvol(v, voices[v].env_level);
+                     return voices[v].env_level;
++                }
+             }
+             return spu_regs[idx];
+         }

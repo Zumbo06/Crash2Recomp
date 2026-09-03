@@ -171,6 +171,10 @@ class Settings:
     # SPU event ring (spu_events / spu_voices).
     debug_port: int = 0
     fps_telemetry: bool = True
+    # Summarises, every ~5s, how the game picks SPU voices: key-ons per voice
+    # index plus each voice's phase and envelope level. Reading it needs no
+    # debug port - it prints straight to the Log page.
+    voice_alloc_trace: bool = False
 
     # --- input ------------------------------------------------------------
     # action -> key name. Empty means "use the runtime default".
@@ -287,6 +291,11 @@ DIAGNOSTIC_SETTINGS: dict[str, str] = {
     ),
     "fps_telemetry": (
         "Prints per-second frame statistics to the log. Harmless, but noisy."
+    ),
+    "voice_alloc_trace": (
+        "Every ~5s, logs how the game is picking SPU voices. Does not change "
+        "how the game sounds - it only counts and prints. For diagnosing the "
+        "sound effect cut-outs."
     ),
 }
 
