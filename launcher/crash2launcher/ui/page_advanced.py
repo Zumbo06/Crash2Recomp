@@ -124,7 +124,7 @@ class AdvancedPage(QWidget):
         self.debug_port.setValue(self.settings.debug_port)
         self.debug_port.valueChanged.connect(self._on_debug_port)
 
-        self.fps_telemetry = QCheckBox("Print fps telemetry to the log")
+        self.fps_telemetry = QCheckBox("Print fps telemetry to the log and window title")
         self.fps_telemetry.setChecked(self.settings.fps_telemetry)
         self.fps_telemetry.toggled.connect(self._on_telemetry)
 

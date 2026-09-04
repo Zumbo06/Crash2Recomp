@@ -290,7 +290,9 @@ DIAGNOSTIC_SETTINGS: dict[str, str] = {
         "tracing overhead."
     ),
     "fps_telemetry": (
-        "Prints per-second frame statistics to the log. Harmless, but noisy."
+        "Prints per-second frame statistics to the log and the window title. "
+        "Harmless, but noisy. It no longer pins a readout over the game - "
+        "that is the pause menu's FPS display row, or the F key."
     ),
     "voice_alloc_trace": (
         "Every ~5s, logs how the game is picking SPU voices. Does not change "

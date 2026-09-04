@@ -266,3 +266,70 @@ that is the remaining lead - `spu_capture.py attach` is the capture for it.
 `launcher/test_settings_coverage.py` now asserts no diagnostic is reachable from
 the ordinary settings page, none is enabled by default, and no preset can turn
 one on. It caught a naming inconsistency on its first run.
+
+## Overlay autocompile was silently off since patch 0002
+
+`compile_overlays.py` refuses to emit shards unless `psxrecomp-game.exe`'s baked
+codegen hash equals the one the runtime tree stamps into
+`overlay_codegen_hash.h`. Patch 0002 edits `cpu_state.h` and `psx_cycles.h`,
+and **both are listed in `runtime/codegen_hash_sources.cmake`** - so the moment
+that patch landed, the vendored tree stopped matching the prebuilt binary that
+ships in `_build/psxrecomp-cli/` (built from unpatched sources, Aug 27).
+
+Every overlay had been falling back to the MIPS interpreter ever since, which
+is also why months of SPU captures were taken with the *sound driver
+interpreted*. Fixing it audibly improved the sound-effect dropouts that three
+SPU theories had failed to explain.
+
+Fix: `_build/build_recompiler.ps1` builds `psxrecomp-game` from the vendored
+tree (`-DPSXRECOMP_ENABLE_CHD=OFF -DBUILD_TESTING=OFF`, and
+`recompiler/tests/` had to be vendored because one test target sits outside the
+`BUILD_TESTING` guard). `paths.py` prefers `_build/build-recompiler/` and falls
+back to the prebuilt binary. Verify with:
+
+    _build/build-recompiler/psxrecomp-game.exe --codegen-hash   # == 5cb10a8a
+    grep PSX_OVERLAY_CODEGEN_HASH .../runtime/include/overlay_codegen_hash.h
+
+## SPU: no defect found; the release rates are deliberate
+
+Ruled out by captures, not by reasoning:
+
+- **ENDX is never read.** 0 reads against ~280k CURVOL polls - the game picks
+  voices purely from the live envelope level, so ENDX behaviour is irrelevant.
+- **Parked voices carry release rate 30 or 31 exclusively.** In the divinco
+  model those never decay (`divinco` saturates to 0 at Rr=31, and the
+  `speed < zs` rescue gives 1 at Rr=30 - about 3 hours). Voices that *are*
+  decaying always read Rr 12-15, which release in 1-5 s. The split is clean,
+  so the game holds those voices on purpose and reclaims them by stealing.
+- **The pool is not leaking.** Key-ons keep climbing on all 24 indices.
+
+`PSX_VOICE_ALLOC_TRACE=1` (launcher: Advanced -> Trace SPU voice allocation)
+prints per-voice key-ons, phase, envelope, Rr, and how many key-ons landed on a
+still-audible voice.
+
+## Line endings: main.cpp and gpu_gl_renderer.c are LF, the rest is CRLF
+
+Old `sed -i` damage. `diff -u` against the pristine clone therefore reports the
+whole file as changed. Generate patches with `--strip-trailing-cr`:
+
+    diff -uN --strip-trailing-cr <pristine> <vendored>
+
+## Home pause menu (patch 0009)
+
+`psx_pause_menu.c` clones the `psx_savestate_menu.c` split: the module only
+rasterizes an ARGB panel, while main.cpp owns state, input and the actions. It
+reuses that menu's blocking pause loop (nested inside the vblank present body,
+so the guest cannot advance a cycle) and `rewind_pause_present()`.
+
+Rows: Resume, Quick save, Quick load, Game aspect, Image fit, FPS display,
+Restart. Aspect and fit apply live - aspect repeats the sequence
+`update_adaptive_widescreen()` uses, and clears `g_ws_adaptive_view` so the next
+resize cannot overwrite an explicit pick. Restart re-execs the process
+(`CreateProcessW` with our own command line) because there is no soft reset and
+`psx_game_codegen_relaunch_or_exit` is compiled out of this build; it needs a
+second press to confirm.
+
+The FPS bar is no longer tied to `PSX_FPS_TELEMETRY`. It has its own flag
+(`PSX_FPS_OSD`, default **off**) because `host_osd_set_status()` has no expiry -
+so the launcher's "print telemetry to the log" checkbox was pinning a readout
+over the game that nothing ever cleared.

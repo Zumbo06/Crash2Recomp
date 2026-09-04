@@ -1,6 +1,12 @@
 --- _build/psxrecomp-src/runtime/src/host_osd.c	2026-08-29 15:55:15.130241600 +0300
-+++ _build/Crash2Recomp/psxrecomp/runtime/src/host_osd.c	2026-09-02 17:07:21.060851200 +0300
-@@ -11,10 +11,21 @@
++++ _build/Crash2Recomp/psxrecomp/runtime/src/host_osd.c	2026-09-04 17:07:02.445217100 +0300
+@@ -6,15 +6,27 @@
+ #include "host_osd.h"
+ #include "psx_rewind.h"
+ #include "psx_savestate_menu.h"
++#include "psx_pause_menu.h"
+ #include "psx_sdl.h"
+ 
  #include <stdio.h>
  #include <string.h>
  
@@ -25,3 +31,34 @@
  #endif
  
  #define OSD_MAX_CHARS  64
+@@ -169,6 +181,9 @@
+ static SDL_Texture *s_sdl_ssm_tex;
+ static int          s_sdl_ssm_tw;
+ static int          s_sdl_ssm_th;
++static SDL_Texture *s_sdl_pm_tex;
++static int          s_sdl_pm_tw;
++static int          s_sdl_pm_th;
+ static SDL_Renderer *s_sdl_ren;
+ #endif
+ 
+@@ -395,6 +410,7 @@
+ int host_osd_needs_present(void) {
+     if (psx_rewind_needs_present()) return 1;
+     if (psx_savestate_menu_needs_present()) return 1;
++    if (psx_pause_menu_needs_present()) return 1;
+ #if !HOST_OSD_VISUAL
+     return 0;
+ #else
+@@ -512,6 +528,12 @@
+             sdl_blit_argb(renderer, &s_sdl_ssm_tex, &s_sdl_ssm_tw,
+                           &s_sdl_ssm_th, px, w, h, 0, 0, lw, lh);
+         }
++        if (psx_pause_menu_overlay_image(&px, &w, &h) && px) {
++            int lw = 640, lh = 480;
++            sdl_logical_size(renderer, &lw, &lh);
++            sdl_blit_argb(renderer, &s_sdl_pm_tex, &s_sdl_pm_tw,
++                          &s_sdl_pm_th, px, w, h, 0, 0, lw, lh);
++        }
+     }
+ #else
+     (void)renderer;

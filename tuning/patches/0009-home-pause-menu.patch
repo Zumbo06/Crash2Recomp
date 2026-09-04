@@ -1,0 +1,1845 @@
+--- _build/psxrecomp-src/runtime/src/main.cpp	2026-08-29 15:55:15.143550500 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp	2026-09-04 17:05:19.017589500 +0300
+@@ -23,9 +23,9 @@
+ #include "savestate.h"
+ #include "psx_rewind.h"
+ #include "psx_savestate_menu.h"
++#include "psx_pause_menu.h"
+ #include "host_osd.h"
+ #include "host_keymap.h"
+-#include "png_write.h"       /* png_write_rgb — present_shot readback */
+ #include "overlay_capture.h"
+ #include "overlay_loader.h"
+ #include "autocompile.h"
+@@ -115,7 +115,6 @@
+ #endif
+ #include <algorithm>
+ #include <atomic>
+-#include <mutex>
+ #include <thread>
+ #include <cctype>
+ #include <cmath>
+@@ -189,19 +188,12 @@
+     extern uint64_t g_dirty_window_dispatches;
+     extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+     extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
+-    /* memory.c */
++    /* MSVC link fix: these are defined in C TUs but were only redeclared
++     * block-scope inside functions below, so MSVC mangled the references. */
++    extern int      g_psx_dispatch_depth, g_call_unit_depth;
+     extern uint32_t i_stat, i_mask;
+-    extern uint64_t g_guest_store_count;
+-    extern uint64_t g_vblank_ack_count;
+-    /* interrupts.c */
+-    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+-    /* dirty_ram_interp.c */
+-    extern uint64_t g_dirty_ram_blocks_run;
+-    extern uint64_t g_dirty_pump_count;
+-    /* overlay_loader.c */
+-    extern int      g_call_unit_depth;
+-    /* psx_bios_backend.c */
+-    extern int      g_psx_dispatch_depth;
++    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count, g_vblank_ack_count;
++    extern uint64_t g_dirty_ram_blocks_run, g_dirty_pump_count, g_guest_store_count;
+ }
+ 
+ /* memory.c */
+@@ -440,7 +432,6 @@
+ static int s_sw_hold_valid = 0;
+ static SDL_Rect s_sw_hold_src;
+ static SDL_Rect s_sw_hold_dst;
+-
+ /* After LOADED: optional freeze probe (PSX_POST_LOAD_PROBE=1). Off by default. */
+ static int      s_post_load_probe_enabled = -1; /* -1 = unread env */
+ static int      s_post_load_probe_left = 0;
+@@ -500,6 +491,13 @@
+ static uint64_t s_fps_last_frame = 0;
+ static std::string s_fps_base_title;
+ static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
++/* The on-screen FPS bar, separate from the stderr log and window title above.
++ * It used to share s_fps_telemetry_enabled, so the launcher checkbox labelled
++ * "print fps telemetry to the log" also pinned a permanent readout over the
++ * game - and because host_osd_set_status() has no expiry, nothing ever cleared
++ * it. Now it is its own flag, defaulting OFF, toggled from the pause menu or
++ * the DisplayPerf key. PSX_FPS_OSD=1 restores it at startup. */
++static int      s_fps_osd_enabled = -1;       /* -1 = unread env */
+ static FramePacer s_frame_pacer = { 0 };
+ static int      s_turbo_present_skip = 0;
+ static int      s_fmv_skip_present_skip = 0;
+@@ -560,16 +558,29 @@
+     return s_fps_telemetry_enabled;
+ }
+ 
+-static void fps_telemetry_toggle(void) {
+-    const int enabled = fps_telemetry_enabled() ? 0 : 1;
+-    s_fps_telemetry_enabled = enabled;
++static int fps_osd_enabled(void) {
++    if (s_fps_osd_enabled < 0) {
++        const char *e = std::getenv("PSX_FPS_OSD");
++        s_fps_osd_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    return s_fps_osd_enabled;
++}
++
++/* Show/hide the on-screen readout. Leaves the stderr log and window title
++ * alone - those stay on PSX_FPS_TELEMETRY. Clearing the status is what
++ * actually removes the bar: it is persistent, not a timed toast. */
++static void fps_osd_set(int on) {
++    const int enabled = on ? 1 : 0;
++    if (fps_osd_enabled() == enabled) return;
++    s_fps_osd_enabled = enabled;
+     s_fps_last_time = 0;
+     s_fps_last_frame = 0;
+-    if (!enabled && sdl_window && !s_fps_base_title.empty())
+-        SDL_SetWindowTitle(sdl_window, s_fps_base_title.c_str());
+-    if (!enabled)
+-        host_osd_set_status(NULL);
+-    s_fps_base_title.clear();
++    if (!enabled) host_osd_set_status(NULL);
++}
++
++static void fps_telemetry_toggle(void) {
++    const int enabled = fps_osd_enabled() ? 0 : 1;
++    fps_osd_set(enabled);
+     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
+ }
+ 
+@@ -1160,6 +1171,11 @@
+ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
+ static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
+ static bool          g_video_win_w_explicit = false; /* user chose a width */
++/* Explicit output HEIGHT. 0 keeps the derived height (width * den / num), which
++ * ties the canvas to the content aspect. Setting both makes the window an exact
++ * canvas (e.g. 3840x2160) and lets the present path pillarbox 4:3 inside it. */
++static int           g_video_win_h    = 0;
++static bool          g_video_win_h_explicit = false;
+ static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
+ static int           g_audio_freq     = 44100; /* host device request */
+ static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+@@ -1170,7 +1186,6 @@
+ static uint32_t      g_savestate_input_guard_min_until = 0;
+ static uint32_t      g_savestate_input_guard_max_until = 0;
+ static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
+-
+ /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
+  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
+  * movie's per-movie total minus 3; writing the current movie's total down to
+@@ -1274,6 +1289,10 @@
+  * in config_loader.h). */
+ static int           g_video_aspect_num = 4;
+ static int           g_video_aspect_den = 3;
++/* Presentation fit: 0 letterbox, 1 stretch, 2 fill, 3 fit_width. Mirrors what
++ * was last handed to gl_renderer_set_scaling_mode(), which has no getter, so
++ * the pause menu can show and cycle the live value. */
++static int           g_present_fit_mode = 0;
+ /* Resize-driven widescreen. The user's fixed aspect is still used to shape the
+  * initial window; after the game window exists these values follow its live
+  * aspect, clamped to 4:3..the widest mode offered by the title. */
+@@ -1662,11 +1681,7 @@
+     if (width <= 0 || height <= 0) return;
+ 
+     int num = width, den = height;
+-    /* A nominal 4:3 client can be one physical pixel wider after fractional-DPI
+-     * conversion (for example 960x720 -> 2161x1620 at 225%).  Keep that
+-     * rounding pixel in the identity fallback instead of engaging an almost-
+-     * identity widescreen squash and its cull guard. */
+-    if ((int64_t)(width - 1) * 3 <= (int64_t)height * 4) {
++    if ((int64_t)width * 3 <= (int64_t)height * 4) {
+         num = 4; den = 3;
+     } else if ((int64_t)width * g_ws_adaptive_max_den >=
+                (int64_t)height * g_ws_adaptive_max_num) {
+@@ -1712,77 +1727,6 @@
+ 
+ static bool          g_gl_active = false;    /* GL context live -> GL present path */
+ static bool          g_vk_active = false;    /* Vulkan context live -> VK present path */
+-
+-/* present_shot — capture the COMPOSED present surface, i.e. the frame after the
+- * backend has fitted the display buffer to the window, so the PNG carries the
+- * aspect the player is actually looking at.
+- *
+- * screenshot / screenshot_file / screenshot_hires all resolve the display
+- * buffer BEFORE that fit: on a 508x256 display in a 4:3 window they answer
+- * 508x256 while the window shows 640x480. Correct for faithfulness work, wrong
+- * for anything aspect-shaped — a widescreen change moves the GTE squash and the
+- * present fit, which is exactly the stage those captures skip.
+- *
+- * Staged here and fulfilled by whichever backend owns the present: the SDL
+- * software path reads back via SDL_RenderReadPixels, the GL path via
+- * glReadPixels before SwapWindow (gpu_gl_renderer.c).
+- *
+- * THREADING: the request is written from a debug-server command handler on the
+- * emu thread (debug_server_poll safe point), but GL fulfilment can run on the
+- * frame-interpolation thread (gpu_gl_renderer.c interp_present -> gl_swap_with_osd),
+- * so the path buffer and the pending flag are mutex-guarded and the counters are
+- * atomic. present_shot_take() CLAIMS the request under the lock, so two present
+- * paths can never fulfil the same shot.
+- *
+- * A staged shot is OVERWRITTEN by a later request rather than refused (the same
+- * choice savestate's request_save_inner makes). A present that never arrives —
+- * a static frame, a backend that stops presenting — therefore cannot wedge the
+- * command: the next request simply replaces it. */
+-static std::mutex       s_present_shot_mtx;
+-static char             s_present_shot_path[512];
+-static bool             s_present_shot_pending = false;
+-static std::atomic<int> s_present_shot_seq{0};   /* bumps on every completion */
+-static std::atomic<int> s_present_shot_ok{0};    /* 1 = last completion wrote a PNG */
+-
+-extern "C" int present_shot_request(const char *path)
+-{
+-    if (!path || !*path) return 0;
+-    if (g_headless)  return 0;   /* no present surface to read back */
+-    /* Vulkan owns its own swapchain present (see the g_vk_active branch in
+-     * sdl_vblank_present_body) and has no readback hook, so nothing would ever
+-     * fulfil the request. Refuse honestly instead of accepting a shot that can
+-     * never complete — CLAUDE.md rule 15. */
+-    if (g_vk_active) return 0;
+-    {
+-        std::lock_guard<std::mutex> lk(s_present_shot_mtx);
+-        std::snprintf(s_present_shot_path, sizeof(s_present_shot_path), "%s", path);
+-        s_present_shot_pending = true;
+-    }
+-    return 1;
+-}
+-
+-/* Backend hook: atomically claim a staged shot (returns 1 and fills `out`),
+- * then call present_shot_done(ok) once the PNG is written — or not written. */
+-extern "C" int present_shot_take(char *out, int n)
+-{
+-    if (!out || n <= 0) return 0;
+-    std::lock_guard<std::mutex> lk(s_present_shot_mtx);
+-    if (!s_present_shot_pending) return 0;
+-    std::snprintf(out, (size_t)n, "%s", s_present_shot_path);
+-    s_present_shot_pending = false;   /* claimed */
+-    return 1;
+-}
+-
+-/* ok = 1 only when a PNG actually landed on disk. seq advances either way so a
+- * client polling it always terminates; ok tells it whether the file exists. */
+-extern "C" void present_shot_done(int ok)
+-{
+-    s_present_shot_ok.store(ok ? 1 : 0, std::memory_order_release);
+-    s_present_shot_seq.fetch_add(1, std::memory_order_release);
+-}
+-
+-extern "C" int present_shot_seq(void) { return s_present_shot_seq.load(std::memory_order_acquire); }
+-extern "C" int present_shot_ok(void)  { return s_present_shot_ok.load(std::memory_order_acquire); }
+ /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
+  * to force the software readout path instead — a diagnostic/fallback that also
+  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
+@@ -2701,41 +2645,9 @@
+     return g_host_refresh_hz >= 58.8 && g_host_refresh_hz <= 61.2;
+ }
+ 
+-static int host_driver_vsync_unreliable(void) {
+-#ifdef _WIN32
+-    return 0;
+-#else
+-    static int cached = -1;
+-    if (cached >= 0)
+-        return cached;
+-    if (const char *e = std::getenv("PSX_TRUST_DRIVER_VSYNC");
+-        e && e[0] && e[0] != '0') {
+-        cached = 0;
+-        return cached;
+-    }
+-    if (std::getenv("WSL_INTEROP") || std::getenv("WSL_DISTRO_NAME")) {
+-        cached = 1;
+-        return cached;
+-    }
+-    cached = 0;
+-    if (FILE *f = std::fopen("/proc/version", "rb")) {
+-        char buf[512];
+-        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+-        std::fclose(f);
+-        buf[n] = '\0';
+-        if (std::strstr(buf, "Microsoft") || std::strstr(buf, "microsoft") ||
+-            std::strstr(buf, "WSL") || std::strstr(buf, "wsl"))
+-            cached = 1;
+-    }
+-    return cached;
+-#endif
+-}
+-
+ static int present_vsync_owns_cadence(void) {
+     if (g_video_vsync == 0 || g_present_vsync_disabled)
+         return 0;
+-    if (host_driver_vsync_unreliable())
+-        return 0;
+     if (g_frame_period_ms <= 0.0)
+         return 0;
+     if (g_frame_interpolation)
+@@ -2787,11 +2699,7 @@
+     } else if (g_frame_period_ms > 0.0) {
+         if (g_video_vsync != 0 && !g_frame_interpolation &&
+             !g_netplay_vsync_forced_off) {
+-            if (host_driver_vsync_unreliable()) {
+-                std::printf("psxrecomp: present cadence: wall-clock pacer "
+-                            "(%.4f ms/frame); driver vsync off under WSL\n",
+-                            g_frame_period_ms);
+-            } else if (g_host_refresh_hz > 0.0) {
++            if (g_host_refresh_hz > 0.0) {
+                 std::printf("psxrecomp: present cadence: wall-clock pacer "
+                             "(%.4f ms/frame); driver vsync off on %.0f Hz panel\n",
+                             g_frame_period_ms, g_host_refresh_hz);
+@@ -5860,6 +5768,24 @@
+     return 1;
+ }
+ 
++/* Which numbered slot the quick save/load keys act on.
++ *
++ * Deliberately a NORMAL slot rather than a hidden one: it then shows up in the
++ * F7 menu with its thumbnail and timestamp, so a quick save is visible and can
++ * be managed like any other. PSX_QUICK_SLOT overrides it for anyone who wants
++ * their manual slots left strictly alone. */
++static int psx_quick_slot(void) {
++    static int slot = -1;
++    if (slot < 0) {
++        slot = 0;
++        if (const char *e = std::getenv("PSX_QUICK_SLOT")) {
++            const int v = std::atoi(e);
++            if (v >= 0 && v < 12) slot = v;
++        }
++    }
++    return slot;
++}
++
+ static void savestate_menu_submit(int save) {
+     if (savestate_submit_slot(savestate_menu_slot, save) && savestate_menu_open) {
+         savestate_menu_open = 0;
+@@ -6138,6 +6064,325 @@
+     savestate_input_guard_arm();
+ }
+ 
++/* ---------------------------------------------------------------------
++ * Home pause menu
++ *
++ * Same split as the savestate menu: psx_pause_menu.c only rasterizes, and
++ * everything below owns the state, the input and the actions. It reuses that
++ * menu's pause loop shape (blocking nested loop inside the vblank present
++ * body, so the guest cannot advance a cycle) and its re-present helper.
++ * ------------------------------------------------------------------- */
++
++static int pause_menu_open = 0;
++static int pause_menu_sel = 0;
++static int pause_menu_restart_armed = 0;   /* Restart needs a second press */
++static SDL_Keycode pause_menu_open_key = 0;
++
++/* Index order must match ASPECT_LABEL in psx_pause_menu.c. */
++static const int kPauseAspect[PSX_PAUSE_ASPECT_COUNT][2] = {
++    { 4, 3 }, { 16, 9 }, { 21, 9 }
++};
++
++static int pause_menu_aspect_index(void) {
++    for (int i = 0; i < PSX_PAUSE_ASPECT_COUNT; i++)
++        if (kPauseAspect[i][0] == g_video_aspect_num &&
++            kPauseAspect[i][1] == g_video_aspect_den)
++            return i;
++    return 0;   /* something custom is live; show 4:3 rather than lying */
++}
++
++static void pause_menu_sync_overlay(void) {
++    psx_pause_menu_set_state(pause_menu_open, pause_menu_sel,
++                             pause_menu_aspect_index(), g_present_fit_mode,
++                             fps_osd_enabled(), pause_menu_restart_armed);
++}
++
++/* Live aspect change. Same sequence update_adaptive_widescreen() uses when the
++ * window is resized - the GL display aspect, the SDL logical size, then the
++ * GTE/GPU widescreen projection. No relaunch. */
++static void pause_menu_apply_aspect(int index) {
++    if (index < 0 || index >= PSX_PAUSE_ASPECT_COUNT) return;
++    const int num = kPauseAspect[index][0];
++    const int den = kPauseAspect[index][1];
++    if (num == g_video_aspect_num && den == g_video_aspect_den) return;
++    /* A fixed pick from the menu is an explicit choice; stop following the
++     * window or the next resize would immediately overwrite it. */
++    g_ws_adaptive_view = false;
++    g_video_aspect_num = num;
++    g_video_aspect_den = den;
++    gl_renderer_set_display_aspect(num, den);
++    if (sdl_renderer) {
++        g_logical_w = 480 * num * g_video_scale / den;
++        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
++    }
++    refresh_widescreen_projection();
++}
++
++static void pause_menu_apply_fit(int mode) {
++    if (mode < 0 || mode >= PSX_PAUSE_FIT_COUNT) return;
++    g_present_fit_mode = mode;
++    gl_renderer_set_scaling_mode(mode);
++}
++
++/* Restart = boot the game again from scratch. There is no soft reset in the
++ * runtime, and psx_game_codegen_relaunch_or_exit() is compiled out of this
++ * build (it needs PSX_HAS_GAME_CODEGEN + RECOMP_LAUNCHER), so re-exec the
++ * process with the exact command line we were started with. */
++static void pause_menu_restart_game(void) {
++#if defined(_WIN32)
++    STARTUPINFOW si;
++    PROCESS_INFORMATION pi;
++    wchar_t *cmd = _wcsdup(GetCommandLineW());
++    if (!cmd) return;
++    std::memset(&si, 0, sizeof(si));
++    si.cb = sizeof(si);
++    std::memset(&pi, 0, sizeof(pi));
++    std::fprintf(stdout, "psxrecomp: restart requested from pause menu\n");
++    std::fflush(stdout);
++    /* Tear the old process down first: it holds the audio device, the GL
++     * context and the overlay cache files the new one is about to open. */
++    psx_crash_trace_set_exit_origin("pause_menu_restart");
++    shutdown_runtime();
++    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
++        CloseHandle(pi.hProcess);
++        CloseHandle(pi.hThread);
++        std::free(cmd);
++        std::exit(0);
++    }
++    std::free(cmd);
++    /* Spawn failed - we have already shut down, so there is nothing to go
++     * back to. Exiting is the honest outcome. */
++    std::fprintf(stderr, "psxrecomp: restart failed to spawn; exiting\n");
++    std::exit(1);
++#else
++    host_osd_push("Restart is Windows-only in this build", 2000);
++#endif
++}
++
++static void pause_menu_close(void) {
++    pause_menu_open = 0;
++    pause_menu_restart_armed = 0;
++    pause_menu_sync_overlay();
++}
++
++static void pause_menu_toggle(SDL_Keycode opened_by_key) {
++    /* One modal at a time, matching savestate_menu_toggle's guard. */
++    if (!pause_menu_open && (psx_rewind_is_open() || savestate_menu_open))
++        return;
++    pause_menu_open = !pause_menu_open;
++    pause_menu_restart_armed = 0;
++    if (pause_menu_open) {
++        pause_menu_sel = 0;
++        pause_menu_open_key = opened_by_key;
++    } else {
++        pause_menu_open_key = 0;
++    }
++    pause_menu_sync_overlay();
++}
++
++static void pause_menu_move(int delta) {
++    pause_menu_sel += delta;
++    while (pause_menu_sel < 0) pause_menu_sel += PSX_PAUSE_ROW_COUNT;
++    while (pause_menu_sel >= PSX_PAUSE_ROW_COUNT)
++        pause_menu_sel -= PSX_PAUSE_ROW_COUNT;
++    /* Moving off Restart disarms it. */
++    pause_menu_restart_armed = 0;
++    pause_menu_sync_overlay();
++}
++
++/* Left/Right on an option row. */
++static void pause_menu_adjust(int delta) {
++    switch (pause_menu_sel) {
++    case PSX_PAUSE_ROW_ASPECT: {
++        int i = pause_menu_aspect_index() + delta;
++        while (i < 0) i += PSX_PAUSE_ASPECT_COUNT;
++        while (i >= PSX_PAUSE_ASPECT_COUNT) i -= PSX_PAUSE_ASPECT_COUNT;
++        pause_menu_apply_aspect(i);
++        break;
++    }
++    case PSX_PAUSE_ROW_FIT: {
++        int i = g_present_fit_mode + delta;
++        while (i < 0) i += PSX_PAUSE_FIT_COUNT;
++        while (i >= PSX_PAUSE_FIT_COUNT) i -= PSX_PAUSE_FIT_COUNT;
++        pause_menu_apply_fit(i);
++        break;
++    }
++    case PSX_PAUSE_ROW_FPS:
++        fps_osd_set(!fps_osd_enabled());
++        break;
++    default:
++        return;
++    }
++    pause_menu_sync_overlay();
++}
++
++/* Enter / Cross on the selected row. */
++static void pause_menu_activate(void) {
++    if (psx_pause_menu_row_is_option(pause_menu_sel)) {
++        pause_menu_adjust(1);
++        return;
++    }
++    switch (pause_menu_sel) {
++    case PSX_PAUSE_ROW_RESUME:
++        pause_menu_close();
++        break;
++    case PSX_PAUSE_ROW_QUICK_SAVE:
++        if (savestate_submit_slot(psx_quick_slot(), 1))
++            host_osd_push("Quick save", 1200);
++        pause_menu_close();
++        break;
++    case PSX_PAUSE_ROW_QUICK_LOAD:
++        if (!savestate_slot_exists(psx_quick_slot())) {
++            host_osd_push("No quick save yet", 1500);
++        } else if (savestate_submit_slot(psx_quick_slot(), 0)) {
++            host_osd_push("Quick load", 1200);
++        }
++        pause_menu_close();
++        break;
++    case PSX_PAUSE_ROW_RESTART:
++        if (!pause_menu_restart_armed) {
++            pause_menu_restart_armed = 1;   /* confirm on the next press */
++            pause_menu_sync_overlay();
++        } else {
++            pause_menu_restart_game();      /* does not return */
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static void pause_menu_handle_key(SDL_Keycode key, SDL_Scancode sc,
++                                  int mod, int repeat) {
++    if (repeat) return;
++    if (key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
++        pause_menu_close();
++        return;
++    }
++    if (host_keymap_match_event(HOST_KEYMAP_PAUSE_MENU, key, sc, mod)
++        && key != pause_menu_open_key) {
++        pause_menu_close();
++        return;
++    }
++    switch (key) {
++    case SDLK_UP:    pause_menu_move(-1); break;
++    case SDLK_DOWN:  pause_menu_move(1);  break;
++    case SDLK_LEFT:  pause_menu_adjust(-1); break;
++    case SDLK_RIGHT: pause_menu_adjust(1);  break;
++    case SDLK_RETURN:
++    case SDLK_KP_ENTER:
++    case SDLK_SPACE: pause_menu_activate(); break;
++    default: break;
++    }
++}
++
++/* Gamepad navigation, mirroring savestate_menu_poll_nav: edge-detected with a
++ * 160 ms auto-repeat so a held stick scrolls rather than races. */
++static void pause_menu_poll_nav(uint32_t now_ms) {
++    static int prev_up = 0, prev_down = 0, prev_left = 0, prev_right = 0;
++    static int prev_accept = 0, prev_cancel = 0;
++    static uint32_t repeat_at = 0;
++    int up = 0, down = 0, left = 0, right = 0, accept = 0, cancel = 0;
++
++    SDL_GameController *c = g_players[0].handle;
++    if (c) {
++        const Sint16 ax_y = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY);
++        const Sint16 ax_x = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
++        const int dz = 16000;
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP)    || ax_y < -dz) up = 1;
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN)  || ax_y >  dz) down = 1;
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT)  || ax_x < -dz) left = 1;
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || ax_x >  dz) right = 1;
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A)) accept = 1;
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B)) cancel = 1;
++    }
++
++    const int held = up || down || left || right;
++    const int edge_up    = up    && !prev_up;
++    const int edge_down  = down  && !prev_down;
++    const int edge_left  = left  && !prev_left;
++    const int edge_right = right && !prev_right;
++    int fire = edge_up || edge_down || edge_left || edge_right;
++    if (!fire && held && now_ms >= repeat_at) fire = 1;
++    if (fire) {
++        if (up)         pause_menu_move(-1);
++        else if (down)  pause_menu_move(1);
++        else if (left)  pause_menu_adjust(-1);
++        else if (right) pause_menu_adjust(1);
++        repeat_at = now_ms + 160u;
++    }
++    if (!held) repeat_at = 0;
++
++    if (accept && !prev_accept) pause_menu_activate();
++    if (cancel && !prev_cancel) pause_menu_close();
++
++    prev_up = up; prev_down = down; prev_left = left; prev_right = right;
++    prev_accept = accept; prev_cancel = cancel;
++}
++
++/* The pad's Home/Guide button. SDL only reports GUIDE on backends that grab
++ * it; where it never arrives the keyboard Home key and the pad chord below
++ * still open the menu. */
++static void pause_menu_poll_toggle_buttons(void) {
++    static int prev = 0;
++    int now = 0;
++    SDL_GameController *c = g_players[0].handle;
++    if (c) {
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_GUIDE))
++            now = 1;
++        /* Start+Select is the universally available fallback chord. */
++        if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_START) &&
++            SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_BACK))
++            now = 1;
++    }
++    if (now && !prev) pause_menu_toggle(0);
++    prev = now;
++}
++
++static void pause_menu_host_pause_loop(void) {
++    while (pause_menu_open) {
++        SDL_Event ev;
++        while (SDL_PollEvent(&ev)) {
++            if (ev.type == SDL_QUIT) {
++                psx_crash_trace_set_exit_origin("sdl_window_close");
++                shutdown_runtime();
++                std::exit(0);
++            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
++                refresh_player_devices();
++            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
++                close_controller();
++                refresh_player_devices();
++            } else if (ev.type == SDL_KEYDOWN) {
++#if defined(PSX_SDL3)
++                const SDL_Keymod mod = ev.key.mod;
++                const SDL_Keycode key = ev.key.key;
++                const SDL_Scancode scancode = ev.key.scancode;
++                const int repeat = ev.key.repeat ? 1 : 0;
++#else
++                const Uint16 mod = ev.key.keysym.mod;
++                const SDL_Keycode key = ev.key.keysym.sym;
++                const SDL_Scancode scancode = ev.key.keysym.scancode;
++                const int repeat = ev.key.repeat ? 1 : 0;
++#endif
++                pause_menu_handle_key(key, scancode, (int)mod, repeat);
++            } else if (ev.type == SDL_KEYUP) {
++#if defined(PSX_SDL3)
++                const SDL_Keycode key = ev.key.key;
++#else
++                const SDL_Keycode key = ev.key.keysym.sym;
++#endif
++                if (pause_menu_open_key == key)
++                    pause_menu_open_key = 0;
++            }
++        }
++        pause_menu_poll_nav((uint32_t)SDL_GetTicks());
++        rewind_pause_present();
++        SDL_Delay(8);
++    }
++    /* Swallow the closing press so it does not bleed into the guest pad. */
++    savestate_input_guard_arm();
++}
++
+ /* Epilogue for netplay admit/pace AFTER all C++ RAII in the present body
+  * is destroyed — episode snap load longjmps via psx_netplay_rb_flush_resume and
+  * must not cross non-trivial destructors (UB / guest crash). */
+@@ -6190,7 +6435,10 @@
+      * than presents so turbo and skipped-frame modes still report game speed.
+      * Skip during netplay post-load barrier — admit is stalled and the window
+      * is not updating, so a climbing FPS line is misleading. */
+-    if (fps_telemetry_enabled() && !psx_netplay_in_load_barrier()) {
++    /* Either consumer keeps the sampler running; each output is gated
++     * separately below so the on-screen bar and the log are independent. */
++    if ((fps_telemetry_enabled() || fps_osd_enabled())
++        && !psx_netplay_in_load_barrier()) {
+         extern uint64_t s_frame_count;
+         const Uint64 now = SDL_GetPerformanceCounter();
+         const Uint64 frequency = SDL_GetPerformanceFrequency();
+@@ -6211,7 +6459,7 @@
+                     ? (double)g_frame_interpolation_fps
+                     : g_host_refresh_hz;
+             }
+-            if (!g_headless && sdl_window) {
++            if (!g_headless && sdl_window && fps_telemetry_enabled()) {
+                 char title[256];
+                 if (display_fps > 0.0) {
+                     snprintf(title, sizeof(title),
+@@ -6223,7 +6471,7 @@
+                 }
+                 SDL_SetWindowTitle(sdl_window, title);
+             }
+-            if (!g_headless) {
++            if (!g_headless && fps_osd_enabled()) {
+                 char osd[96];
+                 if (display_fps > 0.0) {
+                     snprintf(osd, sizeof(osd),
+@@ -6253,6 +6501,7 @@
+                 /* §27: presentation starvation — eye cares about gaps more
+                  * than replay%. Pass: post-settle present_gap_p95 ≤ 33ms. */
+                 netplay_present_gap_stats(&gap_p95, &gap_max);
++                if (fps_telemetry_enabled())
+                 std::fprintf(stderr,
+                     "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
+                     "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
+@@ -6264,7 +6513,7 @@
+                 s_np_admit_ticks = 0;
+                 s_np_guest_ticks = 0;
+                 s_np_timing_frames = 0;
+-            } else {
++            } else if (fps_telemetry_enabled()) {
+                 std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                              fps, speed, (unsigned long long)s_frame_count);
+             }
+@@ -6351,6 +6600,32 @@
+                                                  (int)mod)) {
+                     savestate_menu_toggle(key);
+                 }
++                else if (!key_repeat &&
++                         host_keymap_match_event(HOST_KEYMAP_PAUSE_MENU,
++                                                 (int)key, (int)scancode,
++                                                 (int)mod)) {
++                    pause_menu_toggle(key);
++                }
++                /* Quick save/load: one key, one slot, no menu. The quick slot
++                 * is an ordinary numbered slot, so it still appears in the F7
++                 * menu with its thumbnail and timestamp - this is just a
++                 * shortcut to it, not a separate store. */
++                else if (!key_repeat &&
++                         host_keymap_match_event(HOST_KEYMAP_QUICK_SAVE,
++                                                 (int)key, (int)scancode,
++                                                 (int)mod)) {
++                    if (savestate_submit_slot(psx_quick_slot(), 1))
++                        host_osd_push("Quick save", 1200);
++                }
++                else if (!key_repeat &&
++                         host_keymap_match_event(HOST_KEYMAP_QUICK_LOAD,
++                                                 (int)key, (int)scancode,
++                                                 (int)mod)) {
++                    if (!savestate_slot_exists(psx_quick_slot()))
++                        host_osd_push("No quick save yet", 1500);
++                    else if (savestate_submit_slot(psx_quick_slot(), 0))
++                        host_osd_push("Quick load", 1200);
++                }
+                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
+                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
+                     debug_force_cd_reinsert();
+@@ -6403,11 +6678,14 @@
+             }
+         }
+         savestate_menu_poll_toggle_buttons();
++        pause_menu_poll_toggle_buttons();
+         rewind_poll_toggle_buttons();
+         psx_rewind_note_frame();
+         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
+         if (savestate_menu_open)
+             savestate_menu_host_pause_loop();
++        if (pause_menu_open)
++            pause_menu_host_pause_loop();
+         if (psx_rewind_is_open())
+             rewind_host_pause_loop();
+     }
+@@ -7183,66 +7461,6 @@
+     SDL_RenderClear(sdl_renderer);
+     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
+     host_osd_draw_sdl(sdl_renderer);
+-    /* Fulfil a staged present_shot here: after RenderCopy + OSD, before
+-     * RenderPresent, the renderer holds exactly the composed frame the player
+-     * sees — including the logical-size aspect fit that every buffer-level
+-     * capture misses. Reading back costs a GPU sync, so it only runs when a
+-     * shot was explicitly requested. */
+-    char shot_path[512];
+-    if (present_shot_take(shot_path, (int)sizeof(shot_path))) {
+-        int ow = 0, oh = 0;
+-        uint8_t *packed = NULL;
+-#if defined(PSX_SDL3)
+-        SDL_Surface *surf = SDL_RenderReadPixels(sdl_renderer, NULL);
+-        if (surf) {
+-            SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGB24);
+-            SDL_DestroySurface(surf);
+-            if (conv) {
+-                ow = conv->w; oh = conv->h;
+-                packed = (uint8_t *)std::malloc((size_t)ow * oh * 3);
+-                if (packed) {
+-                    /* SDL rows are pitch-aligned; png_write_rgb wants packed. */
+-                    for (int y = 0; y < oh; y++)
+-                        std::memcpy(packed + (size_t)y * ow * 3,
+-                                    (const uint8_t *)conv->pixels + (size_t)y * conv->pitch,
+-                                    (size_t)ow * 3);
+-                }
+-                SDL_DestroySurface(conv);
+-            }
+-        }
+-#else
+-        /* Size the buffer from the renderer's REAL output, not from a
+-         * viewport*scale reconstruction: SDL_RenderReadPixels(NULL) fills the
+-         * current viewport, and deriving that region from
+-         * SDL_RenderGetViewport x SDL_RenderGetScale rounds independently of
+-         * what SDL actually writes. The output size is a hard upper bound, so
+-         * a full-output allocation cannot be overrun whatever SDL picks. */
+-        int rw = 0, rh = 0;
+-        if (SDL_GetRendererOutputSize(sdl_renderer, &rw, &rh) == 0 && rw > 0 && rh > 0) {
+-            SDL_Rect vp; SDL_RenderGetViewport(sdl_renderer, &vp);
+-            float sx = 1.0f, sy = 1.0f; SDL_RenderGetScale(sdl_renderer, &sx, &sy);
+-            ow = (int)(vp.w * sx); oh = (int)(vp.h * sy);
+-            if (ow <= 0 || ow > rw) ow = rw;
+-            if (oh <= 0 || oh > rh) oh = rh;
+-            packed = (uint8_t *)std::malloc((size_t)rw * rh * 3);   /* upper bound */
+-            if (packed && SDL_RenderReadPixels(sdl_renderer, NULL,
+-                                               SDL_PIXELFORMAT_RGB24,
+-                                               packed, ow * 3) != 0) {
+-                std::free(packed); packed = NULL;
+-            }
+-        }
+-#endif
+-        int wrote = 0;
+-        if (packed && ow > 0 && oh > 0) {
+-            FILE *pf = std::fopen(shot_path, "wb");
+-            if (pf) {
+-                wrote = png_write_rgb(pf, packed, (uint32_t)ow, (uint32_t)oh);
+-                std::fclose(pf);
+-            }
+-        }
+-        std::free(packed);
+-        present_shot_done(wrote);
+-    }
+     /* §33: remember active rect for resim hold-last (not full 640x512). */
+     s_sw_hold_src = src;
+     s_sw_hold_dst = dst;
+@@ -10661,8 +10879,8 @@
+ 
+ int main(int argc, char** argv) {
+     /* Force line-buffered output so messages appear even if killed. */
+-    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+-    std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
++    std::setvbuf(stdout, nullptr, _IOLBF, 0);
++    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+     std::fprintf(stderr, "psxrecomp: main() entered\n");
+     std::fflush(stderr);
+ #if defined(RECOMP_LAUNCHER)
+@@ -10703,35 +10921,6 @@
+     int         cli_renderer   = -1;   /* 0=software 1=opengl 2=vulkan */
+     const char* cli_window_title = nullptr;  /* label windows in a fleet */
+     const char* cli_memcard_dir = nullptr;   /* isolate writable state in a fleet */
+-    std::vector<std::string> cli_path_arg_storage;
+-    cli_path_arg_storage.reserve((size_t)argc);
+-    auto is_cli_option = [](const char* arg) {
+-        return arg && arg[0] == '-' && arg[1] == '-';
+-    };
+-    auto consume_path_arg = [&](int& i) -> const char* {
+-        const int first = i + 1;
+-        std::string combined;
+-        std::string best;
+-        int best_index = first;
+-        for (int j = first; j < argc; ++j) {
+-            if (j != first && is_cli_option(argv[j])) break;
+-            if (!combined.empty()) combined += " ";
+-            combined += argv[j];
+-
+-            std::error_code ec;
+-            if (std::filesystem::exists(std::filesystem::path(combined), ec)) {
+-                best = combined;
+-                best_index = j;
+-            }
+-        }
+-        if (best.empty()) {
+-            best = argv[first];
+-            best_index = first;
+-        }
+-        i = best_index;
+-        cli_path_arg_storage.push_back(std::move(best));
+-        return cli_path_arg_storage.back().c_str();
+-    };
+     PsxNetplayConfig net_cfg;
+     psx_netplay_config_defaults(&net_cfg);
+     psx_netplay_apply_env(&net_cfg);  /* CLI flags below win over env */
+@@ -10757,17 +10946,17 @@
+      * No --game-root flag: that remains config-driven. */
+     for (int i = 1; i < argc; i++) {
+         if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
+-            bios_path = consume_path_arg(i);
++            bios_path = argv[++i];
+             bios_from_cli = true;
+             bios_explicit = true;
+         } else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc) {
+-            game_config_path = consume_path_arg(i);
++            game_config_path = argv[++i];
+         } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
+-            disc_override_path = consume_path_arg(i);
++            disc_override_path = argv[++i];
+         } else if (std::strcmp(argv[i], "--debug-port") == 0 && i + 1 < argc) {
+             cli_debug_port = std::atoi(argv[++i]);
+         } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
+-            cli_memcard_dir = consume_path_arg(i);
++            cli_memcard_dir = argv[++i];
+         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
+             const char* r = argv[++i];
+             if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
+@@ -10882,8 +11071,8 @@
+      * game.toml offer flags remain parseable for old projects but deliberately
+      * cannot expose generic launcher controls or activate the features. Trusted
+      * activation plugins apply them after launcher/settings resolution. */
+-    constexpr bool ws_offered = false;
+-    constexpr bool ws_ultrawide_offered = false;
++    constexpr bool ws_offered = true;
++    constexpr bool ws_ultrawide_offered = true;
+     constexpr bool frame_interpolation_offered = false;
+     constexpr bool skip_fmv_offered = false;
+     /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
+@@ -11023,6 +11212,10 @@
+                 g_video_win_w = gc.runtime.video_window_width;
+                 g_video_win_w_explicit = true;
+             }
++            if (gc.runtime.video_window_height > 0) {
++                g_video_win_h = gc.runtime.video_window_height;
++                g_video_win_h_explicit = true;
++            }
+             g_video_aa         = gc.runtime.video_antialiasing;
+             g_video_texfilter  = gc.runtime.video_texture_filter;
+             g_video_fmv_filter = gc.runtime.video_fmv_filter;
+@@ -11307,10 +11500,6 @@
+                  * chaining and makes them overlay-cache candidates, so live-byte
+                  * closures can own them instead of single-instruction dispatch
+                  * thrash. Clamped to stay above the kernel window. */
+-                if (gc.runtime.has_overlay_region_floor) {
+-                    uint32_t v = gc.runtime.overlay_region_floor & 0x1FFFFFFFu;
+-                    if (v >= 0x00010000u) g_overlay_region_floor = v;
+-                }
+                 {
+                     const char* fenv = std::getenv("PSX_OVERLAY_REGION_FLOOR");
+                     if (fenv && fenv[0]) {
+@@ -11415,6 +11604,8 @@
+         if (us.has_supersampling)  g_video_scale     = us.supersampling;
+         if (us.has_window_width)   g_video_win_w     = us.window_width;
+         if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
++        if (us.has_window_height)  g_video_win_h     = us.window_height;
++        if (us.has_window_height && us.window_height > 0) g_video_win_h_explicit = true;
+         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+@@ -11727,68 +11918,49 @@
+         overlay_autocapture_set_enabled(0);
+         const char *cfg_backend = deferred_overlay_backend.empty()
+                 ? nullptr : deferred_overlay_backend.c_str();
+-        /* The bundled overlay_toolchain/ (embedded Python + compile_overlays.py +
+-         * recompiler + headers + tcc) can drive EITHER compiler: tcc from the
+-         * bundle, or a real gcc when one is on PATH. So a gcc toolchain counts
+-         * as available when there is a configured gcc command OR the bundle is
+-         * present to build one - the same package then yields gcc shards on a
+-         * dev box and tcc shards on a toolchain-less player box. */
+-        extern int g_psx_cps_mode;
+-        const std::filesystem::path tk_xd = exe_dir_from_argv(argv[0]);
+-        const std::filesystem::path tk_dir = tk_xd / "overlay_toolchain";
+-        const std::filesystem::path tk_py = tk_dir / "python" / "python.exe";
+-        const bool tk_present = std::filesystem::exists(tk_py);
+-        auto build_toolchain_cmd = [&](const char *compiler) {
+-            auto cmd_quote = [](const std::string& s) {
+-                return std::string("\"") + s + "\"";
+-            };
+-            std::string c =
+-                cmd_quote(tk_py.string()) + " " +
+-                cmd_quote((tk_dir / "compile_overlays.py").string()) +
+-                " --captures " + cmd_quote(captures_path.string()) +
+-                " --game-toml " + cmd_quote(std::string(
+-                    game_config_path ? game_config_path : "game.toml")) +
+-                " --recompiler " + cmd_quote((tk_dir / "psxrecomp-game.exe").string()) +
+-                " --runtime-include " + cmd_quote((tk_dir / "include").string()) +
+-                " --out-dir " + cmd_quote((tk_xd / "cache").string()) +
+-                (g_psx_cps_mode ? " --cps" : "") +
+-                " --compiler " + compiler;
+-            if (std::string(compiler) == "tcc")
+-                c += " --tcc " + cmd_quote((tk_dir / "tcc" / "tcc.exe").string());
+-            return c;
+-        };
+-        int gcc_avail = (deferred_has_overlay_ac || tk_present)
++        int gcc_avail = deferred_has_overlay_ac
+                         && autocompile_toolchain_available();
+         OverlayBackend eff = overlay_backend_resolve(cfg_backend, gcc_avail);
+         std::string built_tcc_cmd;
+-        std::string built_gcc_cmd;
+         std::string env_ac_cmd;
+         const std::string *ac_cmd = nullptr;
+         if (eff == OVERLAY_BACKEND_TCC) {
+             if (deferred_has_overlay_ac_tcc) {
+                 ac_cmd = &deferred_overlay_ac_tcc;
+-            } else if (tk_present) {
+-                built_tcc_cmd = build_toolchain_cmd("tcc");
+-                ac_cmd = &built_tcc_cmd;
+-                std::fprintf(stdout,
+-                    "psxrecomp: tcc tier using bundled toolchain (%s)\n",
+-                    tk_dir.string().c_str());
+             } else {
+-                std::fprintf(stdout,
+-                    "psxrecomp: tcc tier active but no bundled toolchain at %s "
+-                    "(overlay gaps -> interpreter)\n", tk_dir.string().c_str());
++                extern int g_psx_cps_mode;
++                std::filesystem::path xd = exe_dir_from_argv(argv[0]);
++                std::filesystem::path tk = xd / "overlay_toolchain";
++                std::filesystem::path py = tk / "python" / "python.exe";
++                if (std::filesystem::exists(py)) {
++                    auto cmd_quote = [](const std::string& s) {
++                        return std::string("\"") + s + "\"";
++                    };
++                    built_tcc_cmd =
++                        cmd_quote(py.string()) + " " +
++                        cmd_quote((tk / "compile_overlays.py").string()) +
++                        " --captures " + cmd_quote(captures_path.string()) +
++                        " --game-toml " + cmd_quote(std::string(
++                            game_config_path ? game_config_path : "game.toml")) +
++                        " --recompiler " + cmd_quote((tk / "psxrecomp-game.exe").string()) +
++                        " --runtime-include " + cmd_quote((tk / "include").string()) +
++                        " --out-dir " + cmd_quote((xd / "cache").string()) +
++                        (g_psx_cps_mode ? " --cps" : "") +
++                        " --compiler tcc --tcc " +
++                        cmd_quote((tk / "tcc" / "tcc.exe").string());
++                    ac_cmd = &built_tcc_cmd;
++                    std::fprintf(stdout,
++                        "psxrecomp: tcc tier using bundled toolchain (%s)\n",
++                        tk.string().c_str());
++                } else {
++                    std::fprintf(stdout,
++                        "psxrecomp: tcc tier active but no bundled toolchain at %s "
++                        "(overlay gaps -> interpreter)\n", tk.string().c_str());
++                }
+             }
+         } else {
+-            if (deferred_has_overlay_ac) {
++            if (deferred_has_overlay_ac)
+                 ac_cmd = &deferred_overlay_ac;
+-            } else if (tk_present) {
+-                /* gcc on PATH + bundled toolchain: gcc shards from the same bundle. */
+-                built_gcc_cmd = build_toolchain_cmd("gcc");
+-                ac_cmd = &built_gcc_cmd;
+-                std::fprintf(stdout,
+-                    "psxrecomp: gcc tier using bundled toolchain (%s) with gcc from PATH\n",
+-                    tk_dir.string().c_str());
+-            }
+         }
+         if (const char *e = std::getenv("PSX_OVERLAY_AUTOCOMPILE_CMD")) {
+             if (e[0]) {
+@@ -12892,6 +13064,51 @@
+      * this aspect; native-wide fills it with a genuinely wider frame (no
+      * stretch), squash mode stretches the 4:3 frame into it. */
+     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
++    /* Presentation fit. Letterbox (default) preserves the aspect with bars;
++     * "stretch" fills the canvas exactly and distorts; "fill" preserves the
++     * aspect and crops the overflow. Presentation only - nothing upstream of
++     * the final blit is affected. */
++    if (const char *e = std::getenv("PSX_SCALING_MODE")) {
++        const int mode = (std::strcmp(e, "stretch")   == 0) ? 1
++                       : (std::strcmp(e, "fill")      == 0) ? 2
++                       : (std::strcmp(e, "fit_width") == 0) ? 3
++                       : 0;
++        g_present_fit_mode = mode;
++        gl_renderer_set_scaling_mode(mode);
++        static const char *kFitNames[] = {
++            "letterbox", "stretch", "fill", "fit_width (no side bars)"
++        };
++        std::fprintf(stdout, "psxrecomp: presentation fit = %s\n", kFitNames[mode]);
++    }
++    /* Present-time reconstruction filter. Matters when a high internal
++     * resolution is downsampled to the window: the default single tap averages
++     * only 2x2 texels regardless of the shrink ratio, so most of the
++     * supersampled detail is discarded and the surviving samples shift under
++     * motion (visible as texture shimmer). "bicubic" uses the Catmull-Rom path
++     * already present in the shader. */
++    if (const char *e = std::getenv("PSX_PRESENT_FILTER")) {
++        const int mode = (std::strcmp(e, "bicubic") == 0) ? 2
++                       : (std::strcmp(e, "sharp")   == 0) ? 1
++                       : 0;
++        gl_renderer_set_present_filter(mode);
++        static const char *kNames[] = { "plain", "sharp-bilinear", "bicubic" };
++        std::fprintf(stdout, "psxrecomp: present filter = %s\n", kNames[mode]);
++    }
++    /* Overscan crop, in PS1 scanlines out of 240: "top,bottom[,left,right]".
++     * Games that draw fewer than 240 lines leave real black pixels in the
++     * frame; those bars are content and survive every scaling mode, so the
++     * source rect has to be trimmed instead. */
++    if (const char *e = std::getenv("PSX_OVERSCAN_CROP")) {
++        int t = 0, b = 0, l = 0, r = 0;
++        const int n = std::sscanf(e, "%d,%d,%d,%d", &t, &b, &l, &r);
++        if (n == 1) b = t;                 /* single value = symmetric top/bottom */
++        if (n >= 1) {
++            gl_renderer_set_overscan_crop(t, b, l, r);
++            std::fprintf(stdout,
++                "psxrecomp: overscan crop = top %d, bottom %d, left %d, right %d "
++                "(of 240)\n", t, b, l, r);
++        }
++    }
+     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
+          * the per-frame present path engages it at game entry. */
+@@ -13069,19 +13286,6 @@
+     if (game_entry_pc != 0)
+         fntrace_set_game_range(game_entry_pc, 0);
+ 
+-  /* Headless still runs the SPU as a guest-cycle device. Register and prime
+-   * the pump before the frontend split so deterministic gates exercise the
+-   * same sample-deadline path as an operator run. Without the cycle-zero
+-   * prime, the first deadline service establishes a shifted epoch and the
+-   * headless smoke cannot detect the resulting audio/cutscene regression. */
+-#ifndef PSX_SDL_NO_AUDIO
+-  if (g_headless) {
+-    audio_trace_init();
+-    psx_set_midframe_audio_pump(sdl_audio_pump_midframe);
+-    sdl_audio_pump_midframe();
+-  }
+-#endif
+-
+   if (g_headless) {
+     std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+   } else {
+@@ -13177,10 +13381,6 @@
+      * depend on a successful host open (Win↔Linux aux/spu fork). Routed
+      * through the gated wrapper so turbo mute/sink still apply. */
+     psx_set_midframe_audio_pump(sdl_audio_pump_midframe);
+-    /* Establish the cycle-zero audio epoch before the first device deadline.
+-     * Otherwise the first D-1 quiet-prefix service becomes the epoch and shifts
+-     * every nominal 768-cycle sample boundary. */
+-    sdl_audio_pump_midframe();
+ #endif
+ 
+     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+@@ -13201,6 +13401,16 @@
+      * the image scales to fill the larger window with no further distortion. */
+     int game_w = g_video_win_w, game_h = 0;
+     clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
++    /* An explicit height decouples the output canvas from the content aspect:
++     * the window becomes exactly W x H (1920x1080, 2560x1440, 3840x2160) and
++     * the present path letterboxes/pillarboxes the content inside it, instead
++     * of the height being forced to width * den / num. Only honour it when a
++     * width was given too, so a stray height cannot distort the fit-to-display
++     * default. */
++    if (g_video_win_h_explicit && g_video_win_w_explicit && g_video_win_h > 0) {
++        game_w = g_video_win_w;
++        game_h = g_video_win_h;
++    }
+     sdl_window = SDL_CreateWindow(
+         window_title.c_str(),
+         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+@@ -13241,11 +13451,11 @@
+             g_host_refresh_hz = host_hz;
+             if (host_hz >= 58.8 && host_hz <= 61.2) {
+                 g_frame_period_ms = 1000.0 / host_hz;
+-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %.1f Hz panel "
+-                            "(%.4f ms/frame)\n", host_hz, g_frame_period_ms);
++                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
++                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+             } else {
+-                std::printf("psxrecomp: host panel %.1f Hz not ~60 Hz; keeping PSX "
+-                            "59.94 Hz pacing\n", host_hz);
++                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
++                            "59.94 Hz pacing\n", dm.refresh_rate);
+             }
+         }
+     }
+--- _build/psxrecomp-src/runtime/src/gpu_gl_renderer.c	2026-08-29 15:55:15.121140600 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/gpu_gl_renderer.c	2026-09-04 17:13:47.841680800 +0300
+@@ -70,6 +70,7 @@
+ #include "frame_interpolation.h"
+ #include "host_osd.h"
+ #include "psx_savestate_menu.h"
++#include "psx_pause_menu.h"
+ #include "host_time.h"
+ #include "latency_ring.h"
+ #include "psx_rewind.h"
+@@ -85,7 +86,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include "png_write.h"   /* png_write_rgb — present_shot readback */
+ 
+ #ifndef GL_BGRA
+ #define GL_BGRA 0x80E1
+@@ -126,7 +126,7 @@
+ 
+ #define VRAM_W 1024
+ #define VRAM_H 512
+-#define GL_MAX_INTERNAL_SCALE 4
++#define GL_MAX_INTERNAL_SCALE 8
+ 
+ /* ---- Loaded modern-GL entry points ------------------------------------- */
+ typedef GLuint (APIENTRY *PFN_glCreateShader)(GLenum);
+@@ -2495,13 +2495,8 @@
+         s_up_nrects = 0;
+         rect_clear(&s_d24_skip_fb);
+     } else if (!d24 && s_depth24_skip_up) {
+-        /* Small texture uploads are still queued while depth24 scanout uses
+-         * the CPU mirror. Clear only the skipped movie band first, then land
+-         * those newer uploads so texture pages which overlap that band win in
+-         * PS1 command order. Dropping the queue here loses GT2's boot menu
+-         * atlas; flushing before the clear would wipe it again. */
++        s_up_nrects = 0;
+         depth24_clear_skipped_fb();
+-        flush_cpu_upload();
+         gpu_depth24_upload_span_reset();
+         /* Force a fresh present after FMV→15-bit so menus/loading screens
+          * are not held as a stale depth24 frame. */
+@@ -2594,6 +2589,68 @@
+  * GTE X-squash (gte_set_display_aspect) this nets a wider field of view. */
+ static int s_aspect_num = 4, s_aspect_den = 3;
+ 
++/* How the image fills the output canvas.
++ *   0 letterbox - preserve aspect, bars on the short axis (default)
++ *   1 stretch   - fill exactly, ignoring aspect (distorts)
++ *   2 fill      - preserve aspect, scale until covered, crop the overflow
++ * Only affects presentation; nothing upstream of the final blit changes. */
++#define GL_SCALE_LETTERBOX 0
++#define GL_SCALE_STRETCH   1
++#define GL_SCALE_FILL      2
++/* Width ALWAYS spans the canvas; the vertical falls where it falls (bars top
++ * and bottom when the image is shorter, cropped when taller). This is the mode
++ * to pick when side bars are unacceptable regardless of aspect. */
++#define GL_SCALE_FIT_WIDTH 3
++static int s_scale_mode = GL_SCALE_LETTERBOX;
++
++void gl_renderer_set_scaling_mode(int mode) {
++    s_scale_mode = (mode >= GL_SCALE_LETTERBOX && mode <= GL_SCALE_FIT_WIDTH)
++                   ? mode : GL_SCALE_LETTERBOX;
++}
++
++/* Overscan crop, in PS1 scanlines out of the standard 240.
++ *
++ * Many PS1 titles draw fewer than the full 240 lines and leave the remainder
++ * genuinely black, so those bars are CONTENT, not presentation - no scaling
++ * mode can remove them, because there is nothing else in those pixels. This
++ * trims the source rectangle before scaling so the drawn area fills the output.
++ *
++ * Expressed in 240ths rather than pixels so it is independent of the internal
++ * supersampling scale: the same value means the same thing at 1x and 6x. */
++/* Present-time reconstruction filter, matching PRESENT_FS's u_sharp:
++ *   0 plain single tap (the historical default)
++ *   1 sharp-bilinear texel snap
++ *   2 Catmull-Rom bicubic - the good downsample filter
++ * Applies only to the final blit; nothing upstream is affected. */
++static int s_present_filter = 0;
++
++void gl_renderer_set_present_filter(int mode) {
++    s_present_filter = (mode >= 0 && mode <= 2) ? mode : 0;
++}
++
++static int s_crop_top_240 = 0, s_crop_bot_240 = 0;
++static int s_crop_left_240 = 0, s_crop_right_240 = 0;
++
++void gl_renderer_set_overscan_crop(int top, int bottom, int left, int right) {
++    /* Clamp hard: cropping away the whole frame would divide by zero below. */
++    s_crop_top_240   = top    > 0 ? (top    < 60 ? top    : 60) : 0;
++    s_crop_bot_240   = bottom > 0 ? (bottom < 60 ? bottom : 60) : 0;
++    s_crop_left_240  = left   > 0 ? (left   < 60 ? left   : 60) : 0;
++    s_crop_right_240 = right  > 0 ? (right  < 60 ? right  : 60) : 0;
++}
++
++/* Shrink a source rect by the configured overscan, in place. */
++static void apply_overscan_crop(int *x, int *y, int *w, int *h) {
++    if (!(s_crop_top_240 | s_crop_bot_240 | s_crop_left_240 | s_crop_right_240))
++        return;
++    const int ct = (*h * s_crop_top_240)   / 240;
++    const int cb = (*h * s_crop_bot_240)   / 240;
++    const int cl = (*w * s_crop_left_240)  / 240;
++    const int cr = (*w * s_crop_right_240) / 240;
++    if (ct + cb < *h) { *y += ct; *h -= ct + cb; }
++    if (cl + cr < *w) { *x += cl; *w -= cl + cr; }
++}
++
+ void gl_renderer_set_display_aspect(int num, int den) {
+     if (num <= 0 || den <= 0) { num = 4; den = 3; }
+     s_aspect_num = num; s_aspect_den = den;
+@@ -2602,8 +2659,32 @@
+ /* Letterbox: largest num:den rect centered in the drawable. */
+ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
+                                   int *x, int *y, int *w, int *h) {
++    if (s_scale_mode == GL_SCALE_STRETCH) {
++        /* Fill the canvas exactly. Distorts when the canvas aspect differs
++         * from the content aspect - that is the point of the mode. */
++        *x = 0; *y = 0; *w = ww; *h = wh;
++        return;
++    }
+     int dw = ww, dh = (ww * den) / num;
+-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
++    if (s_scale_mode == GL_SCALE_FIT_WIDTH) {
++        /* Width already spans the canvas (dw == ww); leave it. Centre
++         * vertically, so a shorter image gets bars top and bottom and a taller
++         * one is cropped equally at both edges. Never any side bars. */
++        *x = 0;
++        *y = (wh - dh) / 2;
++        *w = dw; *h = dh;
++        return;
++    }
++    if (s_scale_mode == GL_SCALE_FILL) {
++        /* Cover the canvas with aspect preserved, cropping the overflow: pick
++         * the axis that leaves NO gap, i.e. the opposite choice to letterbox.
++         * The rect is allowed to exceed the window; the centring offsets go
++         * negative and the excess is clipped by the viewport. */
++        if (dh < wh) { dh = wh; dw = (wh * num) / den; }
++    } else if (dh > wh) {
++        /* Letterbox: shrink until it fits entirely. */
++        dh = wh; dw = (wh * num) / den;
++    }
+     *x = (ww - dw) / 2;
+     *y = (wh - dh) / 2;
+     *w = dw; *h = dh;
+@@ -3984,45 +4065,12 @@
+             }
+             if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
+                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
++            /* Pause menu last: it is the topmost modal. */
++            if (psx_pause_menu_overlay_image(&px, &ow, &oh) && px)
++                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+         }
+     }
+     host_osd_present_done();
+-    /* present_shot (GL backend): the default framebuffer now holds the composed
+-     * frame — display quad fitted to the window, plus OSD — so this is the only
+-     * capture that carries the presented aspect. Buffer-level captures resolve
+-     * before the fit and answer the raw display size instead. Read back before
+-     * the swap; GL rows come out bottom-up, so flip into the PNG. */
+-    {
+-        extern int  present_shot_take(char *out, int n);
+-        extern void present_shot_done(int ok);
+-        char shot_path[512];
+-        if (present_shot_take(shot_path, (int)sizeof(shot_path))) {
+-            int ww = 0, wh = 0;
+-            int wrote = 0;
+-            SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+-            if (ww > 0 && wh > 0) {
+-                uint8_t *rows = (uint8_t *)malloc((size_t)ww * wh * 3);
+-                uint8_t *flip = rows ? (uint8_t *)malloc((size_t)ww * wh * 3) : NULL;
+-                if (rows && flip) {
+-                    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+-                    glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rows);
+-                    for (int y = 0; y < wh; y++)
+-                        memcpy(flip + (size_t)y * ww * 3,
+-                               rows + (size_t)(wh - 1 - y) * ww * 3,
+-                               (size_t)ww * 3);
+-                    FILE *pf = fopen(shot_path, "wb");
+-                    if (pf) {
+-                        wrote = png_write_rgb(pf, flip, (uint32_t)ww, (uint32_t)wh);
+-                        fclose(pf);
+-                    }
+-                }
+-                /* free() tolerates NULL, so both exits are covered. */
+-                free(flip);
+-                free(rows);
+-            }
+-            present_shot_done(wrote);
+-        }
+-    }
+     SDL_GL_SwapWindow(s_win);
+ }
+ 
+@@ -4038,9 +4086,19 @@
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+     p_glUseProgram(s_present_prog);
+     p_glUniform1i(s_present_uTex, 0);
+-    /* The rasterized path already renders at the internal scale, so it has no
+-     * low-res source to reconstruct — keep the plain sample. */
+-    present_set_sharp(0, 0, 0, 0, 0);
++    /* Downsample reconstruction.
++     *
++     * The default was a plain single GL_LINEAR tap, which averages a 2x2 texel
++     * neighbourhood no matter how much the image is being shrunk. Presenting a
++     * 6x internal buffer into a smaller window therefore throws most source
++     * texels away, and WHICH ones get sampled shifts as the camera moves - that
++     * is what reads as texture shimmer. Mode 2 is the Catmull-Rom bicubic path
++     * already in PRESENT_FS (9 bilinear taps), which weighs a much wider
++     * footprint and is stable under motion.
++     *
++     * Only u_tex_size matters for the bicubic branch, so passing the viewport
++     * as the output size is sufficient here. */
++    present_set_sharp(s_present_filter, tex_w, tex_h, lw, lh);
+     /* Half-texel inset: with GL_LINEAR, corner-mapped UVs make the outermost
+      * dest pixels blend the border texel with VRAM outside the content rect
+      * (visible edge stripe with AA on). Center-mapped UVs keep edge samples
+@@ -4172,6 +4230,13 @@
+ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+                               int force_4_3) {
+     if (!s_ctx || !s_raster_ok) return;
++    /* Trim blank scanlines the game never drew, BEFORE anything downstream
++     * consumes the rect. This has to happen here rather than at the final blit:
++     * when temporal interpolation owns the frame interval this function hands
++     * the rect to interp_capture/hold_capture_native_fbo and returns early,
++     * never reaching present_target_quad. Cropping there silently did nothing
++     * for anyone running with frame interpolation enabled. */
++    apply_overscan_crop(&disp_x, &disp_y, &w, &h);
+     flush_flat_batch();
+     flush_tex_batch();
+     flush_cpu_upload();
+@@ -4276,6 +4341,12 @@
+  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
+ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
+     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
++    /* Same overscan trim as the VRAM path. Vertical only: the horizontal extent
++     * here is the wide surface (g_wide_w), not a source sub-rect. */
++    {
++        int cx = 0, cw = 1;  /* dummies; only y/h are meaningful on this path */
++        apply_overscan_crop(&cx, &disp_y, &cw, &disp_h);
++    }
+     GLuint fbo = 0, tex = 0;
+     for (int i = 0; i < WIDE_MAX_SURF; i++)
+         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) {
+--- _build/psxrecomp-src/runtime/src/host_keymap.c	2026-08-29 15:55:15.129207700 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/host_keymap.c	2026-09-04 17:00:07.903819800 +0300
+@@ -97,6 +97,16 @@
+ #endif
+     if (s_actions[HOST_KEYMAP_SAVE_STATE_MENU].count == 0)
+         add_bind(HOST_KEYMAP_SAVE_STATE_MENU, (int)SDLK_F7, (int)SDL_SCANCODE_F7, 0);
++    /* Emulator convention, and clear of the keys already taken here:
++     * F7 opens the slot menu, F8 is rewind. */
++    if (s_actions[HOST_KEYMAP_QUICK_SAVE].count == 0)
++        add_bind(HOST_KEYMAP_QUICK_SAVE, (int)SDLK_F5, (int)SDL_SCANCODE_F5, 0);
++    if (s_actions[HOST_KEYMAP_QUICK_LOAD].count == 0)
++        add_bind(HOST_KEYMAP_QUICK_LOAD, (int)SDLK_F9, (int)SDL_SCANCODE_F9, 0);
++    /* Home was unbound across the whole runtime, and it is the key players
++     * already reach for to get an overlay up. */
++    if (s_actions[HOST_KEYMAP_PAUSE_MENU].count == 0)
++        add_bind(HOST_KEYMAP_PAUSE_MENU, (int)SDLK_HOME, (int)SDL_SCANCODE_HOME, 0);
+ }
+ 
+ /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
+@@ -154,6 +164,9 @@
+     if (ieq(name, "DisplayPerf")) return HOST_KEYMAP_DISPLAY_PERF;
+     if (ieq(name, "Rewind")) return HOST_KEYMAP_REWIND;
+     if (ieq(name, "SaveStateMenu")) return HOST_KEYMAP_SAVE_STATE_MENU;
++    if (ieq(name, "QuickSave")) return HOST_KEYMAP_QUICK_SAVE;
++    if (ieq(name, "QuickLoad")) return HOST_KEYMAP_QUICK_LOAD;
++    if (ieq(name, "PauseMenu")) return HOST_KEYMAP_PAUSE_MENU;
+     return HOST_KEYMAP_ACTION_COUNT;
+ }
+ 
+--- _build/psxrecomp-src/runtime/include/host_keymap.h	2026-08-29 15:55:15.027884200 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/include/host_keymap.h	2026-09-04 16:59:55.431691600 +0300
+@@ -21,6 +21,14 @@
+     HOST_KEYMAP_DISPLAY_PERF,
+     HOST_KEYMAP_REWIND,           /* default F8 */
+     HOST_KEYMAP_SAVE_STATE_MENU,  /* default F7 */
++    /* One-key save/load against a single "quick" slot, the way emulators do
++     * it - no menu, no slot picking. The menu (F7) still owns the numbered
++     * slots; these are for mid-play checkpoints. */
++    HOST_KEYMAP_QUICK_SAVE,       /* default F5 */
++    HOST_KEYMAP_QUICK_LOAD,       /* default F9 */
++    /* Pause menu: resume, quick save/load, aspect, image fit, FPS readout,
++     * restart. Home on the keyboard, Guide on a pad. */
++    HOST_KEYMAP_PAUSE_MENU,       /* default Home */
+     HOST_KEYMAP_ACTION_COUNT
+ } HostKeymapAction;
+ 
+--- _build/psxrecomp-src/runtime/runtime.cmake	2026-08-29 15:55:15.078508400 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/runtime.cmake	2026-09-04 17:00:13.192816400 +0300
+@@ -288,12 +288,12 @@
+     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
+     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
+     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
++    ${PSXRECOMP_ROOT}/runtime/src/psx_pause_menu.c
+     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c
+     ${PSXRECOMP_ROOT}/runtime/src/cosim_state.c
+     ${PSXRECOMP_ROOT}/runtime/src/cosim.c
+     ${PSXRECOMP_ROOT}/runtime/src/traps.c
+     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
+-    ${PSXRECOMP_ROOT}/runtime/src/freeze_dump_policy.c
+     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
+     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
+@@ -772,10 +772,7 @@
+     # and stamp the pgxp overlay flavor so the shard cache and the ABI gate
+     # keep pgxp and base DLLs fully separate. The base target is untouched —
+     # the macros preprocess away without the define.
+-    # PGXP_CLONE is internal: set only by the PSX_PGXP_VARIANT auto-clone at the
+-    # end of this function, to mark the sibling that needs a distinguishing exe
+-    # name. Callers pass PGXP alone.
+-    set(options ORACLE COSIM PGXP PGXP_CLONE)
++    set(options ORACLE COSIM PGXP)
+     set(oneValueArgs
+         GAME_GENERATED_DISPATCH_C
+         GAME_OVERLAY_STATIC_C
+@@ -940,22 +937,10 @@
+         set(_psxrt_exe_name "${_psxrt_exe_name}_oracle")
+     endif()
+     if(PSXRT_PGXP)
+-        # The _pgxp suffix exists only to keep the auto-cloned A/B sibling
+-        # distinct from the base binary it sits beside (PSX_PGXP_VARIANT); the
+-        # launcher or the player picks between them. Same debug port as the
+-        # base build — run one at a time (the A/B protocol is
+-        # one-toggle-per-run anyway).
+-        #
+-        # A title that builds PGXP into its ONE runtime target has no base
+-        # binary beside it, so suffixing there would ship a single product
+-        # under an odd name and, worse, leave a second look-alike executable in
+-        # the build tree for someone to launch by mistake. That is not
+-        # hypothetical: a non-PGXP binary got played and reported as "textures
+-        # still wobble" while the PGXP one measured 99% precise-vertex
+-        # coverage. Suffix the clone, never the primary.
+-        if(PSXRT_PGXP_CLONE)
+-            set(_psxrt_exe_name "${_psxrt_exe_name}_pgxp")
+-        endif()
++        # Distinct binary beside the base one; the launcher (or the player)
++        # picks the variant. Same debug port as the base build — run one at a
++        # time (the A/B protocol is one-toggle-per-run anyway).
++        set(_psxrt_exe_name "${_psxrt_exe_name}_pgxp")
+         target_compile_definitions(${target} PRIVATE
+             PSX_PGXP=1
+             PSX_OVERLAY_FLAVOR=2)   # PSX_OVERLAY_FLAVOR_PGXP (overlay_api.h)
+@@ -1673,7 +1658,7 @@
+         option(PSX_PGXP_VARIANT
+             "Also build the <exe>_pgxp PGXP precision-shadowing variant" OFF)
+         if(PSX_PGXP_VARIANT)
+-            psxrecomp_add_runtime_target(${target}-pgxp PGXP PGXP_CLONE ${ARGN})
++            psxrecomp_add_runtime_target(${target}-pgxp PGXP ${ARGN})
+         endif()
+     endif()
+ endfunction()
+--- _build/psxrecomp-src/runtime/src/psx_pause_menu.c	1970-01-01 03:00:00.000000000 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/psx_pause_menu.c	1970-01-01 03:00:00.000000000 +0300
+@@ -0,0 +1,307 @@
++/* psx_pause_menu.c - full-screen Home-key pause menu.
++ *
++ * Deliberately shaped like psx_savestate_menu.c: a dumb rasterizer that
++ * main.cpp pushes state into. Drawing primitives are duplicated rather than
++ * shared because that is what the other overlay modules do (host_osd.c and
++ * psx_savestate_menu.c each carry their own font and helpers), and each one
++ * hardcodes its own panel stride.
++ */
++
++#include "psx_pause_menu.h"
++
++#include "host_keymap.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#define PM_W 640
++#define PM_H 480
++#define PM_ROWS_Y 66
++#define PM_ROW_H 40
++#define PM_ROW_GAP 6
++#define PM_ROWS_X 40
++#define PM_ROWS_W 560
++#define PM_VALUE_X 340
++
++/* Public-domain 8x8 ASCII 32..90 subset from font8x8_basic, same table the
++ * savestate menu uses. Uppercase only; draw_char upcases and maps the rest
++ * to '?', so labels here are written uppercase to match what renders. */
++static const uint8_t FONT8[59][8] = {
++    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
++    {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
++    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
++    {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
++    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
++    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
++    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
++    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
++    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
++    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
++    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
++    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
++    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
++    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06},
++    {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00},
++    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00},
++    {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
++    {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
++    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, {0x7F,0x06,0x06,0x3E,0x06,0x06,0x7F,0x00},
++    {0x7F,0x06,0x06,0x3E,0x06,0x06,0x06,0x00}, {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
++    {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
++    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
++    {0x06,0x06,0x06,0x06,0x06,0x06,0x7F,0x00}, {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
++    {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
++    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x06,0x00}, {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
++    {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
++    {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
++    {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
++    {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
++    {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00},
++};
++
++static int s_open;
++static int s_selected;
++static int s_aspect;
++static int s_fit;
++static int s_fps_on;
++static int s_restart_armed;
++static int s_dirty = 1;
++static uint32_t s_panel[PM_W * PM_H];
++
++static const char *const ROW_LABEL[PSX_PAUSE_ROW_COUNT] = {
++    "RESUME", "QUICK SAVE", "QUICK LOAD",
++    "GAME ASPECT", "IMAGE FIT", "FPS DISPLAY", "RESTART GAME",
++};
++static const char *const ASPECT_LABEL[PSX_PAUSE_ASPECT_COUNT] = {
++    "4:3", "16:9", "21:9",
++};
++static const char *const FIT_LABEL[PSX_PAUSE_FIT_COUNT] = {
++    "LETTERBOX", "STRETCH", "FILL", "FIT WIDTH",
++};
++
++int psx_pause_menu_row_is_option(int row)
++{
++    return row == PSX_PAUSE_ROW_ASPECT
++        || row == PSX_PAUSE_ROW_FIT
++        || row == PSX_PAUSE_ROW_FPS;
++}
++
++static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
++{
++    int x, y;
++    if (x0 < 0) { w += x0; x0 = 0; }
++    if (y0 < 0) { h += y0; y0 = 0; }
++    if (x0 + w > PM_W) w = PM_W - x0;
++    if (y0 + h > PM_H) h = PM_H - y0;
++    if (w <= 0 || h <= 0) return;
++    for (y = 0; y < h; y++)
++        for (x = 0; x < w; x++)
++            dst[(y0 + y) * PM_W + (x0 + x)] = col;
++}
++
++static void stroke_rect(uint32_t *dst, int x, int y, int w, int h, uint32_t col)
++{
++    fill_rect(dst, x, y, w, 1, col);
++    fill_rect(dst, x, y + h - 1, w, 1, col);
++    fill_rect(dst, x, y, 1, h, col);
++    fill_rect(dst, x + w - 1, y, 1, h, col);
++}
++
++static void fill_disc(uint32_t *dst, int cx, int cy, int r, uint32_t col)
++{
++    int x, y;
++    for (y = -r; y <= r; y++)
++        for (x = -r; x <= r; x++)
++            if (x * x + y * y <= r * r) {
++                int dx = cx + x, dy = cy + y;
++                if ((unsigned)dx < PM_W && (unsigned)dy < PM_H)
++                    dst[dy * PM_W + dx] = col;
++            }
++}
++
++static void draw_char(uint32_t *dst, int x0, int y0, char c,
++                      uint32_t col, int scale)
++{
++    int x, y, sx, sy;
++    const uint8_t *g;
++    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
++    if (c < 32 || c > 90) c = '?';
++    g = FONT8[(int)c - 32];
++    for (y = 0; y < 8; y++) {
++        uint8_t row = g[y];
++        for (x = 0; x < 8; x++) {
++            if ((row & (1u << x)) == 0) continue;
++            for (sy = 0; sy < scale; sy++)
++                for (sx = 0; sx < scale; sx++) {
++                    int dx = x0 + x * scale + sx;
++                    int dy = y0 + y * scale + sy;
++                    if ((unsigned)dx < PM_W && (unsigned)dy < PM_H)
++                        dst[dy * PM_W + dx] = col;
++                }
++        }
++    }
++}
++
++static void draw_text(uint32_t *dst, int x, int y, const char *s,
++                      uint32_t col, int scale)
++{
++    if (!s) return;
++    while (*s) {
++        draw_char(dst, x, y, *s++, col, scale);
++        x += 8 * scale;
++    }
++}
++
++/* Right-aligned, for the value column. */
++static void draw_text_r(uint32_t *dst, int right_x, int y, const char *s,
++                        uint32_t col, int scale)
++{
++    int len = 0;
++    const char *p = s;
++    if (!s) return;
++    while (*p++) len++;
++    draw_text(dst, right_x - len * 8 * scale, y, s, col, scale);
++}
++
++static void draw_psx_button(uint32_t *dst, int x, int y, char kind)
++{
++    switch (kind) {
++    case 'x':
++        fill_disc(dst, x + 9, y + 9, 9, 0xFF2C3446u);
++        draw_text(dst, x + 5, y + 5, "X", 0xFF5FA8FFu, 1);
++        break;
++    case 'o':
++        fill_disc(dst, x + 9, y + 9, 9, 0xFF2C3446u);
++        fill_disc(dst, x + 9, y + 9, 6, 0xFFFF6B6Bu);
++        fill_disc(dst, x + 9, y + 9, 3, 0xFF2C3446u);
++        break;
++    default:
++        fill_rect(dst, x + 7, y + 2, 5, 15, 0xFFD7DCE6u);
++        fill_rect(dst, x + 2, y + 7, 15, 5, 0xFFD7DCE6u);
++        break;
++    }
++}
++
++static const char *value_for_row(int row, char *buf, size_t cap)
++{
++    switch (row) {
++    case PSX_PAUSE_ROW_ASPECT:
++        return ASPECT_LABEL[(unsigned)s_aspect < PSX_PAUSE_ASPECT_COUNT
++                            ? s_aspect : 0];
++    case PSX_PAUSE_ROW_FIT:
++        return FIT_LABEL[(unsigned)s_fit < PSX_PAUSE_FIT_COUNT ? s_fit : 0];
++    case PSX_PAUSE_ROW_FPS:
++        return s_fps_on ? "ON" : "OFF";
++    case PSX_PAUSE_ROW_RESTART:
++        if (s_restart_armed) {
++            snprintf(buf, cap, "PRESS AGAIN");
++            return buf;
++        }
++        return NULL;
++    default:
++        return NULL;
++    }
++}
++
++static void rasterize_panel(void)
++{
++    int i;
++    char buf[64];
++    char key[32];
++
++    for (i = 0; i < PM_W * PM_H; i++)
++        s_panel[i] = 0xFF0F1118u;
++
++    fill_rect(s_panel, 0, 0, PM_W, 46, 0xFF171B25u);
++    draw_text(s_panel, 24, 14, "PAUSED", 0xFFFFD24Du, 2);
++    host_keymap_label(HOST_KEYMAP_PAUSE_MENU, key, sizeof(key));
++    snprintf(buf, sizeof(buf), "%s MENU", key[0] ? key : "HOME");
++    draw_text(s_panel, 432, 18, buf, 0xFFB8BDC8u, 1);
++
++    for (i = 0; i < PSX_PAUSE_ROW_COUNT; i++) {
++        int y = PM_ROWS_Y + i * (PM_ROW_H + PM_ROW_GAP);
++        int sel = (i == s_selected);
++        int opt = psx_pause_menu_row_is_option(i);
++        uint32_t bg = sel ? 0xFF2B2830u : 0xFF191D27u;
++        uint32_t fg = sel ? 0xFFFFD24Du : 0xFFE2E5EBu;
++        uint32_t sub = sel ? 0xFFFFFFFFu : 0xFFB2B8C2u;
++        const char *val;
++
++        /* Restart stays red while armed so a second Enter is never a
++         * surprise. */
++        if (i == PSX_PAUSE_ROW_RESTART && s_restart_armed) {
++            bg = sel ? 0xFF3A2028u : 0xFF2A1820u;
++            fg = 0xFFFF8080u;
++        }
++        fill_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H, bg);
++        stroke_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H,
++                    sel ? 0xFFFFD24Du : 0xFF303746u);
++        draw_text(s_panel, PM_ROWS_X + 18, y + 16, ROW_LABEL[i], fg, 1);
++
++        buf[0] = 0;
++        val = value_for_row(i, buf, sizeof(buf));
++        if (val) {
++            if (opt && sel) {
++                draw_text(s_panel, PM_VALUE_X - 4, y + 16, "<", 0xFFFFD24Du, 1);
++                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 16, ">",
++                          0xFFFFD24Du, 1);
++            }
++            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 16, val,
++                        sub, 1);
++        }
++    }
++
++    fill_rect(s_panel, 0, 400, PM_W, 80, 0xFF171B25u);
++    draw_psx_button(s_panel, 32, 414, 'd');
++    draw_text(s_panel, 56, 418, "MOVE", 0xFFE2E5EBu, 1);
++    draw_psx_button(s_panel, 152, 414, 'x');
++    draw_text(s_panel, 176, 418, "SELECT", 0xFFE2E5EBu, 1);
++    draw_psx_button(s_panel, 288, 414, 'o');
++    draw_text(s_panel, 312, 418, "CLOSE", 0xFFE2E5EBu, 1);
++    draw_text(s_panel, 32, 444,
++              "KEYS: ARROWS MOVE/CHANGE  ENTER SELECT  ESC CLOSE",
++              0xFFB8BDC8u, 1);
++    s_dirty = 0;
++}
++
++void psx_pause_menu_set_state(int open, int selected,
++                              int aspect, int fit, int fps_on,
++                              int restart_armed)
++{
++    if (selected < 0) selected = 0;
++    if (selected >= PSX_PAUSE_ROW_COUNT) selected = PSX_PAUSE_ROW_COUNT - 1;
++    open = open ? 1 : 0;
++    fps_on = fps_on ? 1 : 0;
++    restart_armed = restart_armed ? 1 : 0;
++    if (s_open != open || s_selected != selected || s_aspect != aspect
++        || s_fit != fit || s_fps_on != fps_on
++        || s_restart_armed != restart_armed)
++        s_dirty = 1;
++    s_open = open;
++    s_selected = selected;
++    s_aspect = aspect;
++    s_fit = fit;
++    s_fps_on = fps_on;
++    s_restart_armed = restart_armed;
++}
++
++int psx_pause_menu_needs_present(void)
++{
++    return s_open;
++}
++
++int psx_pause_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
++{
++    if (!s_open) {
++        if (pixels) *pixels = NULL;
++        if (w) *w = 0;
++        if (h) *h = 0;
++        return 0;
++    }
++    if (s_dirty)
++        rasterize_panel();
++    if (pixels) *pixels = s_panel;
++    if (w) *w = PM_W;
++    if (h) *h = PM_H;
++    return 1;
++}
+--- _build/psxrecomp-src/runtime/include/psx_pause_menu.h	1970-01-01 03:00:00.000000000 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/include/psx_pause_menu.h	1970-01-01 03:00:00.000000000 +0300
+@@ -0,0 +1,55 @@
++/* psx_pause_menu.h - full-screen Home-key pause menu.
++ *
++ * Same split as psx_savestate_menu: this module is a pure rasterizer with no
++ * input handling and no state of its own beyond what is pushed into it. The
++ * state machine, navigation and the actions themselves live in main.cpp, which
++ * calls psx_pause_menu_set_state() whenever anything changes.
++ */
++#ifndef PSX_PAUSE_MENU_H
++#define PSX_PAUSE_MENU_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Row indices. Kept public so main.cpp can act on a selection without
++ * duplicating the label table. */
++enum {
++    PSX_PAUSE_ROW_RESUME = 0,
++    PSX_PAUSE_ROW_QUICK_SAVE,
++    PSX_PAUSE_ROW_QUICK_LOAD,
++    PSX_PAUSE_ROW_ASPECT,
++    PSX_PAUSE_ROW_FIT,
++    PSX_PAUSE_ROW_FPS,
++    PSX_PAUSE_ROW_RESTART,
++    PSX_PAUSE_ROW_COUNT
++};
++
++/* Value counts for the three option rows, so main.cpp can wrap the cursor
++ * without hardcoding them. */
++#define PSX_PAUSE_ASPECT_COUNT 3   /* 4:3, 16:9, 21:9 */
++#define PSX_PAUSE_FIT_COUNT    4   /* letterbox, stretch, fill, fit width */
++
++/* Non-zero when the row responds to Left/Right rather than Enter. */
++int psx_pause_menu_row_is_option(int row);
++
++/* Push the whole visible state in one call. `aspect` and `fit` are indices,
++ * `fps_on` and `restart_armed` are booleans. Only marks dirty on real change,
++ * so calling it every frame is free. */
++void psx_pause_menu_set_state(int open, int selected,
++                              int aspect, int fit, int fps_on,
++                              int restart_armed);
++
++int psx_pause_menu_needs_present(void);
++
++/* ARGB8888, top-down, fully opaque. Returns 0 and NULLs the outputs when the
++ * menu is closed. Stretched to the full window by both present paths. */
++int psx_pause_menu_overlay_image(const uint32_t **pixels, int *w, int *h);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PSX_PAUSE_MENU_H */

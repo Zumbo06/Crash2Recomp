@@ -108,6 +108,15 @@ class PlayPage(QWidget):
         self.state_lbl.setTextFormat(Qt.TextFormat.RichText)
         srow.addWidget(self.state_lbl)
         lay.addWidget(secondary)
+        # The in-game hotkeys were previously undiscoverable - none of them
+        # appeared anywhere in the launcher, so players had no way to learn
+        # that the pause menu or the quick slots existed.
+        lay.addWidget(dim(
+            "In game — Home (or Guide / Start+Select on a pad): pause menu "
+            "with restart, aspect, image fit and quick save/load. "
+            "F5 quick save, F9 quick load, F7 save slots, F8 rewind, "
+            "F toggles the FPS readout."
+        ))
         return box
 
     def _diag_strip(self) -> QFrame:
