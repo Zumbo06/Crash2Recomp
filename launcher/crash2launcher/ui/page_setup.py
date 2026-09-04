@@ -37,7 +37,7 @@ from ..config import Settings
 from ..paths import Layout
 from ..pipeline import EXIT_DISC_VERIFY_FAILED, Job
 from .common import card, dim, heading, row, section
-from .theme import ERROR, OK, TEXT_DIM, WARN
+from .theme import ERROR, OK, PAGE_MARGINS, TEXT_DIM, WARN
 from .widgets.log_console import LogConsole
 from .widgets.step_list import ACTIVE, DONE, FAILED, PENDING, StepList
 
@@ -105,7 +105,7 @@ class SetupPage(QWidget):
 
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(16)
         scroll.setWidget(body)
 

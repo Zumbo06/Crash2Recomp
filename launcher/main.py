@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from crash2launcher import config, paths, runtime  # noqa: E402
 from crash2launcher.ui.main_window import MainWindow  # noqa: E402
-from crash2launcher.ui.theme import QSS  # noqa: E402
+from crash2launcher.ui.theme import apply_theme  # noqa: E402
 
 
 def main() -> int:
@@ -33,7 +33,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Crash Bandicoot 2 Recompiled")
-    app.setStyleSheet(QSS)
+    apply_theme(app)
 
     window = MainWindow(layout, settings)
     window.show()

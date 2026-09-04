@@ -39,7 +39,7 @@ from ..config import (
     matching_preset,
 )
 from .common import card, dim, heading, row, section
-from .theme import ACCENT, TEXT_DIM
+from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
 
 # Crash 2's own framebuffer, measured from the runtime's gpu_state. The
 # supersampling multiplier scales THIS, not the 320x240 the PS1 is usually
@@ -120,7 +120,17 @@ INTERP_TARGETS = [
     ("280 fps", 280),
 ]
 
-SECTIONS = ["Display", "Image", "Audio", "Input", "Performance"]
+# Sidebar entries. These used to be a SECOND nav rail inside this page,
+# 150px wide, sharing the NavButton style with the real sidebar. They are now
+# driven from the main window via show_section(), so there is one rail.
+# "Video" is the old Display + Image sections merged - neither filled a page.
+SECTIONS = ["Video", "Audio", "Input", "Performance"]
+SECTION_HINTS = {
+    "Video": "Resolution, aspect and image quality. Applies on next launch.",
+    "Audio": "Output level and mixing.",
+    "Input": "Controllers, save states and the keys used while playing.",
+    "Performance": "Frame pacing and how streamed level code is executed.",
+}
 
 
 def _native_resolution() -> tuple[int, int] | None:
@@ -147,29 +157,27 @@ class SettingsPage(QWidget):
         self._loading = True
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(14)
+        root.setContentsMargins(*PAGE_MARGINS)
+        root.setSpacing(SPACE_4)
 
-        root.addWidget(heading(
-            "Settings",
-            "Changes apply on the next launch - use Relaunch on the Play page.",
-        ))
+        self.title = heading("Video", SECTION_HINTS["Video"])
+        root.addWidget(self.title)
         root.addWidget(self._preset_bar())
 
-        split = QHBoxLayout()
-        split.setSpacing(16)
-        split.addWidget(self._section_list(), 0)
-
+        # One stack entry per sidebar section. Video stacks the old Display and
+        # Image builders; the builders themselves are untouched, so every
+        # control keeps the attribute name the coverage test looks for.
         self.stack = QStackedWidget()
-        for builder in (self._display_page, self._image_page, self._audio_page,
-                        self._input_page, self._performance_page):
+        for builders in ((self._display_page, self._image_page),
+                         (self._audio_page,),
+                         (self._input_page,),
+                         (self._performance_page,)):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            scroll.setWidget(builder())
+            scroll.setWidget(self._merge(*[b() for b in builders]))
             self.stack.addWidget(scroll)
-        split.addWidget(self.stack, 1)
-        root.addLayout(split, 1)
+        root.addWidget(self.stack, 1)
 
         self._loading = False
         self._sync_dependent_controls()
@@ -201,29 +209,29 @@ class SettingsPage(QWidget):
             buttons,
         )
 
-    def _section_list(self) -> QWidget:
+    def _merge(self, *pages: QWidget) -> QWidget:
+        """Stack several section builders into one scrollable column."""
+        if len(pages) == 1:
+            return pages[0]
         box = QWidget()
-        box.setFixedWidth(150)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
-
-        self.section_group = QButtonGroup(self)
-        self.section_group.setExclusive(True)
-        for i, name in enumerate(SECTIONS):
-            btn = QPushButton(name)
-            btn.setObjectName("NavButton")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.section_group.addButton(btn, i)
-            lay.addWidget(btn)
-        self.section_group.idClicked.connect(self._select_section)
-        self.section_group.button(0).setChecked(True)
+        lay.setSpacing(SPACE_4)
+        for page in pages:
+            lay.addWidget(page)
         lay.addStretch(1)
         return box
 
-    def _select_section(self, index: int) -> None:
-        self.stack.setCurrentIndex(index)
+    def show_section(self, name: str) -> None:
+        """Select a section by its sidebar name. Called by the main window,
+        which now owns the only navigation rail."""
+        if name not in SECTIONS:
+            return
+        self.stack.setCurrentIndex(SECTIONS.index(name))
+        new_title = heading(name, SECTION_HINTS.get(name, ""))
+        self.layout().replaceWidget(self.title, new_title)
+        self.title.deleteLater()
+        self.title = new_title
 
     # -- sections ----------------------------------------------------------
     def _display_page(self) -> QWidget:

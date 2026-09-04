@@ -333,3 +333,81 @@ The FPS bar is no longer tied to `PSX_FPS_TELEMETRY`. It has its own flag
 (`PSX_FPS_OSD`, default **off**) because `host_osd_set_status()` has no expiry -
 so the launcher's "print telemetry to the log" checkbox was pinning a readout
 over the game that nothing ever cleared.
+
+## Pause-menu aspect change crashed the game
+
+Changing Game aspect from the Home menu killed the process. Three plausible
+causes were investigated and **ruled out** — worth recording so they are not
+re-investigated:
+
+- **A render-thread race.** There is no render thread. The log line
+  "…presents/s on the render thread" is prose; `gpu_gl_renderer.c` says
+  "(single context)" and "every blend and Swap remains on this context/thread",
+  and grepping it for thread/mutex/atomic finds only comments. Interpolation
+  sub-presents run synchronously on the calling thread.
+- **`gl_renderer_set_display_aspect()`.** It is two stores (`s_aspect_num`,
+  `s_aspect_den`) — no GL calls, no allocation.
+- **The SDL logical-size call.** `sdl_renderer` is NULL on the OpenGL path, so
+  that branch never executed.
+
+The real cause was **applying a widescreen mode 0 → 2 transition inline from
+the pause loop**, which is a blocking nested loop inside
+`sdl_vblank_present_body()` with the guest frozen mid-frame. Two compounding
+effects:
+
+1. **Host.** With `native_wide` set, `refresh_widescreen_projection()` picks
+   mode 2, whose first engage allocates the wide mirror surfaces. At
+   supersampling 5 that is 3410x2560 RGBA8 + D24S8 per surface, up to
+   `WIDE_MAX_SURF` (4) of them — roughly 280 MB of GL objects, built
+   synchronously, with no `glGetError` check on `make_tex` /
+   `glRenderbufferStorage`.
+2. **Guest.** `psx_ws_x_margin()` jumps 0 → 85 the instant `ws_mode` becomes 2,
+   which live-rewrites clip/cull constants the recompiler emitted into the
+   game's own code — notably `psx_ws_xclip_bound()` returning `0x7FFFFFFF`
+   instead of the per-primitive X-reject bound — on a frame already built at
+   4:3.
+
+**A false premise made this look safe:** the sequence was copied from
+`update_adaptive_widescreen()`, but that function is **dead code here**. It
+early-returns unless `g_ws_adaptive_view`, and the only assignment of `true` is
+in `psx_mod_set_adaptive_display_aspect()`, a mod-plugin API nothing calls. The
+pause menu was its first-ever caller.
+
+Fixed two ways, both needed:
+
+- **Staged, not inline.** `pause_menu_apply_aspect()` only records
+  `g_pending_aspect`; `pause_menu_flush_pending()` does the work from the normal
+  frame path at `main.cpp:7017`. The pause loop returns at 6688, earlier in the
+  same present body, so the change still lands on the frame the menu closes.
+  Same shape as `savestate_request_load` staging for a safe boundary.
+- **Mode 1, not mode 2.** The flush forces `g_ws_native_wide = 0`. Mode 2 needs
+  per-game viewport data Crash 2 does not have, so it allocates ~280 MB and
+  widens nothing; mode 1 (GTE X-squash + stretched present) allocates no
+  surfaces and is what the launcher already configures.
+
+Window mode (windowed/borderless/exclusive) needs none of this and is applied
+live: a single `SDL_SetWindowFullscreen()`, exactly as the Ctrl+F hotkey does.
+The GL backend re-derives its viewport from `SDL_GL_GetDrawableSize()` on every
+present. Read the row's value from `SDL_GetWindowFlags()`, never `g_fullscreen`
+— the hotkey deliberately never writes that global, so the two desync.
+
+## Launcher: Fusion + palette, then QSS
+
+`apply_theme()` sets Fusion and a dark `QPalette` before the stylesheet. The
+platform style drew light-theme combo arrows and checkmarks on dark surfaces.
+Do **not** style `QCheckBox::indicator` or `QComboBox::down-arrow`: styling
+either makes Qt stop drawing the native glyph and render only the rule, which
+is how the old theme ended up with a tickless checkbox and a blank 20px
+drop-down. Fusion draws both from the palette, using ACCENT as Highlight.
+
+Card tones use `setProperty("tone", …)` + a QSS property selector, never
+`setStyleSheet()` on the widget — a widget-level sheet resets style inheritance
+for that whole subtree, so the two warning cards had been opting out of every
+other Card rule. `common.set_tone()` does the required unpolish/polish pair.
+
+The settings sections used to be a second 150px nav rail nested inside the
+Settings page, sharing the `NavButton` object name with the real sidebar. They
+are top-level sidebar entries now, grouped PLAY / SETTINGS / TOOLS, driven
+through `SettingsPage.show_section()`. Display + Image merged into Video.
+`SettingsPage` is still one class with every control attribute unchanged, which
+is what keeps `test_settings_coverage.py` meaningful.

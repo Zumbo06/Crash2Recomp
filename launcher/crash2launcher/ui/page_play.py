@@ -29,9 +29,9 @@ from PySide6.QtWidgets import (
 from ..config import Settings, active_diagnostics
 from ..paths import Layout
 from ..runtime import GameSession, build_plan, observed_from_log
-from .common import card, dim, section
+from .common import card, dim, section, stat_row
 from .hero import HeroBanner
-from .theme import ERROR, OK, TEXT_DIM, WARN
+from .theme import ERROR, OK, PAGE_MARGINS, TEXT_DIM, WARN
 
 # "[FPS] game: 59.9 fps (1.00x) | frames: 1246"
 _FPS_RE = re.compile(r"\[FPS\][^:]*:\s*([\d.]+)\s*fps.*?\(([\d.]+)x\)", re.IGNORECASE)
@@ -58,7 +58,7 @@ class PlayPage(QWidget):
 
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 20, 28, 24)
+        lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(14)
         root.addWidget(body, 1)
 
@@ -120,11 +120,11 @@ class PlayPage(QWidget):
         return box
 
     def _diag_strip(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("Card")
-        frame.setStyleSheet(f"QFrame#Card {{ border-color: {WARN}; }}")
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(16, 12, 16, 12)
+        # tone= rather than setStyleSheet: a widget-level sheet resets style
+        # inheritance for the whole subtree, so this card used to opt out of
+        # every other Card rule.
+        frame = card(tone="warn")
+        lay = frame.layout()
         self.diag_lbl = QLabel()
         self.diag_lbl.setWordWrap(True)
         self.diag_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -143,23 +143,12 @@ class PlayPage(QWidget):
 
         return card(
             section("While running"),
-            self._stat("Performance", self.perf_lbl),
-            self._stat("Runtime reports", self.observed_lbl),
+            stat_row("Performance", self.perf_lbl),
+            stat_row("Runtime reports", self.observed_lbl),
             dim("These are what the runtime actually did, which can differ from "
                 "what was requested - the renderer clamps values it cannot honour."),
             self.notice,
         )
-
-    def _stat(self, label: str, value: QLabel) -> QWidget:
-        box = QWidget()
-        lay = QHBoxLayout(box)
-        lay.setContentsMargins(0, 0, 0, 0)
-        name = QLabel(label)
-        name.setObjectName("Dim")
-        name.setFixedWidth(150)
-        lay.addWidget(name)
-        lay.addWidget(value, 1)
-        return box
 
     # -- state -------------------------------------------------------------
     def refresh(self) -> None:

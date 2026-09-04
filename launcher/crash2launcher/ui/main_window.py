@@ -26,16 +26,38 @@ from .page_log import LogPage
 from .page_play import PlayPage
 from .page_settings import SettingsPage
 from .page_setup import SetupPage
+from .theme import SIDEBAR_W, SPACE_3
 
+# One navigation rail, grouped. The settings sections used to be a second rail
+# nested inside the Settings page; they are top-level entries now and all point
+# at the same SettingsPage widget with a different section selected.
+#
 # Advanced sits last and apart: it holds diagnostics that change how the game
 # behaves, not quality options.
-PAGES = [
-    ("setup", "Setup"),
-    ("play", "Play"),
-    ("settings", "Settings"),
-    ("log", "Log"),
-    ("advanced", "Advanced"),
+#
+# (key, label, section) - section is the SettingsPage section for settings.* keys.
+NAV_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("PLAY", [
+        ("play", "Play", ""),
+        ("setup", "Setup", ""),
+    ]),
+    ("SETTINGS", [
+        ("settings.video", "Video", "Video"),
+        ("settings.audio", "Audio", "Audio"),
+        ("settings.input", "Input", "Input"),
+        ("settings.performance", "Performance", "Performance"),
+    ]),
+    ("TOOLS", [
+        ("log", "Log", ""),
+        ("advanced", "Advanced", ""),
+    ]),
 ]
+PAGES = [item for _, items in NAV_GROUPS for item in items]
+
+# Which stack widget each nav key shows.
+_STACK_FOR = {
+    "play": "play", "setup": "setup", "log": "log", "advanced": "advanced",
+}
 
 
 class MainWindow(QWidget):
@@ -64,11 +86,15 @@ class MainWindow(QWidget):
         self.log_page = LogPage()
         self.advanced_page = AdvancedPage(settings)
 
-        self.stack.addWidget(self.setup_page)
-        self.stack.addWidget(self.play_page)
-        self.stack.addWidget(self.settings_page)
-        self.stack.addWidget(self.log_page)
-        self.stack.addWidget(self.advanced_page)
+        # Stack order is independent of the nav order now; _select maps.
+        self._stack_index = {}
+        for name, widget in (("setup", self.setup_page),
+                             ("play", self.play_page),
+                             ("settings", self.settings_page),
+                             ("log", self.log_page),
+                             ("advanced", self.advanced_page)):
+            self._stack_index[name] = self.stack.count()
+            self.stack.addWidget(widget)
 
         self.setup_page.ready.connect(self._on_build_ready)
         self.settings_page.changed.connect(self._on_settings_changed)
@@ -78,7 +104,7 @@ class MainWindow(QWidget):
 
         # Restore the page and geometry the user left on.
         start = settings.last_page if layout_.has_runtime else "setup"
-        index = next((i for i, (key, _) in enumerate(PAGES)
+        index = next((i for i, (key, _, _) in enumerate(PAGES)
                       if key == start), 0)
         self._select(index)
         if settings.window_geometry:
@@ -89,10 +115,10 @@ class MainWindow(QWidget):
     def _sidebar(self) -> QWidget:
         bar = QWidget()
         bar.setObjectName("Sidebar")
-        bar.setFixedWidth(190)
+        bar.setFixedWidth(SIDEBAR_W)
 
         lay = QVBoxLayout(bar)
-        lay.setContentsMargins(0, 0, 0, 12)
+        lay.setContentsMargins(0, 0, 0, SPACE_3)
         lay.setSpacing(0)
 
         title = QLabel("CRASH 2")
@@ -107,24 +133,35 @@ class MainWindow(QWidget):
 
         self.nav = QButtonGroup(self)
         self.nav.setExclusive(True)
-        for i, (_, label) in enumerate(PAGES):
-            btn = QPushButton(label)
-            btn.setObjectName("NavButton")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.nav.addButton(btn, i)
-            lay.addWidget(btn)
+        index = 0
+        for group, items in NAV_GROUPS:
+            caption = QLabel(group)
+            caption.setObjectName("NavGroup")
+            lay.addWidget(caption)
+            for _, label, _section in items:
+                btn = QPushButton(label)
+                btn.setObjectName("NavButton")
+                btn.setCheckable(True)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                self.nav.addButton(btn, index)
+                lay.addWidget(btn)
+                index += 1
 
         self.nav.idClicked.connect(self._select)
         lay.addStretch(1)
         return bar
 
     def _select(self, index: int) -> None:
-        self.stack.setCurrentIndex(index)
+        key, _label, sec = PAGES[index]
+        if sec:
+            self.settings_page.show_section(sec)
+            self.stack.setCurrentIndex(self._stack_index["settings"])
+        else:
+            self.stack.setCurrentIndex(self._stack_index[_STACK_FOR[key]])
         button = self.nav.button(index)
         if button:
             button.setChecked(True)
-        self.settings.last_page = PAGES[index][0]
+        self.settings.last_page = key
 
     # -- events ------------------------------------------------------------
     def _on_settings_changed(self) -> None:
@@ -138,7 +175,7 @@ class MainWindow(QWidget):
     def _on_build_ready(self) -> None:
         """The game just finished building - Play becomes usable."""
         self.play_page.refresh()
-        self._select(next(i for i, (k, _) in enumerate(PAGES) if k == "play"))
+        self._select(next(i for i, (k, _, _) in enumerate(PAGES) if k == "play"))
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.session.running:

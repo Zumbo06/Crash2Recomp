@@ -1,5 +1,5 @@
 --- _build/psxrecomp-src/runtime/src/main.cpp	2026-08-29 15:55:15.143550500 +0300
-+++ _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp	2026-09-04 17:05:19.017589500 +0300
++++ _build/Crash2Recomp/psxrecomp/runtime/src/main.cpp	2026-09-04 18:10:10.280674600 +0300
 @@ -23,9 +23,9 @@
  #include "savestate.h"
  #include "psx_rewind.h"
@@ -306,7 +306,7 @@
  static void savestate_menu_submit(int save) {
      if (savestate_submit_slot(savestate_menu_slot, save) && savestate_menu_open) {
          savestate_menu_open = 0;
-@@ -6138,6 +6064,325 @@
+@@ -6138,6 +6064,402 @@
      savestate_input_guard_arm();
  }
  
@@ -329,7 +329,23 @@
 +    { 4, 3 }, { 16, 9 }, { 21, 9 }
 +};
 +
++/* Staged display changes.
++ *
++ * The pause loop is a blocking nested loop inside sdl_vblank_present_body(),
++ * with the guest frozen mid-present and rewind_pause_present() re-presenting
++ * the held frame every 8 ms. Reconfiguring the display from there crashed the
++ * game. Everything unsafe is therefore staged here and applied by
++ * pause_menu_flush_pending() from the normal frame path, right next to
++ * update_adaptive_widescreen() - which performs this very sequence on every
++ * window resize and is proven safe there.
++ *
++ * -1 means "nothing pending". */
++static int g_pending_aspect = -1;
++
 +static int pause_menu_aspect_index(void) {
++    /* A staged pick outranks the live value so the row updates the instant the
++     * user presses Left/Right, even though the change lands a frame later. */
++    if (g_pending_aspect >= 0) return g_pending_aspect;
 +    for (int i = 0; i < PSX_PAUSE_ASPECT_COUNT; i++)
 +        if (kPauseAspect[i][0] == g_video_aspect_num &&
 +            kPauseAspect[i][1] == g_video_aspect_den)
@@ -337,26 +353,67 @@
 +    return 0;   /* something custom is live; show 4:3 rather than lying */
 +}
 +
++/* The window's ACTUAL mode, read from SDL rather than g_fullscreen.
++ * The Ctrl+F hotkey deliberately never writes g_fullscreen - that global stays
++ * the mode the config asked for - so after one press the two disagree and a
++ * row driven by g_fullscreen would display a lie. */
++static int pause_menu_window_index(void) {
++    if (!sdl_window) return 0;
++    const Uint32 f = SDL_GetWindowFlags(sdl_window);
++    /* FULLSCREEN_DESKTOP has FULLSCREEN's bit set too, so test it first. */
++    if ((f & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP)
++        return 1;   /* borderless */
++    if (f & SDL_WINDOW_FULLSCREEN)
++        return 2;   /* exclusive */
++    return 0;       /* windowed */
++}
++
 +static void pause_menu_sync_overlay(void) {
 +    psx_pause_menu_set_state(pause_menu_open, pause_menu_sel,
 +                             pause_menu_aspect_index(), g_present_fit_mode,
-+                             fps_osd_enabled(), pause_menu_restart_armed);
++                             pause_menu_window_index(), fps_osd_enabled(),
++                             pause_menu_restart_armed);
 +}
 +
-+/* Live aspect change. Same sequence update_adaptive_widescreen() uses when the
-+ * window is resized - the GL display aspect, the SDL logical size, then the
-+ * GTE/GPU widescreen projection. No relaunch. */
++/* Request only - see g_pending_aspect. Safe to call from the pause loop. */
 +static void pause_menu_apply_aspect(int index) {
 +    if (index < 0 || index >= PSX_PAUSE_ASPECT_COUNT) return;
++    g_pending_aspect = index;
++}
++
++/* Apply whatever the menu staged. Called from the normal frame path only, at a
++ * clean vblank boundary with the guest about to start a fresh frame. */
++static void pause_menu_flush_pending(void) {
++    if (g_pending_aspect < 0) return;
++    const int index = g_pending_aspect;
++    g_pending_aspect = -1;
++    if (index >= PSX_PAUSE_ASPECT_COUNT) return;
++
 +    const int num = kPauseAspect[index][0];
 +    const int den = kPauseAspect[index][1];
 +    if (num == g_video_aspect_num && den == g_video_aspect_den) return;
-+    /* A fixed pick from the menu is an explicit choice; stop following the
-+     * window or the next resize would immediately overwrite it. */
-+    g_ws_adaptive_view = false;
++
++    /* Force the GTE X-squash projection (mode 1) for runtime changes.
++     *
++     * With native_wide set, refresh_widescreen_projection() would pick mode 2,
++     * whose first engage allocates the wide mirror surfaces: at supersampling
++     * 5 that is 3410x2560 RGBA8 + D24S8 per surface, up to WIDE_MAX_SURF of
++     * them - roughly 280 MB of GL objects, built synchronously, with no
++     * glGetError check on make_tex/glRenderbufferStorage.
++     *
++     * And it buys nothing here: mode 2 renders extra columns from per-game
++     * viewport data, which Crash 2 does not have, so nw_extra stays 0 and
++     * nothing widens (tuning/NOTES.md - the documented fix for this title is
++     * native_wide = false). Mode 1 squashes the projection and stretches the
++     * present, allocates no surfaces, and is what the launcher already
++     * configures. */
++    g_ws_native_wide = 0;
++
 +    g_video_aspect_num = num;
 +    g_video_aspect_den = den;
 +    gl_renderer_set_display_aspect(num, den);
++    /* sdl_renderer is NULL on the GL path; this only matters to the software
++     * backend, which drives its scaling off the logical size. */
 +    if (sdl_renderer) {
 +        g_logical_w = 480 * num * g_video_scale / den;
 +        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
@@ -368,6 +425,19 @@
 +    if (mode < 0 || mode >= PSX_PAUSE_FIT_COUNT) return;
 +    g_present_fit_mode = mode;
 +    gl_renderer_set_scaling_mode(mode);
++}
++
++/* Live, no relaunch: the GL backend re-derives its viewport from
++ * SDL_GL_GetDrawableSize() on every present (including the pause loop's
++ * hold-present), and the software backend is logical-size driven. */
++static void pause_menu_apply_window_mode(int mode) {
++    if (mode < 0 || mode >= PSX_PAUSE_WINDOW_COUNT || !sdl_window) return;
++    if (mode == pause_menu_window_index()) return;
++    /* The index IS the mode value psx_fullscreen_flag_for_mode expects. */
++    SDL_SetWindowFullscreen(sdl_window, psx_fullscreen_flag_for_mode(mode));
++    /* Keep the configured mode in step so a later Ctrl+F toggles back into the
++     * flavour just picked, rather than the one from settings.toml. */
++    g_fullscreen = mode;
 +}
 +
 +/* Restart = boot the game again from scratch. There is no soft reset in the
@@ -451,6 +521,13 @@
 +        while (i < 0) i += PSX_PAUSE_FIT_COUNT;
 +        while (i >= PSX_PAUSE_FIT_COUNT) i -= PSX_PAUSE_FIT_COUNT;
 +        pause_menu_apply_fit(i);
++        break;
++    }
++    case PSX_PAUSE_ROW_WINDOW: {
++        int i = pause_menu_window_index() + delta;
++        while (i < 0) i += PSX_PAUSE_WINDOW_COUNT;
++        while (i >= PSX_PAUSE_WINDOW_COUNT) i -= PSX_PAUSE_WINDOW_COUNT;
++        pause_menu_apply_window_mode(i);
 +        break;
 +    }
 +    case PSX_PAUSE_ROW_FPS:
@@ -632,7 +709,7 @@
  /* Epilogue for netplay admit/pace AFTER all C++ RAII in the present body
   * is destroyed — episode snap load longjmps via psx_netplay_rb_flush_resume and
   * must not cross non-trivial destructors (UB / guest crash). */
-@@ -6190,7 +6435,10 @@
+@@ -6190,7 +6512,10 @@
       * than presents so turbo and skipped-frame modes still report game speed.
       * Skip during netplay post-load barrier — admit is stalled and the window
       * is not updating, so a climbing FPS line is misleading. */
@@ -644,7 +721,7 @@
          extern uint64_t s_frame_count;
          const Uint64 now = SDL_GetPerformanceCounter();
          const Uint64 frequency = SDL_GetPerformanceFrequency();
-@@ -6211,7 +6459,7 @@
+@@ -6211,7 +6536,7 @@
                      ? (double)g_frame_interpolation_fps
                      : g_host_refresh_hz;
              }
@@ -653,7 +730,7 @@
                  char title[256];
                  if (display_fps > 0.0) {
                      snprintf(title, sizeof(title),
-@@ -6223,7 +6471,7 @@
+@@ -6223,7 +6548,7 @@
                  }
                  SDL_SetWindowTitle(sdl_window, title);
              }
@@ -662,7 +739,7 @@
                  char osd[96];
                  if (display_fps > 0.0) {
                      snprintf(osd, sizeof(osd),
-@@ -6253,6 +6501,7 @@
+@@ -6253,6 +6578,7 @@
                  /* §27: presentation starvation — eye cares about gaps more
                   * than replay%. Pass: post-settle present_gap_p95 ≤ 33ms. */
                  netplay_present_gap_stats(&gap_p95, &gap_max);
@@ -670,7 +747,7 @@
                  std::fprintf(stderr,
                      "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
                      "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
-@@ -6264,7 +6513,7 @@
+@@ -6264,7 +6590,7 @@
                  s_np_admit_ticks = 0;
                  s_np_guest_ticks = 0;
                  s_np_timing_frames = 0;
@@ -679,7 +756,7 @@
                  std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
                               fps, speed, (unsigned long long)s_frame_count);
              }
-@@ -6351,6 +6600,32 @@
+@@ -6351,6 +6677,32 @@
                                                   (int)mod)) {
                      savestate_menu_toggle(key);
                  }
@@ -712,7 +789,7 @@
                  else if (key == SDLK_c && (mod & KMOD_CTRL)) {
                      std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                      debug_force_cd_reinsert();
-@@ -6403,11 +6678,14 @@
+@@ -6403,11 +6755,14 @@
              }
          }
          savestate_menu_poll_toggle_buttons();
@@ -727,7 +804,20 @@
          if (psx_rewind_is_open())
              rewind_host_pause_loop();
      }
-@@ -7183,66 +7461,6 @@
+@@ -6734,6 +7089,12 @@
+     /* Mod hooks. Run after all normal input sampling. */
+     mod_call_frame_hooks();
+ 
++    /* Display changes staged by the pause menu. Applied here, on the normal
++     * frame path, rather than inside the menu's own blocking loop - see
++     * g_pending_aspect. The loop above returns before this point, so a change
++     * still lands on the same frame the menu closes. */
++    pause_menu_flush_pending();
++
+     /* Resize-driven mode updates the pending aspect during BIOS boot too, but
+      * the actual wide compositor remains disengaged until game entry. */
+     update_adaptive_widescreen();
+@@ -7183,66 +7544,6 @@
      SDL_RenderClear(sdl_renderer);
      SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
      host_osd_draw_sdl(sdl_renderer);
@@ -794,7 +884,7 @@
      /* §33: remember active rect for resim hold-last (not full 640x512). */
      s_sw_hold_src = src;
      s_sw_hold_dst = dst;
-@@ -10661,8 +10879,8 @@
+@@ -10661,8 +10962,8 @@
  
  int main(int argc, char** argv) {
      /* Force line-buffered output so messages appear even if killed. */
@@ -805,7 +895,7 @@
      std::fprintf(stderr, "psxrecomp: main() entered\n");
      std::fflush(stderr);
  #if defined(RECOMP_LAUNCHER)
-@@ -10703,35 +10921,6 @@
+@@ -10703,35 +11004,6 @@
      int         cli_renderer   = -1;   /* 0=software 1=opengl 2=vulkan */
      const char* cli_window_title = nullptr;  /* label windows in a fleet */
      const char* cli_memcard_dir = nullptr;   /* isolate writable state in a fleet */
@@ -841,7 +931,7 @@
      PsxNetplayConfig net_cfg;
      psx_netplay_config_defaults(&net_cfg);
      psx_netplay_apply_env(&net_cfg);  /* CLI flags below win over env */
-@@ -10757,17 +10946,17 @@
+@@ -10757,17 +11029,17 @@
       * No --game-root flag: that remains config-driven. */
      for (int i = 1; i < argc; i++) {
          if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
@@ -863,7 +953,7 @@
          } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
              const char* r = argv[++i];
              if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
-@@ -10882,8 +11071,8 @@
+@@ -10882,8 +11154,8 @@
       * game.toml offer flags remain parseable for old projects but deliberately
       * cannot expose generic launcher controls or activate the features. Trusted
       * activation plugins apply them after launcher/settings resolution. */
@@ -874,7 +964,7 @@
      constexpr bool frame_interpolation_offered = false;
      constexpr bool skip_fmv_offered = false;
      /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
-@@ -11023,6 +11212,10 @@
+@@ -11023,6 +11295,10 @@
                  g_video_win_w = gc.runtime.video_window_width;
                  g_video_win_w_explicit = true;
              }
@@ -885,7 +975,7 @@
              g_video_aa         = gc.runtime.video_antialiasing;
              g_video_texfilter  = gc.runtime.video_texture_filter;
              g_video_fmv_filter = gc.runtime.video_fmv_filter;
-@@ -11307,10 +11500,6 @@
+@@ -11307,10 +11583,6 @@
                   * chaining and makes them overlay-cache candidates, so live-byte
                   * closures can own them instead of single-instruction dispatch
                   * thrash. Clamped to stay above the kernel window. */
@@ -896,7 +986,7 @@
                  {
                      const char* fenv = std::getenv("PSX_OVERLAY_REGION_FLOOR");
                      if (fenv && fenv[0]) {
-@@ -11415,6 +11604,8 @@
+@@ -11415,6 +11687,8 @@
          if (us.has_supersampling)  g_video_scale     = us.supersampling;
          if (us.has_window_width)   g_video_win_w     = us.window_width;
          if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
@@ -905,7 +995,7 @@
          if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
          if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
          if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
-@@ -11727,68 +11918,49 @@
+@@ -11727,68 +12001,49 @@
          overlay_autocapture_set_enabled(0);
          const char *cfg_backend = deferred_overlay_backend.empty()
                  ? nullptr : deferred_overlay_backend.c_str();
@@ -1005,7 +1095,7 @@
          }
          if (const char *e = std::getenv("PSX_OVERLAY_AUTOCOMPILE_CMD")) {
              if (e[0]) {
-@@ -12892,6 +13064,51 @@
+@@ -12892,6 +13147,51 @@
       * this aspect; native-wide fills it with a genuinely wider frame (no
       * stretch), squash mode stretches the 4:3 frame into it. */
      gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
@@ -1057,7 +1147,7 @@
      if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
          /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
           * the per-frame present path engages it at game entry. */
-@@ -13069,19 +13286,6 @@
+@@ -13069,19 +13369,6 @@
      if (game_entry_pc != 0)
          fntrace_set_game_range(game_entry_pc, 0);
  
@@ -1077,7 +1167,7 @@
    if (g_headless) {
      std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
    } else {
-@@ -13177,10 +13381,6 @@
+@@ -13177,10 +13464,6 @@
       * depend on a successful host open (Win↔Linux aux/spu fork). Routed
       * through the gated wrapper so turbo mute/sink still apply. */
      psx_set_midframe_audio_pump(sdl_audio_pump_midframe);
@@ -1088,7 +1178,7 @@
  #endif
  
      Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-@@ -13201,6 +13401,16 @@
+@@ -13201,6 +13484,16 @@
       * the image scales to fill the larger window with no further distortion. */
      int game_w = g_video_win_w, game_h = 0;
      clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
@@ -1105,7 +1195,7 @@
      sdl_window = SDL_CreateWindow(
          window_title.c_str(),
          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-@@ -13241,11 +13451,11 @@
+@@ -13241,11 +13534,11 @@
              g_host_refresh_hz = host_hz;
              if (host_hz >= 58.8 && host_hz <= 61.2) {
                  g_frame_period_ms = 1000.0 / host_hz;
@@ -1477,7 +1567,7 @@
  endfunction()
 --- _build/psxrecomp-src/runtime/src/psx_pause_menu.c	1970-01-01 03:00:00.000000000 +0300
 +++ _build/Crash2Recomp/psxrecomp/runtime/src/psx_pause_menu.c	1970-01-01 03:00:00.000000000 +0300
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,319 @@
 +/* psx_pause_menu.c - full-screen Home-key pause menu.
 + *
 + * Deliberately shaped like psx_savestate_menu.c: a dumb rasterizer that
@@ -1496,9 +1586,9 @@
 +
 +#define PM_W 640
 +#define PM_H 480
-+#define PM_ROWS_Y 66
-+#define PM_ROW_H 40
-+#define PM_ROW_GAP 6
++#define PM_ROWS_Y 60
++#define PM_ROW_H 36
++#define PM_ROW_GAP 5
 +#define PM_ROWS_X 40
 +#define PM_ROWS_W 560
 +#define PM_VALUE_X 340
@@ -1543,6 +1633,7 @@
 +static int s_selected;
 +static int s_aspect;
 +static int s_fit;
++static int s_window;
 +static int s_fps_on;
 +static int s_restart_armed;
 +static int s_dirty = 1;
@@ -1550,7 +1641,7 @@
 +
 +static const char *const ROW_LABEL[PSX_PAUSE_ROW_COUNT] = {
 +    "RESUME", "QUICK SAVE", "QUICK LOAD",
-+    "GAME ASPECT", "IMAGE FIT", "FPS DISPLAY", "RESTART GAME",
++    "GAME ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS DISPLAY", "RESTART GAME",
 +};
 +static const char *const ASPECT_LABEL[PSX_PAUSE_ASPECT_COUNT] = {
 +    "4:3", "16:9", "21:9",
@@ -1558,11 +1649,15 @@
 +static const char *const FIT_LABEL[PSX_PAUSE_FIT_COUNT] = {
 +    "LETTERBOX", "STRETCH", "FILL", "FIT WIDTH",
 +};
++static const char *const WINDOW_LABEL[PSX_PAUSE_WINDOW_COUNT] = {
++    "WINDOWED", "BORDERLESS", "EXCLUSIVE",
++};
 +
 +int psx_pause_menu_row_is_option(int row)
 +{
 +    return row == PSX_PAUSE_ROW_ASPECT
 +        || row == PSX_PAUSE_ROW_FIT
++        || row == PSX_PAUSE_ROW_WINDOW
 +        || row == PSX_PAUSE_ROW_FPS;
 +}
 +
@@ -1670,6 +1765,9 @@
 +                            ? s_aspect : 0];
 +    case PSX_PAUSE_ROW_FIT:
 +        return FIT_LABEL[(unsigned)s_fit < PSX_PAUSE_FIT_COUNT ? s_fit : 0];
++    case PSX_PAUSE_ROW_WINDOW:
++        return WINDOW_LABEL[(unsigned)s_window < PSX_PAUSE_WINDOW_COUNT
++                            ? s_window : 0];
 +    case PSX_PAUSE_ROW_FPS:
 +        return s_fps_on ? "ON" : "OFF";
 +    case PSX_PAUSE_ROW_RESTART:
@@ -1716,17 +1814,17 @@
 +        fill_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H, bg);
 +        stroke_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H,
 +                    sel ? 0xFFFFD24Du : 0xFF303746u);
-+        draw_text(s_panel, PM_ROWS_X + 18, y + 16, ROW_LABEL[i], fg, 1);
++        draw_text(s_panel, PM_ROWS_X + 18, y + 14, ROW_LABEL[i], fg, 1);
 +
 +        buf[0] = 0;
 +        val = value_for_row(i, buf, sizeof(buf));
 +        if (val) {
 +            if (opt && sel) {
-+                draw_text(s_panel, PM_VALUE_X - 4, y + 16, "<", 0xFFFFD24Du, 1);
-+                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 16, ">",
++                draw_text(s_panel, PM_VALUE_X - 4, y + 14, "<", 0xFFFFD24Du, 1);
++                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 14, ">",
 +                          0xFFFFD24Du, 1);
 +            }
-+            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 16, val,
++            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 14, val,
 +                        sub, 1);
 +        }
 +    }
@@ -1738,14 +1836,17 @@
 +    draw_text(s_panel, 176, 418, "SELECT", 0xFFE2E5EBu, 1);
 +    draw_psx_button(s_panel, 288, 414, 'o');
 +    draw_text(s_panel, 312, 418, "CLOSE", 0xFFE2E5EBu, 1);
-+    draw_text(s_panel, 32, 444,
++    draw_text(s_panel, 32, 442,
 +              "KEYS: ARROWS MOVE/CHANGE  ENTER SELECT  ESC CLOSE",
 +              0xFFB8BDC8u, 1);
++    draw_text(s_panel, 32, 458,
++              "DISPLAY CHANGES APPLY NOW BUT RESET ON NEXT LAUNCH",
++              0xFF7F8796u, 1);
 +    s_dirty = 0;
 +}
 +
 +void psx_pause_menu_set_state(int open, int selected,
-+                              int aspect, int fit, int fps_on,
++                              int aspect, int fit, int window, int fps_on,
 +                              int restart_armed)
 +{
 +    if (selected < 0) selected = 0;
@@ -1754,13 +1855,14 @@
 +    fps_on = fps_on ? 1 : 0;
 +    restart_armed = restart_armed ? 1 : 0;
 +    if (s_open != open || s_selected != selected || s_aspect != aspect
-+        || s_fit != fit || s_fps_on != fps_on
++        || s_fit != fit || s_window != window || s_fps_on != fps_on
 +        || s_restart_armed != restart_armed)
 +        s_dirty = 1;
 +    s_open = open;
 +    s_selected = selected;
 +    s_aspect = aspect;
 +    s_fit = fit;
++    s_window = window;
 +    s_fps_on = fps_on;
 +    s_restart_armed = restart_armed;
 +}
@@ -1787,7 +1889,7 @@
 +}
 --- _build/psxrecomp-src/runtime/include/psx_pause_menu.h	1970-01-01 03:00:00.000000000 +0300
 +++ _build/Crash2Recomp/psxrecomp/runtime/include/psx_pause_menu.h	1970-01-01 03:00:00.000000000 +0300
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,59 @@
 +/* psx_pause_menu.h - full-screen Home-key pause menu.
 + *
 + * Same split as psx_savestate_menu: this module is a pure rasterizer with no
@@ -1812,15 +1914,19 @@
 +    PSX_PAUSE_ROW_QUICK_LOAD,
 +    PSX_PAUSE_ROW_ASPECT,
 +    PSX_PAUSE_ROW_FIT,
++    PSX_PAUSE_ROW_WINDOW,
 +    PSX_PAUSE_ROW_FPS,
 +    PSX_PAUSE_ROW_RESTART,
 +    PSX_PAUSE_ROW_COUNT
 +};
 +
-+/* Value counts for the three option rows, so main.cpp can wrap the cursor
-+ * without hardcoding them. */
++/* Value counts for the option rows, so main.cpp can wrap the cursor without
++ * hardcoding them. */
 +#define PSX_PAUSE_ASPECT_COUNT 3   /* 4:3, 16:9, 21:9 */
 +#define PSX_PAUSE_FIT_COUNT    4   /* letterbox, stretch, fill, fit width */
++#define PSX_PAUSE_WINDOW_COUNT 3   /* windowed, borderless, exclusive - the
++                                    * order psx_fullscreen_flag_for_mode()
++                                    * uses, so the index IS the mode value. */
 +
 +/* Non-zero when the row responds to Left/Right rather than Enter. */
 +int psx_pause_menu_row_is_option(int row);
@@ -1829,7 +1935,7 @@
 + * `fps_on` and `restart_armed` are booleans. Only marks dirty on real change,
 + * so calling it every frame is free. */
 +void psx_pause_menu_set_state(int open, int selected,
-+                              int aspect, int fit, int fps_on,
++                              int aspect, int fit, int window, int fps_on,
 +                              int restart_armed);
 +
 +int psx_pause_menu_needs_present(void);

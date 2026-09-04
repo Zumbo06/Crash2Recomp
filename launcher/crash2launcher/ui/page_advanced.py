@@ -30,6 +30,7 @@ from ..config import (
     reset_diagnostics,
 )
 from .common import card, dim, heading, row, section
+from .theme import PAGE_MARGINS
 from .theme import ERROR, TEXT_DIM, WARN
 
 
@@ -50,7 +51,7 @@ class AdvancedPage(QWidget):
 
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(16)
         scroll.setWidget(body)
 
@@ -71,11 +72,8 @@ class AdvancedPage(QWidget):
 
     # -- pieces ------------------------------------------------------------
     def _banner(self) -> QWidget:
-        frame = QFrame()
-        frame.setObjectName("Card")
-        frame.setStyleSheet(f"QFrame#Card {{ border-color: {WARN}; }}")
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(16, 14, 16, 14)
+        frame = card(tone="warn")
+        lay = frame.layout()
 
         text = QLabel(
             "<b>These are measurement tools, not settings.</b><br>"

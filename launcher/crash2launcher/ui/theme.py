@@ -1,24 +1,98 @@
 """Dark theme for the launcher.
 
-One stylesheet, applied to the whole app. Colours are defined once here so the
-pages never hard-code a hex value; the accent is Crash's orange.
+Three layers, in order:
+
+1. **Fusion + QPalette** (`apply_theme`). The platform style draws light-theme
+   combo arrows, checkmarks and focus rings that look wrong on a dark surface.
+   Fusion draws all of those from the palette instead, so setting the palette
+   once gets them right everywhere - including widgets no stylesheet reaches.
+2. **Tokens** below. Every colour, spacing and radius the UI uses lives here.
+   Pages must not hard-code a hex value or a pixel margin; the previous theme
+   had ~13 hex literals baked into the stylesheet string where no palette
+   change could reach them, and repeated `(28, 24, 28, 24)` in five files.
+3. **QSS**, for the things a palette cannot express: cards, the nav rail, the
+   primary/play buttons.
+
+Deliberately NOT styled here: `QCheckBox::indicator` and
+`QComboBox::down-arrow`. Styling either one makes Qt stop drawing the native
+glyph and draw only what the rule says - which is how the old theme ended up
+with a checkbox that had no checkmark and a blank 20px drop-down zone. Fusion
+draws both correctly from the palette, using ACCENT as Highlight.
 """
 
 from __future__ import annotations
 
+from PySide6.QtGui import QColor, QPalette
+
 # --- palette --------------------------------------------------------------
-BG          = "#14161a"   # window
-BG_RAISED   = "#1c1f25"   # cards, sidebar
-BG_INPUT    = "#22262e"
-BORDER      = "#2e343e"
-TEXT        = "#e6e8ec"
-TEXT_DIM    = "#9aa2b1"
-ACCENT      = "#f07e1e"   # Crash orange
-ACCENT_HOVER= "#ff9236"
-ACCENT_DEEP = "#c25f0d"
-OK          = "#4ac97e"
-WARN        = "#e8b339"
-ERROR       = "#e8595b"
+BG            = "#0f1114"   # window
+BG_RAISED     = "#16191e"   # cards, sidebar
+BG_INPUT      = "#1d2127"   # inputs, hover fills
+BG_SUNKEN     = "#0b0d10"   # log console
+BORDER        = "#262b33"   # hairline, the default
+BORDER_STRONG = "#333a44"   # only where a card must separate from a card
+
+TEXT          = "#e8eaee"
+TEXT_DIM      = "#8d95a3"
+TEXT_FAINT    = "#5c6472"   # disabled text
+
+ACCENT        = "#f07e1e"   # Crash orange
+ACCENT_HOVER  = "#ff9236"
+ACCENT_DEEP   = "#c25f0d"   # selections, slider sub-page
+ACCENT_INK    = "#17120c"   # text ON accent - near-black, not white
+ACCENT_MUTED  = "#4a3a28"   # disabled accent fill
+
+OK            = "#4ac97e"
+WARN          = "#e8b339"
+ERROR         = "#e8595b"
+
+SCROLL        = "#2c333d"
+SCROLL_HOVER  = "#3c4552"
+
+# --- spacing scale --------------------------------------------------------
+SPACE_1, SPACE_2, SPACE_3 = 4, 8, 12
+SPACE_4, SPACE_5, SPACE_6 = 16, 24, 32
+
+RADIUS_SM, RADIUS_MD, RADIUS_LG = 6, 10, 14
+
+# Layout metrics that were previously literals repeated across the pages.
+PAGE_MARGINS = (SPACE_6, SPACE_5, SPACE_6, SPACE_5)   # was (28, 24, 28, 24)
+CARD_MARGINS = (SPACE_4 + 2, SPACE_4, SPACE_4 + 2, SPACE_4)
+LABEL_COL = 180          # the settings row label column
+SIDEBAR_W = 208
+
+
+def apply_theme(app) -> None:
+    """Install Fusion + the dark palette, then the stylesheet."""
+    app.setStyle("Fusion")
+
+    c = QColor
+    p = QPalette()
+    p.setColor(QPalette.ColorRole.Window, c(BG))
+    p.setColor(QPalette.ColorRole.WindowText, c(TEXT))
+    p.setColor(QPalette.ColorRole.Base, c(BG_INPUT))
+    p.setColor(QPalette.ColorRole.AlternateBase, c(BG_RAISED))
+    p.setColor(QPalette.ColorRole.Text, c(TEXT))
+    p.setColor(QPalette.ColorRole.Button, c(BG_INPUT))
+    p.setColor(QPalette.ColorRole.ButtonText, c(TEXT))
+    p.setColor(QPalette.ColorRole.BrightText, c(ERROR))
+    p.setColor(QPalette.ColorRole.ToolTipBase, c(BG_INPUT))
+    p.setColor(QPalette.ColorRole.ToolTipText, c(TEXT))
+    p.setColor(QPalette.ColorRole.PlaceholderText, c(TEXT_FAINT))
+    p.setColor(QPalette.ColorRole.Link, c(ACCENT))
+    # Highlight drives the checkbox tick, combo selection and focus ring.
+    p.setColor(QPalette.ColorRole.Highlight, c(ACCENT))
+    p.setColor(QPalette.ColorRole.HighlightedText, c(ACCENT_INK))
+
+    dis = QPalette.ColorGroup.Disabled
+    p.setColor(dis, QPalette.ColorRole.Text, c(TEXT_FAINT))
+    p.setColor(dis, QPalette.ColorRole.ButtonText, c(TEXT_FAINT))
+    p.setColor(dis, QPalette.ColorRole.WindowText, c(TEXT_FAINT))
+    p.setColor(dis, QPalette.ColorRole.Highlight, c(ACCENT_MUTED))
+
+    app.setPalette(p)
+    app.setStyleSheet(QSS)
+
 
 QSS = f"""
 QWidget {{
@@ -27,6 +101,7 @@ QWidget {{
     font-family: "Segoe UI", "Inter", system-ui, sans-serif;
     font-size: 13px;
 }}
+QScrollArea, QStackedWidget {{ background: transparent; border: none; }}
 
 /* ---- sidebar ---------------------------------------------------------- */
 #Sidebar {{
@@ -34,112 +109,132 @@ QWidget {{
     border-right: 1px solid {BORDER};
 }}
 #SidebarTitle {{
-    color: {ACCENT};
-    font-size: 15px;
+    color: {TEXT};
+    font-size: 16px;
     font-weight: 700;
-    padding: 18px 16px 4px 16px;
+    letter-spacing: 1px;
+    padding: {SPACE_5}px {SPACE_4}px 0 {SPACE_4}px;
 }}
 #SidebarSubtitle {{
-    color: {TEXT_DIM};
+    color: {TEXT_FAINT};
     font-size: 11px;
-    padding: 0 16px 14px 16px;
+    padding: 2px {SPACE_4}px {SPACE_5}px {SPACE_4}px;
+}}
+/* Group captions in the nav rail - the structural change that lets one rail
+   carry what used to need two. */
+#NavGroup {{
+    color: {TEXT_FAINT};
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    padding: {SPACE_4}px {SPACE_4}px {SPACE_1}px {SPACE_4}px;
 }}
 QPushButton#NavButton {{
     background: transparent;
     border: none;
-    border-left: 3px solid transparent;
-    padding: 10px 16px;
+    border-radius: {RADIUS_SM}px;
+    margin: 1px {SPACE_2}px;
+    padding: 9px {SPACE_3}px;
     text-align: left;
     color: {TEXT_DIM};
     font-size: 13px;
 }}
-QPushButton#NavButton:hover {{
-    background: {BG_INPUT};
-    color: {TEXT};
-}}
+QPushButton#NavButton:hover {{ background: {BG_INPUT}; color: {TEXT}; }}
 QPushButton#NavButton:checked {{
     background: {BG_INPUT};
-    border-left: 3px solid {ACCENT};
-    color: {TEXT};
+    color: {ACCENT};
     font-weight: 600;
 }}
 
 /* ---- headings --------------------------------------------------------- */
-QLabel#PageTitle   {{ font-size: 20px; font-weight: 700; }}
+QLabel#PageTitle   {{ font-size: 22px; font-weight: 700; }}
 QLabel#PageHint    {{ color: {TEXT_DIM}; font-size: 12px; }}
-QLabel#SectionTitle{{ font-size: 13px; font-weight: 700; color: {TEXT}; }}
+QLabel#SectionTitle{{
+    font-size: 11px; font-weight: 700; color: {TEXT_DIM};
+    letter-spacing: 1px;
+}}
 QLabel#Dim         {{ color: {TEXT_DIM}; }}
 QLabel#Ok          {{ color: {OK}; font-weight: 600; }}
 QLabel#Warn        {{ color: {WARN}; font-weight: 600; }}
 QLabel#Error       {{ color: {ERROR}; font-weight: 600; }}
 
 /* ---- cards ------------------------------------------------------------ */
+/* tone is set with setProperty("tone", ...) + style().polish(); see
+   common.card(). A widget-level setStyleSheet would break inheritance for the
+   whole subtree, which is what the old warning cards did. */
 QFrame#Card {{
     background: {BG_RAISED};
     border: 1px solid {BORDER};
-    border-radius: 8px;
+    border-radius: {RADIUS_MD}px;
 }}
+QFrame#Card[tone="warn"]  {{ border-color: {WARN}; }}
+QFrame#Card[tone="error"] {{ border-color: {ERROR}; }}
+QFrame#Card[tone="flat"]  {{ background: transparent; border-color: transparent; }}
 
 /* ---- buttons ---------------------------------------------------------- */
 QPushButton {{
     background: {BG_INPUT};
     border: 1px solid {BORDER};
-    border-radius: 6px;
-    padding: 7px 14px;
+    border-radius: {RADIUS_SM}px;
+    padding: 7px {SPACE_4}px;
     color: {TEXT};
 }}
-QPushButton:hover  {{ border-color: {ACCENT}; }}
-QPushButton:disabled {{ color: #5c6472; border-color: {BORDER}; background: #1a1d23; }}
+QPushButton:hover    {{ border-color: {ACCENT}; color: {TEXT}; }}
+QPushButton:disabled {{ color: {TEXT_FAINT}; border-color: {BORDER}; background: {BG}; }}
 
 QPushButton#Primary {{
     background: {ACCENT};
     border: 1px solid {ACCENT};
-    color: #17120c;
+    color: {ACCENT_INK};
     font-weight: 700;
 }}
 QPushButton#Primary:hover    {{ background: {ACCENT_HOVER}; border-color: {ACCENT_HOVER}; }}
-QPushButton#Primary:disabled {{ background: #4a3a28; border-color: #4a3a28; color: #8d8175; }}
+QPushButton#Primary:disabled {{
+    background: {ACCENT_MUTED}; border-color: {ACCENT_MUTED}; color: {TEXT_FAINT};
+}}
 
 QPushButton#PlayButton {{
     background: {ACCENT};
     border: none;
-    border-radius: 10px;
-    color: #17120c;
-    font-size: 19px;
+    border-radius: {RADIUS_MD}px;
+    color: {ACCENT_INK};
+    font-size: 18px;
     font-weight: 800;
-    padding: 18px 0;
+    letter-spacing: 1px;
+    padding: {SPACE_4}px 0;
 }}
 QPushButton#PlayButton:hover    {{ background: {ACCENT_HOVER}; }}
-QPushButton#PlayButton:disabled {{ background: #3a332b; color: #7d7266; }}
+QPushButton#PlayButton:disabled {{ background: {ACCENT_MUTED}; color: {TEXT_FAINT}; }}
 
 QPushButton#Danger {{ border-color: {ERROR}; color: {ERROR}; }}
+QPushButton#Danger:hover {{ background: {ERROR}; color: {ACCENT_INK}; }}
+
+/* Quiet button for secondary actions - no border until hovered. */
+QPushButton#Ghost {{ background: transparent; border-color: transparent; color: {TEXT_DIM}; }}
+QPushButton#Ghost:hover {{ background: {BG_INPUT}; color: {TEXT}; }}
 
 /* ---- inputs ----------------------------------------------------------- */
 QLineEdit, QComboBox, QSpinBox {{
     background: {BG_INPUT};
     border: 1px solid {BORDER};
-    border-radius: 6px;
+    border-radius: {RADIUS_SM}px;
     padding: 6px 9px;
+    min-height: 18px;
     selection-background-color: {ACCENT_DEEP};
 }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
-QLineEdit[readOnly="true"] {{ color: {TEXT_DIM}; }}
-QComboBox::drop-down {{ border: none; width: 20px; }}
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: {BORDER_STRONG}; }}
+QLineEdit[readOnly="true"] {{ color: {TEXT_DIM}; background: {BG}; }}
 QComboBox QAbstractItemView {{
     background: {BG_INPUT};
     border: 1px solid {BORDER};
     selection-background-color: {ACCENT_DEEP};
+    selection-color: {TEXT};
     outline: none;
+    padding: {SPACE_1}px;
 }}
-
-QCheckBox {{ spacing: 8px; }}
-QCheckBox::indicator {{
-    width: 16px; height: 16px;
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    background: {BG_INPUT};
-}}
-QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QCheckBox, QRadioButton {{ spacing: {SPACE_2}px; }}
+QCheckBox:disabled, QRadioButton:disabled {{ color: {TEXT_FAINT}; }}
 
 QSlider::groove:horizontal {{ height: 4px; background: {BORDER}; border-radius: 2px; }}
 QSlider::handle:horizontal {{
@@ -152,7 +247,7 @@ QSlider::sub-page:horizontal {{ background: {ACCENT_DEEP}; border-radius: 2px; }
 QProgressBar {{
     background: {BG_INPUT};
     border: 1px solid {BORDER};
-    border-radius: 6px;
+    border-radius: {RADIUS_SM}px;
     height: 18px;
     text-align: center;
     color: {TEXT};
@@ -161,9 +256,9 @@ QProgressBar::chunk {{ background: {ACCENT}; border-radius: 5px; }}
 
 /* ---- log console ------------------------------------------------------ */
 QPlainTextEdit#LogConsole {{
-    background: #0e1013;
+    background: {BG_SUNKEN};
     border: 1px solid {BORDER};
-    border-radius: 6px;
+    border-radius: {RADIUS_SM}px;
     font-family: "Cascadia Mono", "Consolas", monospace;
     font-size: 11px;
     color: #c3cad6;
@@ -173,24 +268,26 @@ QPlainTextEdit#LogConsole {{
 QListWidget {{
     background: {BG_INPUT};
     border: 1px solid {BORDER};
-    border-radius: 6px;
+    border-radius: {RADIUS_SM}px;
     outline: none;
 }}
-QListWidget::item {{ padding: 8px; border-bottom: 1px solid {BORDER}; }}
+QListWidget::item {{ padding: {SPACE_2}px; border-bottom: 1px solid {BORDER}; }}
 QListWidget::item:selected {{ background: {ACCENT_DEEP}; color: {TEXT}; }}
 
 /* ---- scrollbars ------------------------------------------------------- */
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
-QScrollBar::handle:vertical {{ background: #39414e; border-radius: 5px; min-height: 24px; }}
-QScrollBar::handle:vertical:hover {{ background: #48525f; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+QScrollBar::handle:vertical {{ background: {SCROLL}; border-radius: 5px; min-height: 24px; }}
+QScrollBar::handle:vertical:hover {{ background: {SCROLL_HOVER}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; }}
-QScrollBar::handle:horizontal {{ background: #39414e; border-radius: 5px; min-width: 24px; }}
+QScrollBar::handle:horizontal {{ background: {SCROLL}; border-radius: 5px; min-width: 24px; }}
 
 QToolTip {{
     background: {BG_INPUT};
     color: {TEXT};
-    border: 1px solid {ACCENT};
-    padding: 4px 7px;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: {RADIUS_SM}px;
+    padding: {SPACE_1}px 7px;
 }}
 """

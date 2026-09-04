@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from .common import heading
+from .theme import PAGE_MARGINS
 from .widgets.log_console import LogConsole
 
 
@@ -27,7 +28,7 @@ class LogPage(QWidget):
         self._max_kept = 5000
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 24)
+        root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
         root.addWidget(heading("Log", "Output from the running game."))
 
