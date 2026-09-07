@@ -43,7 +43,7 @@ def about(parent: QWidget | None) -> None:
     is a fan work using someone else's trademark - a user is entitled to see
     all three without reading the source.
     """
-    from ..version import DISCLAIMER, full_version
+    from ..version import DISCLAIMER, STATUS, full_version
 
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Information)
@@ -51,9 +51,10 @@ def about(parent: QWidget | None) -> None:
     box.setText("Crash Bandicoot 2 Recompiled")
     box.setInformativeText(
         "Version %s\n\n"
+        "%s\n\n"
         "The PlayStation game translated to native code and run directly, "
         "rather than emulated.\n\n"
-        "%s" % (full_version(), DISCLAIMER)
+        "%s" % (full_version(), STATUS, DISCLAIMER)
     )
     box.setDetailedText(
         "Licences\n"

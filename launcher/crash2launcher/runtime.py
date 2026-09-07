@@ -18,7 +18,7 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from . import gametoml, usersettings
 from .config import Settings
-from .paths import Layout, find_c_toolchain_bin
+from .paths import Layout, find_c_toolchain_bin, find_overlay_python
 
 
 @dataclass
@@ -213,8 +213,11 @@ def overlay_autocompile_cmd(layout: Layout) -> str:
 
     Used verbatim by the runtime, so every path is absolute and quoted.
     """
+    # NOT sys.executable: frozen, that is Crash2Launcher.exe and the command
+    # would relaunch the launcher rather than compile anything.
+    python = find_overlay_python() or Path(sys.executable)
     return " ".join([
-        _quote(sys.executable),
+        _quote(python),
         _quote(layout.overlay_script),
         "--captures", _quote(layout.overlay_captures),
         "--game-toml", _quote(layout.game_toml),

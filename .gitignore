@@ -102,6 +102,9 @@ _build/Crash2Recomp/*
 build/
 build-clang/
 dist/
+# Local release-packaging scripts. Anchored to the repo root so it cannot hide
+# a vendored tools/ directory deeper in the tree.
+/tools/
 out/
 cmake-build-*/
 CMakeCache.txt

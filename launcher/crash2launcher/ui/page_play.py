@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 from ..config import Settings, active_diagnostics, diagnostic_label
 from ..paths import Layout
 from ..runtime import GameSession, build_plan, observed_from_log
+from ..version import STATUS
 from .common import card, dim, section, set_status, stat_row
 from .dialogs import confirm
 from .hero import HeroBanner
@@ -86,7 +87,7 @@ class PlayPage(QWidget):
 
         self.hero = HeroBanner(
             "CRASH BANDICOOT 2",
-            "Cortex Strikes Back  -  statically recompiled, running natively",
+            "Cortex Strikes Back, recompiled to run natively",
         )
         root.addWidget(self.hero)
 
@@ -96,6 +97,9 @@ class PlayPage(QWidget):
         lay.setSpacing(14)
         root.addWidget(body, 1)
 
+        # Set expectations before the first launch, not after a player hits a
+        # glitch and assumes their disc is bad.
+        lay.addWidget(card(dim(STATUS), tone="flat"))
         lay.addWidget(self._controls())
         self.diag_strip = self._diag_strip()
         lay.addWidget(self.diag_strip)

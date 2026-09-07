@@ -4,6 +4,10 @@ The PlayStation game *Crash Bandicoot 2: Cortex Strikes Back* translated to
 native code and run directly, rather than emulated. A launcher takes a disc
 image you already own, builds the game on your machine, and runs it.
 
+> **Work in progress.** The game is completable from start to finish, but there
+> are still minor sound and graphical issues. Treat this as a preview rather
+> than a finished release, and expect rough edges.
+
 **This project contains no game data.** No game code, artwork, audio or disc
 content is distributed here. You supply your own disc image; everything derived
 from it is produced locally and never leaves your machine.

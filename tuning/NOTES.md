@@ -1007,3 +1007,68 @@ Launcher, same pass:
 
 UNVERIFIED: the audio changes still need the user's ears. Both test suites pass
 and both runtime trees build clean.
+
+## Release packaging (tools/package.ps1, v0.9.0)
+
+Model: BUILD ON THE PLAYER'S PC. We ship the launcher and the recompiler; the
+player supplies a disc image they own and the game is generated and compiled
+locally. That is a legal requirement rather than a preference - the compiled
+runtime contains the recompiled game code and is a derivative work of
+Activision's copyright, so it can never be distributed.
+
+Result: 144 MB staged, 56 MB zipped. The 761 MB clang/cmake/ninja toolchain is
+NOT bundled (a separate prerequisite); bundling it would treble the download
+and mean redistributing and licence-auditing all of LLVM, MinGW, CMake, Ninja.
+
+**Two traps found while building it, both of which would have shipped a
+silently degraded game:**
+
+1. **The stock CLI's codegen hash is c5974900; ours is 5cb10a8a.** The runtime
+   refuses a native overlay shard whose hash disagrees with the recompiler that
+   emitted it and falls back to the interpreter WITHOUT SAYING SO - the exact
+   failure documented at NOTES.md:270-291 that made months of audio captures
+   worthless. package.ps1 replaces libexec/psxrecomp-game.exe with ours and
+   prints both hashes.
+2. **The CLI bundles its own framework/ tree, which is stock upstream.** A
+   player building from it would get a runtime with NONE of tuning/patches/ -
+   no GTE sign-extension fix (Night Fight renders black), no SPU catch-up, no
+   pause menu, no presentation modes. package.ps1 ships the PATCHED tree from
+   _build/Crash2Recomp/psxrecomp/ instead, and the result is verified identical
+   to the working tree for spu.c, gte.cpp and main.cpp.
+
+Also needed and easy to miss: tools/compile_overlays.py lives only in the full
+source checkout (not in the CLI bundle, not in the project tree). Without it
+the native overlay tier cannot run at all. package.ps1 fails rather than
+shipping without it.
+
+**Three launcher bugs that only exist when frozen**, found by running the
+packaged exe rather than reasoning about it:
+
+* paths.detect() keyed PLAYER mode purely on the runtime binary sitting next to
+  the launcher. A FRESH bundle has no runtime yet, so the very first launch -
+  the only one that matters for setup - fell through to WORKSPACE paths and
+  looked for a _build tree a bundle does not contain. Now keyed on a
+  bundle.json marker that package.ps1 writes.
+* PyInstaller onedir puts the exe one level below the bundle root, so app_dir()
+  anchored inside the program folder and would have written saves next to the
+  Qt DLLs. It now walks up to the marker.
+* overlay_autocompile_cmd used sys.executable, which frozen is
+  Crash2Launcher.exe - the "compile overlays" command would have relaunched the
+  launcher. find_overlay_python() looks for a real interpreter, and
+  can_compile_overlays reports honestly when there is none.
+
+The audit step is a deny-list re-scan of what was actually staged, run after
+the allow-list copy, and it fails the build rather than warning: no disc image,
+no SCUS_941* boot executable, no generated/ (keyed on recompiler output names,
+since rabbitizer legitimately ships a directory of that name), no cache, no
+.mcd/.pst, no compiled runtime. bios/openbios.bin is allow-listed by name and
+location because it is MIT and required at boot.
+
+Verified: `Crash2Launcher.exe --paths` from the staged bundle reports
+mode=player, root=bundle root, and finds the recompiler, codegen and overlay
+script. runtime/game.toml correctly absent until the player builds.
+
+NOT yet verified end to end: an actual disc -> build -> play run from the
+bundle on a clean machine. That is the remaining acceptance test, and the thing
+to watch in its log is "overlay autocompile enabled (gcc)" rather than
+"overlay gaps -> interpreter".

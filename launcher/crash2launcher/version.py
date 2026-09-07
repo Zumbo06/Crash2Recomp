@@ -11,10 +11,18 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "0.9.0"
 
 APP_NAME = "Crash 2 Recompiled"
 ORG_NAME = "Crash2Recomp"
+
+# Shown on the Play page and in About. The game is completable, so this is a
+# preview rather than an alpha - but it is not finished, and saying so up front
+# is better than a player discovering it and assuming their disc is at fault.
+STATUS = (
+    "Work in progress. The game is playable from start to finish, with some "
+    "minor sound and graphical issues still to fix."
+)
 
 # Shown in the About panel. Trademark position: this is a fan project, it
 # includes no game data, and it is not endorsed by the rights holders.

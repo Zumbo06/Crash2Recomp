@@ -52,6 +52,19 @@ class Mode(Enum):
     WORKSPACE = "workspace"
 
 
+#: Dropped into a release bundle by tools/package.ps1. It is the marker that
+#: says "this is a shipped bundle", and it is what makes a FRESH bundle - one
+#: where the player has not built the game yet, so no runtime exists - resolve
+#: correctly. Keying player mode purely off the runtime binary meant the very
+#: first launch fell through to workspace paths and looked for a _build tree
+#: that a bundle does not contain, breaking Setup before it could run once.
+BUNDLE_MARKER = "bundle.json"
+
+
+def is_bundle(root: Path) -> bool:
+    return (root / BUNDLE_MARKER).is_file()
+
+
 def is_frozen() -> bool:
     """True when running from a PyInstaller build."""
     return getattr(sys, "frozen", False)
@@ -65,7 +78,16 @@ def app_dir() -> Path:
     levels above this file (``launcher/crash2launcher/paths.py``).
     """
     if is_frozen():
-        return Path(sys.executable).resolve().parent
+        here = Path(sys.executable).resolve().parent
+        # PyInstaller onedir puts the executable in its own folder, so in a
+        # release bundle the exe is one level BELOW the bundle root that holds
+        # data/, userdata/, recompiler/ and the marker. Walk up a little to
+        # find it; without this the launcher anchors inside its own program
+        # folder and writes saves next to the Qt DLLs.
+        for candidate in (here, *here.parents[:2]):
+            if (candidate / BUNDLE_MARKER).is_file():
+                return candidate
+        return here
     return Path(__file__).resolve().parents[2]
 
 
@@ -152,12 +174,39 @@ class Layout:
             and self.recompiler_exe.is_file()
             and self.runtime_include.is_dir()
             and find_c_toolchain_bin() is not None
+            # A frozen bundle has no interpreter of its own; without one the
+            # compile command cannot be formed at all.
+            and find_overlay_python() is not None
         )
 
     def ensure_writable_dirs(self) -> None:
         """Create the directories we own. Safe to call repeatedly."""
         for d in (self.userdata, self.save_dir, self.mods):
             d.mkdir(parents=True, exist_ok=True)
+
+
+def find_overlay_python() -> Path | None:
+    """A real Python interpreter for the overlay compile step.
+
+    The runtime shells out to compile_overlays.py while the game runs. From a
+    source checkout ``sys.executable`` is the interpreter and that is the right
+    answer. FROZEN it is Crash2Launcher.exe, so handing it to the runtime would
+    build a command that relaunches the launcher instead of compiling anything
+    - the overlay tier would silently fall back to the MIPS interpreter, which
+    is the exact degraded state that once hid an audio bug for months.
+
+    So when frozen, look for a real interpreter and report honestly when there
+    is none.
+    """
+    if not is_frozen():
+        return Path(sys.executable)
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    # The Windows launcher: `py -3` resolves any installed version.
+    found = shutil.which("py")
+    return Path(found) if found else None
 
 
 def find_c_toolchain_bin() -> Path | None:
@@ -192,22 +241,26 @@ def detect(root: Path | None = None) -> Layout:
     """Work out which shape we are running in and resolve all paths."""
     root = (root or app_dir()).resolve()
 
-    # Player mode is defined by the runtime sitting next to us. That is the one
-    # signal that is true in the shipped bundle and false in the source tree.
+    # Player mode: either the marker a packaged bundle carries, or a runtime
+    # sitting next to us (an already-built bundle, or one repackaged by hand).
     player_runtime = find_runtime(root)
-    if player_runtime is not None:
+    if player_runtime is not None or is_bundle(root):
         return Layout(
             mode=Mode.PLAYER,
             root=root,
             project=root,
-            runtime_exe=player_runtime,
+            # Before the first build there is no runtime yet; name where it
+            # will land so the Play page can say so instead of crashing.
+            runtime_exe=player_runtime or (root / RUNTIME_EXE),
             game_toml=root / "game.toml",
             disc_data=root / "data",
             userdata=root / "userdata",
             mods=root / "mods",
             build_dir=root / "build",
-            cli_exe=root / "psxrecomp.exe",
-            src_cli=root / "psxrecomp_cli.py",
+            # The recompiler ships in its own folder so its framework/ tree
+            # cannot be mistaken for the generated project.
+            cli_exe=root / "recompiler" / "psxrecomp.exe",
+            src_cli=root / "recompiler" / "psxrecomp_cli.py",
         )
 
     build = root / "_build"

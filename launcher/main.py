@@ -39,7 +39,44 @@ def _claim_taskbar_identity() -> None:
         pass
 
 
+def _print_paths() -> int:
+    """`--paths`: report where the launcher thinks everything is.
+
+    The first question in any "it does not work in the bundle" report. It runs
+    before Qt starts, writes to stdout, and needs no display - so it also works
+    over a remote shell and inside a packaging check.
+    """
+    from crash2launcher.paths import find_c_toolchain_bin, find_overlay_python
+
+    layout = paths.detect()
+    print("Crash 2 Recompiled launcher %s" % full_version())
+    print("  frozen           : %s" % paths.is_frozen())
+    print("  mode             : %s" % layout.mode.value)
+    print("  root             : %s" % layout.root)
+    rows = [
+        ("runtime", layout.runtime_exe, layout.runtime_exe.is_file()),
+        ("recompiler", layout.cli_exe, layout.cli_exe.is_file()),
+        ("codegen", layout.recompiler_exe, layout.recompiler_exe.is_file()),
+        ("overlay script", layout.overlay_script, layout.overlay_script.is_file()),
+        ("game.toml", layout.game_toml, layout.game_toml.is_file()),
+        ("disc data", layout.disc_data, layout.disc_data.is_dir()),
+        ("userdata", layout.userdata, layout.userdata.is_dir()),
+    ]
+    for label, path, present in rows:
+        print("  %-16s : [%s] %s" % (label, "ok" if present else "--", path))
+    tc = find_c_toolchain_bin()
+    py = find_overlay_python()
+    print("  C toolchain      : [%s] %s" % ("ok" if tc else "--", tc or "not found on PATH"))
+    print("  python (overlays): [%s] %s" % ("ok" if py else "--", py or "not found on PATH"))
+    print("  native overlays  : %s" % ("yes" if layout.can_compile_overlays
+                                       else "NO - level code would be interpreted"))
+    return 0
+
+
 def main() -> int:
+    if "--paths" in sys.argv:
+        return _print_paths()
+
     _claim_taskbar_identity()
 
     app = QApplication(sys.argv)
