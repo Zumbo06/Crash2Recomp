@@ -36,7 +36,8 @@ from .. import disc
 from ..config import Settings
 from ..paths import Layout
 from ..pipeline import EXIT_DISC_VERIFY_FAILED, Job
-from .common import card, dim, heading, row, section
+from .common import card, dim, heading, section, set_status
+from .dialogs import confirm
 from .theme import ERROR, OK, PAGE_MARGINS, TEXT_DIM, WARN
 from .widgets.log_console import LogConsole
 from .widgets.step_list import ACTIVE, DONE, FAILED, PENDING, StepList
@@ -92,6 +93,9 @@ class SetupPage(QWidget):
         self.layout_ = layout_
         self.settings = settings
         self._info: disc.DiscInfo | None = None
+        # Set for any image the build can use. Verification is separate: a CHD
+        # is buildable but not inspectable by this page.
+        self._disc_ok = False
         self._thread: QThread | None = None
         self._worker: _HashWorker | None = None
         self._job: Job | None = None
@@ -156,6 +160,13 @@ class SetupPage(QWidget):
             self.hash_bar,
         )
 
+    def _disc_path(self) -> Path | None:
+        """The image to hand the recompiler. For a cue this is the parsed cue
+        path; for anything we could not parse (CHD) it is what was selected."""
+        if self._info is not None:
+            return self._info.cue_path
+        return Path(self.settings.disc_path) if self.settings.disc_path else None
+
     def _browse(self) -> None:
         start = (str(Path(self.settings.disc_path).parent)
                  if self.settings.disc_path else str(Path.home()))
@@ -167,8 +178,26 @@ class SetupPage(QWidget):
 
     def _inspect(self, path: Path) -> None:
         self.path_edit.setText(str(path))
-        self._info = info = disc.parse_cue(path)
         self.settings.disc_path = str(path)
+
+        # The dialog offers .chd because the recompiler and the runtime both
+        # read it, but our inspector only understands cue sheets - it used to
+        # report "Cue sheet lists no FILE entries", which describes nothing a
+        # player can act on. Say what is actually true instead.
+        if path.suffix.lower() == ".chd":
+            self._info = None
+            self._disc_ok = True
+            set_status(
+                self.summary, "Warn",
+                "CHD selected. The build accepts it, but this page cannot "
+                "check the tracks or read the boot serial - only .cue images "
+                "can be verified here.")
+            self.steps.set_state("verify", DONE, "not verified (CHD)")
+            self._refresh()
+            return
+
+        self._info = info = disc.parse_cue(path)
+        self._disc_ok = info.ok
 
         bits = ["<b>%d</b> track(s), <b>%s</b> bytes"
                 % (len(info.tracks), format(info.total_bytes, ","))]
@@ -191,6 +220,7 @@ class SetupPage(QWidget):
     def _start_hash(self, info: disc.DiscInfo) -> None:
         self.hash_bar.setVisible(True)
         self.hash_bar.setValue(0)
+        self.cancel_btn.setEnabled(True)   # hashing is minutes on a big dump
         self._thread = QThread(self)
         self._worker = _HashWorker(info.bin_paths)
         self._worker.moveToThread(self._thread)
@@ -207,6 +237,7 @@ class SetupPage(QWidget):
     def _on_hash_done(self, digest: str) -> None:
         self._stop_thread()
         self.hash_bar.setVisible(False)
+        self.cancel_btn.setEnabled(False)
         self.settings.disc_sha1 = digest
         self.settings.disc_verified = bool(self._info and self._info.ok)
         self.steps.set_state("verify", DONE, "SHA-1 " + digest[:12])
@@ -218,6 +249,7 @@ class SetupPage(QWidget):
     def _on_hash_failed(self, message: str) -> None:
         self._stop_thread()
         self.hash_bar.setVisible(False)
+        self.cancel_btn.setEnabled(False)
         self.steps.set_state("verify", FAILED, message)
 
     def _stop_thread(self) -> None:
@@ -269,14 +301,21 @@ class SetupPage(QWidget):
 
     def _on_build(self) -> None:
         if not self.layout_.cli_exe.is_file():
-            self.build_note.setText(
-                '<span style="color:%s">The recompiler was not found at %s'
-                "</span><br>It is a separate download - see the project README."
-                % (ERROR, self.layout_.cli_exe))
+            set_status(self.build_note, "Error",
+                       "The recompiler is missing. It should sit next to this "
+                       "launcher at %s - if the download is incomplete, "
+                       "unpack it again." % self.layout_.cli_exe)
             return
-        if not (self._info and self._info.ok):
-            self.build_note.setText(
-                '<span style="color:%s">Select a valid disc first.</span>' % WARN)
+        if not self._disc_ok:
+            set_status(self.build_note, "Warn", "Select a valid disc first.")
+            return
+
+        # Rebuilding throws away a working build and costs minutes.
+        if self.layout_.has_runtime and not confirm(
+                self, "Rebuild the game?",
+                "The game is already built and playable. Rebuilding takes "
+                "several minutes and is only needed if you have changed discs.",
+                "Rebuild"):
             return
 
         self.steps.set_state("generate", ACTIVE)
@@ -289,7 +328,7 @@ class SetupPage(QWidget):
         self._job = Job(
             str(self.layout_.cli_exe),
             ["build",
-             "--disc", str(self._info.cue_path),
+             "--disc", str(self._disc_path()),
              "--output", str(self.layout_.project)],
             cwd=self.layout_.cli_exe.parent,
         )
@@ -355,15 +394,36 @@ class SetupPage(QWidget):
                 % (ERROR, message, hint))
 
     def _on_cancel(self) -> None:
+        # Cancel whichever long job is actually running. The hasher was never
+        # wired up: _HashWorker.cancel() existed and had no caller, so pressing
+        # Cancel during the SHA-1 of a ~700 MB image did nothing at all.
+        if self._worker:
+            self._worker.cancel()
         if self._job:
             self._job.cancel()
         for key, _ in BUILD_STEPS[1:]:
             self.steps.set_state(key, PENDING)
         self._finish_build(False, "Cancelled.", -1)
 
+    # -- lifecycle ---------------------------------------------------------
+    @property
+    def busy(self) -> bool:
+        """A build is in flight. The window asks before closing on this."""
+        return bool(self._job and self._job.running)
+
+    def shutdown(self) -> None:
+        """Stop everything this page owns. Without it, closing the launcher
+        mid-build orphaned cmake/ninja and left the hash thread running."""
+        if self._worker:
+            self._worker.cancel()
+        if self._job:
+            self._job.cancel()
+            self._job = None
+        self._stop_thread()
+
     # -- state -------------------------------------------------------------
     def _refresh(self) -> None:
-        have_disc = bool(self._info and self._info.ok)
+        have_disc = self._disc_ok
         self.build_btn.setEnabled(have_disc and not (self._job and self._job.running))
 
         if self.layout_.has_runtime:

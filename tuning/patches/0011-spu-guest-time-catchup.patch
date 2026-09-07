@@ -1,0 +1,209 @@
+--- a/runtime/src/spu.c
++++ b/runtime/src/spu.c
+@@ -757,8 +757,8 @@
+  * call site in spu_render) if a better-documented filter emerges. */
+ /* The 39-tap half-band FIR the SPU applies at the 44.1 <-> 22.05 kHz
+  * boundary (psx-spx, "SPU Reverb Formula": reverb down/upsampling filter).
+- * Symmetric; every odd tap except the centre is zero; taps sum to 0x8000, so
+- * (acc >> 15) is unity gain. */
++ * Symmetric; every odd tap except the centre is zero. Taps sum to 0x7FFE, so
++ * (acc >> 15) is unity gain to within -0.0005 dB. */
+ #define REV_FIR_TAPS 39
+ static const int32_t REV_FIR[REV_FIR_TAPS] = {
+     -0x0001, 0x0000,  0x0002, 0x0000, -0x000A, 0x0000,  0x0023, 0x0000,
+@@ -913,7 +913,16 @@
+                 v->env_level = 0;
+             }
+         }
++        /* Whole sample steps that ran past the end of the old block belong at
++         * the head of the new one. decode_block() zeroes sample_idx, so carry
++         * them across by hand — dropping them is the pitch>1.0 position slip
++         * documented at the phase advance below. Bounded by 3 (14-bit pitch),
++         * clamped anyway so a malformed pitch can never index out of range. */
++        int carry = v->sample_idx - SPU_BLOCK_SAMPLES;
++        if (carry < 0) carry = 0;
++        if (carry >= SPU_BLOCK_SAMPLES) carry = SPU_BLOCK_SAMPLES - 1;
+         decode_block(v);
++        v->sample_idx = carry;
+     }
+ 
+     /* Noise mode (NON bit set): the voice outputs the live noise LFSR value
+@@ -976,10 +985,20 @@
+      * pitch to the counter, so zero holds. */
+     uint32_t pitch = voice_reg(idx, 2) & 0x3FFFu;
+     v->phase += pitch;
++    /* Let sample_idx run PAST the end of the block; the decode at the top of
++     * the next call carries the overflow into the new block (see there).
++     *
++     * Breaking out here instead — the previous shape — abandoned the unconsumed
++     * phase: decode_block() resets sample_idx to 0 but left phase >= 0x1000,
++     * and the Gaussian index is (phase >> 4) & 0xFF, so 0x1000 aliases to
++     * index 0. Every block boundary silently dropped up to three whole sample
++     * steps and restarted the interpolation window in the wrong place. Only
++     * reachable above 1.0x (pitch > 0x1000), i.e. exactly the pitched-up sound
++     * effects, once per 28 samples. Pitch is 14 bits (max ~4.0x), so at most
++     * four steps run per call and the carry can never exceed 3. */
+     while (v->phase >= 0x1000u) {
+         v->phase -= 0x1000u;
+         v->sample_idx++;
+-        if (v->sample_idx >= SPU_BLOCK_SAMPLES) break;
+     }
+     return (int16_t)shaped;
+ }
+@@ -1511,6 +1530,36 @@
+     out->cd_underflow_frames = cd_underflow_frames;
+ }
+ 
++/* ---- guest-time catch-up ------------------------------------------------
++ *
++ * The SPU is pumped in blocks: the guest runs frozen while spu_render() emits
++ * ~8 ms of audio at once, so between pumps the envelope state is STALE by up
++ * to a whole block. That is invisible for output, and fatal for the registers
++ * the guest reads back to make decisions.
++ *
++ * Crash 2 (and the stock BIOS engine) allocate voices by polling CURVOL and
++ * taking any voice whose envelope reads 0 — measured: ~280k CURVOL reads and
++ * ZERO ENDX reads across a session, so CURVOL is the ONLY signal the game
++ * uses. Key a sound on, poll a few hundred cycles later, and our env_level is
++ * still exactly 0 because no render has happened yet; the game concludes the
++ * voice it just keyed is free and keys another sound onto it, truncating the
++ * first. On hardware the envelope has already advanced hundreds of samples.
++ *
++ * So: before serving any envelope-derived register, render up to the guest's
++ * current cycle. The host owns the cycle accounting and the output sink, so it
++ * installs the callback (main.cpp) rather than spu.c reaching for either.
++ *
++ * The callback MUST early-out when less than one output frame (768 guest
++ * cycles) is due — this runs on the CURVOL path, hundreds of thousands of
++ * times per session. */
++static void (*s_catchup_fn)(void) = NULL;
++
++void spu_set_catchup(void (*fn)(void)) { s_catchup_fn = fn; }
++
++static inline void spu_catch_up(void) {
++    if (s_catchup_fn) s_catchup_fn();
++}
++
+ uint32_t spu_read(uint32_t addr) {
+     if (addr >= 0x1F801C00u && addr <= 0x1F801DFFu) {
+         uint32_t idx = reg_index(addr);
+@@ -1581,6 +1630,9 @@
+                 && (idx & 7u) == 6u) {
+                 int v = (int)(idx >> 3);
+                 if (v >= 0 && v < SPU_VOICE_COUNT) {
++                    /* Advance to guest-now first: this is the voice-allocation
++                     * signal, and a stale zero here is read as "free". */
++                    spu_catch_up();
+                     spu_alloc_trace_curvol(v, voices[v].env_level);
+                     return voices[v].env_level;
+                 }
+@@ -1596,6 +1648,8 @@
+         int v  = (int)(half >> 1);
+         int ch = (int)(half & 1u);
+         if (v < SPU_VOICE_COUNT) {
++            /* Sweep-aware live volume: same staleness argument as CURVOL. */
++            spu_catch_up();
+             return (uint32_t)(uint16_t)chan_volume(
+                 voice_reg(v, ch), &sweep_voice_env[v][ch]);
+         }
+@@ -1659,6 +1713,14 @@
+                 spu_irq_check(transfer_addr, 2u);
+             }
+ 
++            /* KEYON/KEYOFF: flush the audio owed for the time BEFORE this
++             * edge, so the voice being replaced keeps the tail it actually
++             * sounded and the new voice starts at the right sample. Without
++             * this the whole block renders with the post-edge voice state and
++             * the previous sound's last ~8 ms is overwritten, not just cut. */
++            if (addr >= 0x1F801D88u && addr <= 0x1F801D8Eu)
++                spu_catch_up();
++
+             if (addr == 0x1F801D88u) {
+                 kon_latch = (kon_latch & 0xFFFF0000u) | (uint32_t)(uint16_t)value;
+                 key_on((uint32_t)(uint16_t)value);
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2829,6 +2829,13 @@
+  * sdl_audio_fadein_left is declared with present_session_reset. */
+ static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
+ 
++/* Guest-cycle audio clock. File scope rather than function statics so the SPU
++ * register catch-up (sdl_audio_catch_up below) can test whether a whole output
++ * frame is even owed before paying for a pump — it runs on the CURVOL read
++ * path, which the game polls hundreds of thousands of times per session. */
++static uint64_t s_audio_last_cycles = 0;
++static uint64_t s_audio_cycle_carry = 0;
++
+ static void sdl_audio_pump(bool discard_output = false) {
+     /* Guest-cycle SPU advance must not depend on host audio device/backpressure.
+      * Win↔Linux rollback forked on aux/spu when one peer skipped spu_render
+@@ -2889,8 +2896,8 @@
+      * produced vs 44100/s consumed = recurring ring underruns no +/-0.5%
+      * DRC trim could absorb during jitter spikes). */
+     extern uint64_t psx_cycle_count;
+-    static uint64_t last_cycles = 0;
+-    static uint64_t cycle_carry = 0;
++    uint64_t &last_cycles = s_audio_last_cycles;
++    uint64_t &cycle_carry = s_audio_cycle_carry;
+     const uint64_t now_cycles = psx_cycle_count;
+     if (g_audio_cycle_resync) {
+         last_cycles = now_cycles;
+@@ -3367,6 +3374,31 @@
+     }
+ }
+ 
++/* SPU register catch-up (installed with spu_set_catchup).
++ *
++ * The SPU calls this before serving CURVOL / per-voice CURRENT volume and on
++ * KEYON/KEYOFF, so voice-allocation polling sees a live envelope instead of one
++ * up to a whole render block (~8 ms) stale. See the long note in spu.c: Crash 2
++ * picks free voices purely by reading CURVOL == 0, so a stale zero makes it key
++ * a second sound onto a voice it started microseconds earlier, truncating the
++ * first.
++ *
++ * Goes through the same gate as the mid-frame pump, so turbo mute and the
++ * discard-only sink keep their existing, user-validated semantics. */
++static void sdl_audio_catch_up(void) {
++    extern uint64_t psx_cycle_count;
++    static int in_catch_up = 0;
++    if (in_catch_up) return;   /* spu_render never reads registers; belt and braces */
++    /* Hot path: bail before touching the device or the bridge unless at least
++     * one whole output frame (768 guest cycles) is owed. Matches the frames
++     * computation in sdl_audio_pump exactly. */
++    if ((psx_cycle_count - s_audio_last_cycles) + s_audio_cycle_carry < 768u)
++        return;
++    in_catch_up = 1;
++    sdl_audio_pump_midframe();
++    in_catch_up = 0;
++}
++
+ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
+     {   /* Tag audio events with the vblank frame counter. */
+         extern uint64_t s_frame_count;
+@@ -13464,6 +13496,8 @@
+      * depend on a successful host open (Win↔Linux aux/spu fork). Routed
+      * through the gated wrapper so turbo mute/sink still apply. */
+     psx_set_midframe_audio_pump(sdl_audio_pump_midframe);
++    /* Envelope-derived SPU registers read live guest time, not last block's. */
++    spu_set_catchup(sdl_audio_catch_up);
+ #endif
+ 
+     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+--- a/runtime/include/spu.h
++++ b/runtime/include/spu.h
+@@ -10,6 +10,15 @@
+ void spu_init(void);
+ void spu_render(int16_t* out_stereo, int frames);
+ 
++/* Install the guest-time catch-up callback (see spu.c). The host renders and
++ * sinks whatever audio is owed up to the current guest cycle; the SPU calls it
++ * before serving envelope-derived registers (CURVOL, per-voice CURRENT volume)
++ * and on KEYON/KEYOFF, so voice-allocation polling sees live state instead of
++ * a value up to one render block stale. Pass NULL to disable.
++ *
++ * The callback is on the CURVOL path (hundreds of thousands of calls per
++ * session) and MUST early-out when under one output frame is due. */
++void spu_set_catchup(void (*fn)(void));
+ 
+ typedef struct SpuDebugInfo {
+     uint32_t ctrl;

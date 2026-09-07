@@ -41,26 +41,6 @@ def card(*children: QWidget, spacing: int = SPACE_3, tone: str = "") -> QFrame:
     return frame
 
 
-def set_tone(widget: QWidget, tone: str) -> None:
-    """Change a card's tone after construction.
-
-    Qt does not re-evaluate property selectors on its own - without the
-    unpolish/polish pair the new value is stored and ignored, which is exactly
-    why the old `setProperty("active", ...)` call did nothing.
-    """
-    widget.setProperty("tone", tone or None)
-    widget.style().unpolish(widget)
-    widget.style().polish(widget)
-
-
-def page_body(*, spacing: int = SPACE_4) -> tuple[QWidget, QVBoxLayout]:
-    """A page's content column, with the standard margins."""
-    body = QWidget()
-    lay = QVBoxLayout(body)
-    lay.setContentsMargins(*PAGE_MARGINS)
-    lay.setSpacing(spacing)
-    return body, lay
-
 
 def heading(title: str, hint: str = "") -> QWidget:
     """Page title with an optional one-line explanation beneath it."""
@@ -113,6 +93,22 @@ def err(text: str) -> QLabel:
     return _tagged(text, "Error")
 
 
+def set_status(label: QLabel, tone: str, text: str) -> None:
+    """Re-tone an EXISTING label whose text changes at runtime.
+
+    ``tone`` is "", "Ok", "Warn" or "Error". Qt only re-evaluates a stylesheet
+    when a widget is re-polished, so changing the object name alone leaves the
+    old colour on screen - the same trap that made an earlier setProperty call
+    elsewhere in the UI a silent no-op.
+    """
+    label.setText(text)
+    if label.objectName() != tone:
+        label.setObjectName(tone)
+        style = label.style()
+        style.unpolish(label)
+        style.polish(label)
+
+
 def row(label: str, widget: QWidget, label_width: int = LABEL_COL) -> QWidget:
     """A left-aligned label paired with a control."""
     box = QWidget()
@@ -142,15 +138,6 @@ def stat_row(label: str, value: QLabel) -> QWidget:
     lay.addWidget(value, 1)
     return box
 
-
-def hstack(*children: QWidget, spacing: int = SPACE_2) -> QWidget:
-    box = QWidget()
-    lay = QHBoxLayout(box)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(spacing)
-    for child in children:
-        lay.addWidget(child)
-    return box
 
 
 def stretch() -> QWidget:

@@ -40,11 +40,6 @@ EXIT_MEANING = {
 _NINJA_RE = re.compile(r"^\[(\d+)/(\d+)\]")
 
 
-@dataclass
-class Step:
-    key: str
-    label: str
-
 
 class Job(QObject):
     """One external command, streamed to the UI."""

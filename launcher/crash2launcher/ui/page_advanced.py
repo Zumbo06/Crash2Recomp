@@ -27,11 +27,12 @@ from ..config import (
     DIAGNOSTIC_SETTINGS,
     Settings,
     active_diagnostics,
+    diagnostic_label,
     reset_diagnostics,
 )
-from .common import card, dim, heading, row, section
+from .common import card, dim, heading, row, section, set_status
+from .dialogs import confirm
 from .theme import PAGE_MARGINS
-from .theme import ERROR, TEXT_DIM, WARN
 
 
 class AdvancedPage(QWidget):
@@ -99,18 +100,18 @@ class AdvancedPage(QWidget):
         self.audio_shadow.setChecked(self.settings.audio_shadow)
         self.audio_shadow.toggled.connect(self._on_audio_shadow)
 
-        warn = QLabel(
-            f'<span style="color:{ERROR}"><b>Known to cause dropouts.</b></span> '
+        legacy_note = QLabel(
+            "Known to cause dropouts. "
             + DIAGNOSTIC_SETTINGS["audio_legacy"]
             + " It exists only to measure the bridge against a baseline."
         )
-        warn.setWordWrap(True)
-        warn.setTextFormat(Qt.TextFormat.RichText)
+        legacy_note.setObjectName("Error")
+        legacy_note.setWordWrap(True)
 
         return card(
             section("Audio diagnostics"),
             self.audio_legacy,
-            warn,
+            legacy_note,
             self.audio_shadow,
             dim(DIAGNOSTIC_SETTINGS["audio_shadow"]),
         )
@@ -121,10 +122,6 @@ class AdvancedPage(QWidget):
         self.debug_port.setSpecialValueText("Off")
         self.debug_port.setValue(self.settings.debug_port)
         self.debug_port.valueChanged.connect(self._on_debug_port)
-
-        self.fps_telemetry = QCheckBox("Print fps telemetry to the log and window title")
-        self.fps_telemetry.setChecked(self.settings.fps_telemetry)
-        self.fps_telemetry.toggled.connect(self._on_telemetry)
 
         self.voice_alloc_trace = QCheckBox("Trace SPU voice allocation")
         self.voice_alloc_trace.setChecked(self.settings.voice_alloc_trace)
@@ -146,12 +143,11 @@ class AdvancedPage(QWidget):
             section("Capture / debug server"),
             row("Debug server port", self.debug_port),
             dim(
-                "Serves spu_events, spu_voices, audio_stats and gpu_state over "
-                "TCP - what the capture scripts in _build/ read. 4370 is the "
-                "port those scripts expect."
+                "Serves the sound, video and CPU state over TCP so a capture "
+                "tool can read it while the game runs. Use 4370 unless you "
+                "have a reason not to."
             ),
             self.build_lbl,
-            self.fps_telemetry,
             self.voice_alloc_trace,
             dim(DIAGNOSTIC_SETTINGS["voice_alloc_trace"]),
             self.overlay_interpreter,
@@ -174,27 +170,20 @@ class AdvancedPage(QWidget):
     def refresh(self) -> None:
         names = active_diagnostics(self.settings)
         if names:
-            self.active_lbl.setText(
-                f'<span style="color:{WARN}"><b>Active now:</b> '
-                + ", ".join(names) + "</span>"
-            )
+            set_status(self.active_lbl, "Warn",
+                       "Active now: " + ", ".join(diagnostic_label(n) for n in names))
         else:
-            self.active_lbl.setText(
-                f'<span style="color:{TEXT_DIM}">Nothing active - normal play.</span>'
-            )
+            set_status(self.active_lbl, "", "Nothing active - normal play.")
 
         # The debug server only exists in the debugtools build, so asking for a
         # port silently swaps which binary runs. Say so rather than surprise.
         if self.settings.debug_port:
-            self.build_lbl.setText(
-                f'<span style="color:{WARN}">Runs the <b>debugtools</b> build '
-                "instead of the release build (tracing overhead). Set to Off "
-                "for normal play.</span>"
-            )
+            set_status(self.build_lbl, "Warn",
+                       "Runs the debugtools build instead of the release "
+                       "build, which is slower. Set the port to Off for "
+                       "normal play.")
         else:
-            self.build_lbl.setText(
-                f'<span style="color:{TEXT_DIM}">Release build will be used.</span>'
-            )
+            set_status(self.build_lbl, "", "Release build will be used.")
 
     def _touch(self) -> None:
         self.refresh()
@@ -214,9 +203,6 @@ class AdvancedPage(QWidget):
         self.settings.debug_port = value
         self._touch()
 
-    def _on_telemetry(self, on: bool) -> None:
-        self.settings.fps_telemetry = on
-        self._touch()
 
     def _on_voice_alloc_trace(self, on: bool) -> None:
         self.settings.voice_alloc_trace = on
@@ -230,12 +216,27 @@ class AdvancedPage(QWidget):
         self.settings.force_interpreter = on
         self._touch()
 
+    # Every diagnostic's control, keyed by the settings field it edits. Driving
+    # the re-sync from DIAGNOSTIC_SETTINGS rather than a hand-written list is
+    # what stops this drifting again: the reset used to clear all of them but
+    # refresh only four checkboxes, so voice_alloc_trace, overlay_interpreter
+    # and force_interpreter stayed visibly ticked while their setting was off.
+    def _diagnostic_controls(self) -> dict:
+        return {name: getattr(self, name, None) for name in DIAGNOSTIC_SETTINGS}
+
     def _on_reset(self) -> None:
+        if not confirm(
+            self, "Reset diagnostics?",
+            "Every measurement tool goes back off and the game returns to "
+            "normal playback.", "Reset"):
+            return
         reset_diagnostics(self.settings)
         self._loading = True
-        self.audio_legacy.setChecked(self.settings.audio_legacy)
-        self.audio_shadow.setChecked(self.settings.audio_shadow)
-        self.debug_port.setValue(self.settings.debug_port)
-        self.fps_telemetry.setChecked(self.settings.fps_telemetry)
+        for name, widget in self._diagnostic_controls().items():
+            value = getattr(self.settings, name)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QSpinBox):
+                widget.setValue(int(value))
         self._loading = False
         self._touch()

@@ -1,0 +1,60 @@
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1178,6 +1178,14 @@
+ static bool          g_video_win_h_explicit = false;
+ static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
+ static int           g_audio_freq     = 44100; /* host device request */
++/* Output latency: the DRC bridge's target ring fill in ms. game.toml
++ * [audio] buffer_ms has been parsed and range-checked (30..500) since the
++ * config loader was written but was never read by anything, so the bridge
++ * always ran on its built-in 180 ms. That is a lot of latency for a
++ * platformer; it is now honoured, with PSX_AUDIO_BUFFER_MS as the A/B
++ * override. Only meaningful in bridge mode - the legacy push path has its
++ * own fixed 200 ms queue ceiling. */
++static int           g_audio_buffer_ms = 180;
+ static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+ static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
+ static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
+@@ -11520,6 +11528,7 @@
+                 psx_ws_set_backdrop_sites(gc.ws_backdrop_x_sites.data(),
+                                           (int)gc.ws_backdrop_x_sites.size());
+             g_audio_spu_hq     = gc.runtime.audio_spu_hq;
++            g_audio_buffer_ms  = gc.runtime.audio_buffer_ms;
+             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
+             /* [controller] game-declared input defaults (settings.toml/launcher
+              * still override below). */
+@@ -11887,6 +11896,13 @@
+      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
+     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
+     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
++    /* Audio output latency (bridge target fill) and host master volume. The
++     * launcher sets both from its Audio page; volume 0 is how Mute is
++     * expressed, so an explicit 0 must be honoured rather than treated as
++     * "unset" - hence the empty-string check instead of a truth test. */
++    if (const char *e = std::getenv("PSX_AUDIO_BUFFER_MS")) {
++        if (e[0]) g_audio_buffer_ms = atoi(e);
++    }
+     if (const char *e = std::getenv("PSX_AUDIO_VOLUME")) {
+         if (e[0]) host_volume_set(atoi(e));   /* clamps internally */
+     }
+@@ -13488,6 +13504,20 @@
+                 cfg.channels    = 2;
+                 cfg.source_rate = 44100.0;            /* SPU render rate */
+                 cfg.host_rate   = (double)have.freq;  /* actual device rate */
++                /* Output latency. Ring capacity must stay clear of the target
++                 * or the controller has no headroom to correct into; the
++                 * shipped defaults keep 100 ms of slack, so preserve that
++                 * ratio rather than the absolute 280 ms. */
++                {
++                    int ms = g_audio_buffer_ms;
++                    if (ms < 30)  ms = 30;
++                    if (ms > 500) ms = 500;
++                    cfg.target_ms = (double)ms;
++                    cfg.ring_ms   = (double)(ms + 100);
++                    if (ms != 180)
++                        std::printf("psxrecomp: audio latency %d ms "
++                                    "(ring %d ms)\n", ms, ms + 100);
++                }
+                 if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+             }
+             g_audio_host_rate = have.freq;

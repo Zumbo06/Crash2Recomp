@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -26,18 +26,51 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import Settings, active_diagnostics
+from ..config import Settings, active_diagnostics, diagnostic_label
 from ..paths import Layout
 from ..runtime import GameSession, build_plan, observed_from_log
-from .common import card, dim, section, stat_row
+from .common import card, dim, section, set_status, stat_row
+from .dialogs import confirm
 from .hero import HeroBanner
 from .theme import ERROR, OK, PAGE_MARGINS, TEXT_DIM, WARN
 
 # "[FPS] game: 59.9 fps (1.00x) | frames: 1246"
 _FPS_RE = re.compile(r"\[FPS\][^:]*:\s*([\d.]+)\s*fps.*?\(([\d.]+)x\)", re.IGNORECASE)
 
+# Windows reports a fatal exception as the negative of its NTSTATUS. These are
+# the ones a player can actually hit; anything else falls back to the number.
+_EXIT_REASONS = {
+    -1073741819: ("access violation",
+                  "The game read or wrote memory it does not own."),
+    -1073741795: ("illegal instruction",
+                  "The game tried to run something that is not code."),
+    -1073741676: ("divide by zero", "The game divided by zero."),
+    -1073740791: ("stack overflow", "The game ran out of stack space."),
+    -1073741571: ("stack overflow", "The game ran out of stack space."),
+}
+
+
+def _is_crash(code: int) -> bool:
+    """True for an abnormal termination rather than a clean or asked-for exit.
+    A stop from the launcher terminates the process, so treat 1 and 15 as ours
+    rather than reporting them to the player as a crash."""
+    return code not in (0, 1, 15)
+
+
+def _exit_explanation(code: int) -> str:
+    named = _EXIT_REASONS.get(code)
+    if named:
+        return "%s (%s). This is a bug in the recompilation, not in your disc." % (
+            named[1], named[0])
+    return ("The game stopped unexpectedly with code %d." % code)
+
 
 class PlayPage(QWidget):
+    # (exit code, plain-language explanation). The window listens and brings
+    # the Log page forward - a crash report is useless if the log is two
+    # clicks away and the player does not know it exists.
+    crashed = Signal(int, str)
+
     def __init__(self, layout_: Layout, settings: Settings, session: GameSession,
                  parent: QWidget | None = None):
         super().__init__(parent)
@@ -45,6 +78,7 @@ class PlayPage(QWidget):
         self.settings = settings
         self.session = session
         self._observed: dict[str, str] = {}
+        self._relaunch_pending = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -84,7 +118,7 @@ class PlayPage(QWidget):
 
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.session.stop)
+        self.stop_btn.clicked.connect(self._on_stop)
 
         self.relaunch_btn = QPushButton("Relaunch")
         self.relaunch_btn.setToolTip("Restart with the current settings")
@@ -154,23 +188,22 @@ class PlayPage(QWidget):
     def refresh(self) -> None:
         names = active_diagnostics(self.settings)
         if names:
-            self.diag_lbl.setText(
-                f'<span style="color:{WARN}"><b>Diagnostics active:</b> '
-                + ", ".join(names) +
-                "</span><br>These change how the game behaves and can make it "
-                "worse. Turn them off on the Advanced page for normal play."
-            )
+            set_status(
+                self.diag_lbl, "Warn",
+                "Diagnostics active: "
+                + ", ".join(diagnostic_label(n) for n in names)
+                + ". These change how the game behaves and can make it worse. "
+                  "Turn them off on the Advanced page for normal play.")
             self.diag_strip.setVisible(True)
         else:
             self.diag_strip.setVisible(False)
 
         if not self.layout_.has_runtime:
-            plan = build_plan(self.layout_, self.settings)
             self.play_btn.setEnabled(False)
-            self.notice.setText(
-                f'<span style="color:{ERROR}">The recompiled game was not found.'
-                f'</span><br><span style="color:{TEXT_DIM}">{plan.program}</span>'
-            )
+            set_status(self.notice, "Error",
+                       "The game has not been built yet. Open Setup, choose "
+                       "your disc image, and build it - that only needs doing "
+                       "once.")
         else:
             self.play_btn.setEnabled(not self.session.running)
 
@@ -178,9 +211,8 @@ class PlayPage(QWidget):
         self.refresh()
         if self.session.running:
             self.relaunch_btn.setEnabled(True)
-            self.notice.setText(
-                f'<span style="color:{WARN}">Settings changed - relaunch to '
-                "apply.</span>")
+            set_status(self.notice, "Warn",
+                       "Settings changed - relaunch to apply.")
 
     # -- actions -----------------------------------------------------------
     def _on_play(self) -> None:
@@ -191,27 +223,53 @@ class PlayPage(QWidget):
         self.session.launch(build_plan(self.layout_, self.settings))
 
     def _on_relaunch(self) -> None:
+        # Starting again immediately raced the shutdown: stop() falls back to
+        # kill() after 4 s without waiting, and QProcess.start() on a process
+        # that is still running fails with a console warning and no UI change.
+        # Wait for the exit, then let _on_finished start the new run.
+        self._relaunch_pending = True
+        self.relaunch_btn.setEnabled(False)
         self.session.stop()
-        self._on_play()
+
+    def _on_stop(self) -> None:
+        if not confirm(self, "Stop the game?",
+                       "Anything since your last save is lost. The game saves "
+                       "to its memory card at the usual points, and F5 makes a "
+                       "quick save at any time.", "Stop"):
+            return
+        self.session.stop()
 
     # -- session -----------------------------------------------------------
     def _on_started(self) -> None:
-        self.state_lbl.setText(f'<span style="color:{OK}">Running</span>')
+        set_status(self.state_lbl, "Ok", "Running")
         self.play_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.relaunch_btn.setEnabled(True)
 
     def _on_finished(self, code: int) -> None:
-        colour = TEXT_DIM if code == 0 else ERROR
-        self.state_lbl.setText(
-            f'<span style="color:{colour}">Exited ({code})</span>')
         self.play_btn.setEnabled(self.layout_.has_runtime)
         self.stop_btn.setEnabled(False)
         self.relaunch_btn.setEnabled(False)
 
+        if self._relaunch_pending:
+            self._relaunch_pending = False
+            self._on_play()
+            return
+
+        if code == 0:
+            set_status(self.state_lbl, "", "Exited")
+            self.notice.setText("")
+            return
+
+        # A crash used to read "Exited (-1073741819)" in small grey text, which
+        # tells a player nothing. Name it, and put the log within reach.
+        set_status(self.state_lbl, "Error", "Crashed" if _is_crash(code)
+                   else "Exited (%d)" % code)
+        self.crashed.emit(code, _exit_explanation(code))
+
     def _on_failed(self, message: str) -> None:
-        self.state_lbl.setText(f'<span style="color:{ERROR}">Failed</span>')
-        self.notice.setText(f'<span style="color:{ERROR}">{message}</span>')
+        set_status(self.state_lbl, "Error", "Failed to start")
+        set_status(self.notice, "Error", message)
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 

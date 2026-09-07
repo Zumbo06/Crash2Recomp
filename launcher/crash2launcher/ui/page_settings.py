@@ -12,7 +12,7 @@ from a quality option.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -155,6 +155,12 @@ class SettingsPage(QWidget):
         super().__init__(parent)
         self.settings = settings
         self._loading = True
+
+        # Coalesces saves from continuous controls (see _touch).
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(300)
+        self._save_timer.timeout.connect(self.changed.emit)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(*PAGE_MARGINS)
@@ -367,15 +373,41 @@ class SettingsPage(QWidget):
         self.mute = QCheckBox("Mute")
         self.mute.setChecked(self.settings.mute)
         self.mute.toggled.connect(self._on_mute)
+        self.volume.setEnabled(not self.settings.mute)
+
+        # Latency: named choices rather than a raw millisecond spinner. The
+        # runtime accepts 30-500; these are the three that are worth offering.
+        self.audio_latency_ms = QComboBox()
+        for label, ms in (("Low - 60 ms", 60),
+                          ("Normal - 90 ms", 90),
+                          ("Safe - 180 ms", 180)):
+            self.audio_latency_ms.addItem(label, ms)
+        idx = self.audio_latency_ms.findData(self.settings.audio_latency_ms)
+        if idx < 0:                       # hand-edited value: keep it visible
+            self.audio_latency_ms.addItem(
+                "Custom - %d ms" % self.settings.audio_latency_ms,
+                self.settings.audio_latency_ms)
+            idx = self.audio_latency_ms.count() - 1
+        self.audio_latency_ms.setCurrentIndex(idx)
+        self.audio_latency_ms.currentIndexChanged.connect(self._on_audio_latency)
+
+        self.audio_hq = QCheckBox("Higher-quality sound mixing")
+        self.audio_hq.setChecked(self.settings.audio_hq)
+        self.audio_hq.toggled.connect(self._on_audio_hq)
 
         return self._wrap(
             card(
                 section("Audio"),
                 row("Volume", vol_row),
                 self.mute,
-                dim("Audio diagnostics live on the Advanced page. If sound is "
-                    "dropping out, check there first - the legacy audio path "
-                    "disables the buffer's rate control and causes underruns."),
+                row("Latency", self.audio_latency_ms),
+                dim("How far ahead the game buffers sound. Lower responds "
+                    "faster; too low and it crackles. Drop to Safe if you "
+                    "hear crackling."),
+                self.audio_hq,
+                dim("Re-mixes the sound at higher precision. Slightly more "
+                    "CPU. The game checks it against the normal mix while it "
+                    "plays and falls back on its own if they ever disagree."),
             ),
         )
 
@@ -439,6 +471,14 @@ class SettingsPage(QWidget):
         self.native_overlays.setChecked(self.settings.native_overlays)
         self.native_overlays.toggled.connect(self._on_native_overlays)
 
+        self.fps_telemetry = QCheckBox("Show performance readout on the Play page")
+        self.fps_telemetry.setChecked(self.settings.fps_telemetry)
+        self.fps_telemetry.toggled.connect(self._on_fps_telemetry)
+
+        self.developer_mode = QCheckBox("Developer mode")
+        self.developer_mode.setChecked(self.settings.developer_mode)
+        self.developer_mode.toggled.connect(self._on_developer_mode)
+
         return self._wrap(
             card(
                 section("Frame pacing"),
@@ -455,6 +495,17 @@ class SettingsPage(QWidget):
                 self.native_overlays,
                 dim("Crash 2 streams level code from disc. Without this it runs "
                     "on the MIPS interpreter - correct, but far slower."),
+            ),
+            card(
+                section("Reporting"),
+                self.fps_telemetry,
+                dim("Feeds the performance line on the Play page. Costs "
+                    "nothing but a line in the log."),
+                self.developer_mode,
+                dim("Adds the Advanced page: capture and measurement tools "
+                    "used to investigate bugs. They can make the game slower "
+                    "or sound worse, so they stay switched off, and unreachable, "
+                    "unless you turn this on."),
             ),
         )
 
@@ -537,11 +588,18 @@ class SettingsPage(QWidget):
         self._sync_dependent_controls()
         self._refresh_preset_label()
 
-    def _touch(self) -> None:
+    def _touch(self, debounce: bool = False) -> None:
         self._sync_dependent_controls()
         self._refresh_preset_label()
-        if not self._loading:
-            self.changed.emit()
+        if self._loading:
+            return
+        if debounce:
+            # Continuous controls (the volume slider) emit per pixel, and each
+            # commit rewrites settings.toml and re-parses game.toml. Coalesce.
+            self._save_timer.start()
+            return
+        self._save_timer.stop()
+        self.changed.emit()
 
     # -- handlers ----------------------------------------------------------
     def _on_renderer(self, value: str) -> None:
@@ -606,10 +664,30 @@ class SettingsPage(QWidget):
     def _on_volume(self, value: int) -> None:
         self.settings.volume = value
         self.volume_lbl.setText("%d%%" % value)
-        self._touch()
+        # Dragging the slider fires per pixel, and each commit rewrites
+        # settings.toml and re-parses game.toml. Show the number immediately,
+        # save once the value settles.
+        self._touch(debounce=True)
 
     def _on_mute(self, on: bool) -> None:
         self.settings.mute = on
+        self.volume.setEnabled(not on)
+        self._touch()
+
+    def _on_audio_latency(self, index: int) -> None:
+        self.settings.audio_latency_ms = self.audio_latency_ms.itemData(index)
+        self._touch()
+
+    def _on_audio_hq(self, on: bool) -> None:
+        self.settings.audio_hq = on
+        self._touch()
+
+    def _on_fps_telemetry(self, on: bool) -> None:
+        self.settings.fps_telemetry = on
+        self._touch()
+
+    def _on_developer_mode(self, on: bool) -> None:
+        self.settings.developer_mode = on
         self._touch()
 
     def _on_merge(self, on: bool) -> None:

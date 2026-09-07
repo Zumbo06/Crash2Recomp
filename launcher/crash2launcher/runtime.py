@@ -56,7 +56,10 @@ def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
     args += ["--window-title", "Crash Bandicoot 2 Recompiled"]
 
     # Opens the runtime's TCP debug server - how we read the SPU event ring.
-    if settings.debug_port:
+    # Developer mode gates it: it also swaps in the debugtools binary, so a
+    # stale port in a carried-over settings file must not quietly change which
+    # executable a player runs.
+    if settings.debug_port and settings.developer_mode:
         args += ["--debug-port", str(settings.debug_port)]
 
     env = _build_env(settings)
@@ -95,7 +98,7 @@ def _runtime_for(layout: Layout, settings: Settings) -> Path:
     listens on nothing. Asking for a debug port has to mean the debugtools
     build, or the setting is a trap.
     """
-    if settings.debug_port:
+    if settings.debug_port and settings.developer_mode:
         debug_exe = layout.project / "build-debugtools" / layout.runtime_exe.name
         if debug_exe.is_file():
             return debug_exe
@@ -139,20 +142,35 @@ def _build_env(settings: Settings) -> dict[str, str]:
     if settings.frame_blend:
         env["PSX_FRAME_BLEND"] = "1"
 
-    # Audio diagnostics for the sound cut-off work.
-    if settings.audio_legacy:
-        env["PSXRECOMP_AUDIO_LEGACY"] = "1"
-    if settings.audio_shadow:
+    # Audio output. Volume is the runtime's host master volume (the same one
+    # the numpad +/- keys drive); Mute is volume 0 rather than a separate flag,
+    # so the two controls cannot disagree.
+    env["PSX_AUDIO_VOLUME"] = "0" if settings.mute else str(settings.volume)
+    env["PSX_AUDIO_BUFFER_MS"] = str(settings.audio_latency_ms)
+    if settings.audio_hq:
         env["PSX_AUDIO_SHADOW"] = "1"
 
+    # Not a diagnostic: this is what the Play page's performance readout is
+    # parsed from, and it only writes lines to a log we already capture.
     if settings.fps_telemetry:
         env["PSX_FPS_TELEMETRY"] = "1"
-    if settings.voice_alloc_trace:
-        env["PSX_VOICE_ALLOC_TRACE"] = "1"
-    if settings.overlay_interpreter:
-        env["PSX_OVERLAY_NATIVE_OFF"] = "1"
-    if settings.force_interpreter:
-        env["PSX_FORCE_INTERP"] = "1"
+
+    # Diagnostics. Every one of these makes the game slower, worse, or both,
+    # and they exist for measurement. Developer mode is a hard gate rather than
+    # only a UI filter: a settings.json carried over from a debugging session
+    # must not keep degrading a player's game just because the page that set it
+    # is now hidden.
+    if settings.developer_mode:
+        if settings.audio_legacy:
+            env["PSXRECOMP_AUDIO_LEGACY"] = "1"
+        if settings.audio_shadow:
+            env["PSX_AUDIO_SHADOW"] = "1"
+        if settings.voice_alloc_trace:
+            env["PSX_VOICE_ALLOC_TRACE"] = "1"
+        if settings.overlay_interpreter:
+            env["PSX_OVERLAY_NATIVE_OFF"] = "1"
+        if settings.force_interpreter:
+            env["PSX_FORCE_INTERP"] = "1"
 
     # Presentation fit. Only "stretch"/"fill" change anything; letterbox is the
     # runtime default, so we still pass it explicitly to make a relaunch after
@@ -255,9 +273,6 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
     Uses the line-preserving writer in :mod:`gametoml`, so comments and key
     order in the generated game.toml survive.
     """
-    if not layout.game_toml.is_file():
-        return
-
     # settings.toml sits beside the runtime executable and layers over
     # game.toml. Fullscreen mode, window size, CRT and texture filtering exist
     # ONLY here - there is no game.toml key or env override for them.
@@ -270,6 +285,13 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
     # independent installs.
     for build_dir in _settings_targets(layout):
         usersettings.save(build_dir / "settings.toml", settings)
+
+    # game.toml is optional; settings.toml is not. Returning early on a missing
+    # game.toml used to skip the settings.toml write above too, so in any tree
+    # without one (a bundle staged before its first build) fullscreen, window
+    # size, CRT and texture filtering silently did nothing.
+    if not layout.game_toml.is_file():
+        return
 
     gametoml.update(
         layout.game_toml,
@@ -315,28 +337,6 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
         },
     )
 
-
-def effective_scale_from_log(line: str) -> int | None:
-    """Pull the scale the renderer *actually* used out of its startup line.
-
-    The request is clamped to SW_MAX_INTERNAL_SCALE and can also fall back on
-    an allocation failure, so the log is the only trustworthy source. Matches:
-    ``psxrecomp: GL GPU pipeline ready (internal scale 2x, ...``
-    """
-    match = _SCALE_RE.search(line)
-    return int(match.group(1)) if match else None
-
-
-_SCALE_RE = re.compile(r"internal scale\s+(\d+)x")
-
-# "psxrecomp: widescreen 16:9 (GTE X-squash + stretched present; ...)"
-_WIDESCREEN_RE = re.compile(r"widescreen\s+(\d+:\d+)")
-# "psxrecomp: presentation fit = fill"
-_FIT_RE = re.compile(r"presentation fit = (\S+)")
-# "psxrecomp: overlay autocompile enabled (gcc); ..."
-_OVERLAY_RE = re.compile(r"overlay autocompile enabled \((\w+)\)")
-# "GL temporal frame blending enabled: 240.0 presents/s ..."
-_BLEND_RE = re.compile(r"frame blending enabled:\s*([\d.]+)\s*presents/s")
 
 
 def observed_from_log(line: str) -> tuple[str, str] | None:

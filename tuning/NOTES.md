@@ -871,3 +871,139 @@ Old savestates canonicalise on the first helper call.
 Same bug class to watch for: any game that reads V registers back after a
 GTE op (per-vertex lighting done on the CPU). Verified only by the user's
 Night Fight test at the time of writing.
+
+## Sound effects cut off early: SPU guest-time catch-up (patch 0011)
+
+Symptom the user reports now that the game is completable: a jump/spin/crate
+effect stops abruptly when several sounds overlap. NOTES.md:257-262 already
+named voice stealing as the last open lead. This is the mechanism.
+
+**The SPU is pumped in blocks, and the guest reads envelopes between pumps.**
+spu_render() emits a whole block while the guest is frozen; the pump runs twice
+per vblank, so a block is ~370 frames = ~8 ms (main.cpp:2884-2936, and
+spu.c already called this out as "the write-to-render quantization audit").
+Between pumps every envelope-derived register is stale by up to a whole block.
+
+That is invisible for OUTPUT and fatal for ALLOCATION. The earlier capture work
+established that Crash 2 makes 0 ENDX reads against ~280k CURVOL reads: CURVOL
+is the only signal it uses to find a free voice, and it takes any voice reading
+0. So the game keys a sound on, polls a few hundred cycles later, reads the
+env_level we have not advanced yet (still exactly 0 from key_on's memset), and
+keys the next sound onto the voice it started microseconds ago. The first effect
+is truncated. On hardware that envelope has already advanced hundreds of
+samples and the voice reads busy. Every allocation decision inside a block is
+made against a stale envelope, so this fires constantly in dense scenes.
+
+Fix: render up to the guest's current cycle BEFORE serving the registers the
+decision depends on.
+  * spu.c gains a catch-up callback (spu_set_catchup, spu.h). Called at the
+    CURVOL branch of spu_read, the per-voice CURRENT-volume block
+    (0x1F801E00..), and on KEYON/KEYOFF writes (0x1F801D88..0x1F801D8E). NOT on
+    ordinary register writes - pitch/volume do not need it and the extra
+    renders would fragment the block for nothing.
+  * main.cpp installs sdl_audio_catch_up next to the mid-frame pump
+    registration. It routes through sdl_audio_pump_midframe, so the turbo mute
+    and discard-sink gates keep their existing validated semantics.
+  * The audio clock statics (last_cycles/cycle_carry) moved to file scope as
+    s_audio_last_cycles/s_audio_cycle_carry so the hook can early-out on
+    "less than one output frame (768 cycles) owed" with a subtract and a
+    compare. That path runs on every CURVOL poll; it must stay this cheap.
+  * Re-entrancy guarded, though spu_render never reads registers.
+
+KEYON also flushes: without it the whole block renders with post-edge voice
+state, so the previous sound's last ~8 ms is overwritten rather than merely cut.
+
+No new SPU state, so spu_snapshot_* is untouched. Netplay/rollback keeps the
+same cycle accounting and g_audio_cycle_resync behaviour.
+
+Watch for: the event ring now takes an AUDIO_EV_RENDER per catch-up, so it
+wraps sooner during capture. Per-call spu_render overhead is small (register
+reads plus a 24-voice active scan, no allocation on the default path), but if
+FPS regresses the mitigation is a minimum-chunk threshold in the early-out.
+
+**Also in 0011, unrelated to the above:**
+
+* Pitch > 1.0 lost phase at every block boundary. The phase-advance loop broke
+  out when sample_idx hit 28 without consuming the remaining phase;
+  decode_block() then zeroed sample_idx but left phase >= 0x1000, and the
+  Gaussian index is (phase >> 4) & 0xFF so 0x1000 aliases to index 0. Up to
+  three whole sample steps were dropped and the interpolation window restarted
+  in the wrong place, once per 28 samples, on exactly the pitched-up sound
+  effects. The loop now runs to completion and the overflow is carried into the
+  new block (bounded by 3 for 14-bit pitch, clamped anyway).
+* Reverb FIR comment said the taps sum to 0x8000; they sum to 0x7FFE
+  (-0.0005 dB). Comment corrected, table untouched.
+
+UNVERIFIED at the time of writing: both trees build clean, but the audible
+result and the LIVE-key-on count still need the user's A/B run. The pre-0011
+debugtools binary is preserved in the session scratchpad as
+Crash2_BEFORE_debugtools.exe so the baseline can still be taken.
+
+## Audio latency, volume and mute (patch 0012 + launcher)
+
+Three dead knobs, all wired now.
+
+* **game.toml [audio] buffer_ms was parsed and never read.** config_loader has
+  range-checked it (30..500, default 180) since it was written, and nothing in
+  runtime/src ever looked at runtime.audio_buffer_ms, so the DRC bridge always
+  used its built-in 180 ms target. main.cpp now picks it up next to
+  audio_spu_hq and applies it at rab_config time, keeping the shipped 100 ms of
+  slack between target_ms and ring_ms rather than the absolute 280 ms.
+  PSX_AUDIO_BUFFER_MS overrides for A/B, matching the convention of the other
+  latency knobs. The launcher offers Low 60 / Normal 90 / Safe 180 and now
+  defaults to 90: 180 ms of output latency is a lot for a platformer, and the
+  bridge's controller has always had the headroom - it just was not asked.
+* **Volume and Mute were dead controls.** They were declared, clamped, drawn
+  and persisted, and reached nothing: absent from _build_env, absent from the
+  settings.toml writer (which only ever emitted [video]). The runtime already
+  had the sink - host_volume_get(), applied after the fade, the same value the
+  numpad +/- keys drive. PSX_AUDIO_VOLUME now carries it, and Mute is expressed
+  as volume 0 rather than a second flag so the two cannot disagree. An
+  environment variable rather than settings.toml deliberately: the alternative
+  meant adding a field to the recompiler's config_loader, and while that header
+  is NOT in codegen_hash_sources.cmake (checked), it would still have forced a
+  recompiler rebuild for a launcher feature.
+* **spu_hq had no UI at all.** Exposed as "Higher-quality sound mixing".
+
+Launcher, same pass:
+
+* fps_telemetry was classified as a diagnostic while defaulting to True. Since
+  active_diagnostics() reports anything deviating from its default, turning it
+  OFF made the Play page announce "Diagnostics active: fps_telemetry" - the
+  warning fired exactly when nothing was wrong. It is not a diagnostic: it
+  prints lines to a log we already capture, and the Play page's performance
+  readout is parsed from them. Moved to Settings -> Performance, still on.
+* Developer mode (default off) hides the Advanced page AND hard-gates every
+  diagnostic in _build_env and the debugtools binary swap, so a settings.json
+  carried over from a debugging session cannot keep degrading a player's game
+  after the page that set it is hidden.
+* Diagnostics are reported by display name now, not raw field name.
+* "Reset all diagnostics" cleared seven settings and re-synced four checkboxes,
+  leaving three visibly ticked while off. Driven from DIAGNOSTIC_SETTINGS now.
+* apply_config_settings returned early when game.toml was missing, which also
+  skipped the settings.toml write - so in a tree without one, fullscreen,
+  window size, CRT and texture filtering silently did nothing.
+* Relaunch raced stop/start (terminate falls back to kill after 4 s without
+  waiting, and QProcess.start on a live process fails silently); it waits for
+  the exit now. Stop, Rebuild, Clear log and close-during-build all confirm.
+* Crashes were reported as "Exited (-1073741819)" in small grey text. Named
+  exit codes now map to plain language, the Log page comes forward, and the log
+  can be saved to a file - the runtime writes no log of its own, so the
+  launcher's capture is the only record.
+* _HashWorker.cancel() had no caller: Cancel during the SHA-1 of a ~700 MB
+  image did nothing. Wired, and the button is enabled during hashing.
+* Closing mid-build orphaned cmake/ninja and the hash thread. SetupPage.busy /
+  shutdown() now take the job down.
+* The file dialog offered .chd while the inspector only reads cue sheets, so a
+  CHD reported "Cue sheet lists no FILE entries". A CHD is now accepted as
+  buildable-but-unverifiable, and "buildable" is tracked separately from
+  "verified" so the Build button still works for it.
+* Added: app/window icon (drawn, no shipped art), AppUserModelID so the taskbar
+  stops grouping under python.exe, version.py, an About panel carrying the
+  licence position, a startup try/except that reports failure in a dialog
+  rather than a traceback on a console a player does not have, README.md, and
+  launcher/test_ui_smoke.py (builds the window, toggles developer mode, selects
+  every page, asserts no diagnostic env leaks).
+
+UNVERIFIED: the audio changes still need the user's ears. Both test suites pass
+and both runtime trees build clean.

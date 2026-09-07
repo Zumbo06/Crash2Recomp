@@ -156,6 +156,14 @@ class Settings:
     # --- audio ------------------------------------------------------------
     volume: int = 100
     mute: bool = False
+    # Output latency: how much audio the runtime keeps buffered ahead of the
+    # speakers, in milliseconds. Lower reacts faster; too low and the buffer
+    # runs dry and crackles. 90 is comfortable on a normal desktop; 180 was
+    # the old hard-coded value and is the safe choice on a busy machine.
+    audio_latency_ms: int = 90
+    # Higher-quality SPU mix (float re-render, verified against the canonical
+    # mix and dropped automatically if it ever disagrees).
+    audio_hq: bool = False
     # Diagnostics for the sound cut-off investigation.
     audio_legacy: bool = False
     audio_shadow: bool = False
@@ -166,10 +174,25 @@ class Settings:
     # launcher supplies from psxrecomp's own clang pack.
     native_overlays: bool = True
 
+    # --- developer --------------------------------------------------------
+    # Reveals the Advanced page. Off for players: the controls behind it are
+    # measurement tools that make the game slower or worse, and none of them
+    # should be reachable by accident. While this is off the launcher also
+    # refuses to pass any diagnostic to the runtime, so a settings file
+    # carried over from a debugging session cannot leak into normal play.
+    developer_mode: bool = False
+
     # --- diagnostics ------------------------------------------------------
     # Non-zero opens the runtime's TCP debug server, which is how we read the
     # SPU event ring (spu_events / spu_voices).
     debug_port: int = 0
+    # NOT a diagnostic: it only prints "[FPS] ..." lines that the launcher
+    # already captures, and the Play page's performance readout is parsed from
+    # them. It was listed as one, and because active_diagnostics() reports
+    # anything deviating from its default, a player who turned it OFF made the
+    # Play page announce "Diagnostics active: fps_telemetry" - a warning that
+    # fired precisely when none were. It is an ordinary setting on the
+    # Performance page now, and stays on so the readout works.
     fps_telemetry: bool = True
     # Summarises, every ~5s, how the game picks SPU voices: key-ons per voice
     # index plus each voice's phase and envelope level. Reading it needs no
@@ -217,6 +240,8 @@ class Settings:
         # The runtime hard-clamps supersampling to SW_MAX_INTERNAL_SCALE.
         self.supersampling = max(1, min(MAX_SUPERSAMPLING, int(self.supersampling or 1)))
         self.volume = max(0, min(100, int(self.volume or 0)))
+        # Mirrors the runtime's own accepted range for [audio] buffer_ms.
+        self.audio_latency_ms = max(30, min(500, int(self.audio_latency_ms or 90)))
         if self.vsync not in (-1, 0, 1):
             self.vsync = 0
         if self.fullscreen_mode not in (0, 1, 2):
@@ -297,11 +322,6 @@ DIAGNOSTIC_SETTINGS: dict[str, str] = {
         "- so the launcher runs that build instead of the release one, with "
         "tracing overhead."
     ),
-    "fps_telemetry": (
-        "Prints per-second frame statistics to the log and the window title. "
-        "Harmless, but noisy. It no longer pins a readout over the game - "
-        "that is the pause menu's FPS display row, or the F key."
-    ),
     "voice_alloc_trace": (
         "Every ~5s, logs how the game is picking SPU voices. Does not change "
         "how the game sounds - it only counts and prints. For diagnosing the "
@@ -327,6 +347,26 @@ def _diagnostic_default(name: str) -> Any:
         if f.name == name:
             return f.default
     return None
+
+
+# Human names for the places a diagnostic is reported back to the user. The UI
+# used to print the raw field name, so the Play page warned about
+# "voice_alloc_trace" and "overlay_interpreter" - accurate, and meaningless to
+# anyone who has not read this file.
+DIAGNOSTIC_LABELS: dict[str, str] = {
+    "audio_legacy": "legacy audio path",
+    "audio_shadow": "alternate sound mixing",
+    "debug_port": "debug server",
+    "voice_alloc_trace": "sound voice tracing",
+    "overlay_interpreter": "level code interpreted",
+    "force_interpreter": "all code interpreted",
+}
+
+
+def diagnostic_label(name: str) -> str:
+    """Display name for a diagnostic. Falls back to the field name so a newly
+    added diagnostic is still reported, just less prettily."""
+    return DIAGNOSTIC_LABELS.get(name, name.replace("_", " "))
 
 
 def active_diagnostics(settings: Settings) -> list[str]:
