@@ -130,6 +130,14 @@ class AdvancedPage(QWidget):
         self.voice_alloc_trace.setChecked(self.settings.voice_alloc_trace)
         self.voice_alloc_trace.toggled.connect(self._on_voice_alloc_trace)
 
+        self.overlay_interpreter = QCheckBox("Run level code in the interpreter")
+        self.overlay_interpreter.setChecked(self.settings.overlay_interpreter)
+        self.overlay_interpreter.toggled.connect(self._on_overlay_interpreter)
+
+        self.force_interpreter = QCheckBox("Run ALL game code in the interpreter")
+        self.force_interpreter.setChecked(self.settings.force_interpreter)
+        self.force_interpreter.toggled.connect(self._on_force_interpreter)
+
         self.build_lbl = QLabel()
         self.build_lbl.setWordWrap(True)
         self.build_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -146,6 +154,10 @@ class AdvancedPage(QWidget):
             self.fps_telemetry,
             self.voice_alloc_trace,
             dim(DIAGNOSTIC_SETTINGS["voice_alloc_trace"]),
+            self.overlay_interpreter,
+            dim(DIAGNOSTIC_SETTINGS["overlay_interpreter"]),
+            self.force_interpreter,
+            dim(DIAGNOSTIC_SETTINGS["force_interpreter"]),
         )
 
     def _reset_card(self) -> QWidget:
@@ -208,6 +220,14 @@ class AdvancedPage(QWidget):
 
     def _on_voice_alloc_trace(self, on: bool) -> None:
         self.settings.voice_alloc_trace = on
+        self._touch()
+
+    def _on_overlay_interpreter(self, on: bool) -> None:
+        self.settings.overlay_interpreter = on
+        self._touch()
+
+    def _on_force_interpreter(self, on: bool) -> None:
+        self.settings.force_interpreter = on
         self._touch()
 
     def _on_reset(self) -> None:

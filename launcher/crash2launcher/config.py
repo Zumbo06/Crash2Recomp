@@ -175,6 +175,14 @@ class Settings:
     # index plus each voice's phase and envelope level. Reading it needs no
     # debug port - it prints straight to the Log page.
     voice_alloc_trace: bool = False
+    # Runs streamed level code in the MIPS interpreter instead of the native
+    # shards. Slow, but it is the reference: if something works here and not
+    # natively, the recompiler's codegen is the bug.
+    overlay_interpreter: bool = False
+    # Stronger form: EVERY game function, main executable included, runs in
+    # the interpreter. overlay_interpreter leaves the main exe compiled, so a
+    # codegen fault there survives that test. This one does not.
+    force_interpreter: bool = False
 
     # --- input ------------------------------------------------------------
     # action -> key name. Empty means "use the runtime default".
@@ -298,6 +306,17 @@ DIAGNOSTIC_SETTINGS: dict[str, str] = {
         "Every ~5s, logs how the game is picking SPU voices. Does not change "
         "how the game sounds - it only counts and prints. For diagnosing the "
         "sound effect cut-outs."
+    ),
+    "overlay_interpreter": (
+        "Runs level code in the MIPS interpreter instead of native shards. "
+        "Much slower. It is the reference behaviour: if a level works with "
+        "this on and not off, the recompiler's output is wrong for that level."
+    ),
+    "force_interpreter": (
+        "Runs ALL game code in the interpreter - the main executable too, "
+        "which the level-code switch above leaves compiled. Very slow. If a "
+        "bug survives even this, the recompiler is fully cleared and the "
+        "fault is in the emulated hardware (GTE, GPU, CD, timers)."
     ),
 }
 

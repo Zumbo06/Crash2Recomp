@@ -1,6 +1,99 @@
 --- _build/psxrecomp-src/runtime/src/spu.c	2026-08-29 15:55:15.186295500 +0300
-+++ _build/Crash2Recomp/psxrecomp/runtime/src/spu.c	2026-09-03 15:04:25.739994900 +0300
-@@ -909,10 +909,133 @@
++++ _build/Crash2Recomp/psxrecomp/runtime/src/spu.c	2026-09-05 14:42:32.242894600 +0300
+@@ -741,6 +741,8 @@
+ }
+ 
+ /* ⚠ DOCUMENTED-GAP — the ONE known deliberate deviation from hardware.
++ * [RESOLVED] The stand-ins below are gone: reverb_frame() now applies the
++ * documented 39-tap filter on both sides of the 22.05 kHz boundary.
+  * The reverb engine runs at 22050 Hz but the real SPU's 22.05 -> 44.1 kHz
+  * reconstruction filter (and the matching 44.1 -> 22.05 kHz input
+  * decimation) is NOT specified in the documentation this implementation is
+@@ -753,8 +755,81 @@
+  * A later Beetle-output oracle comparison should quantify the spectral
+  * difference; replace ONLY this function (and the input average at the
+  * call site in spu_render) if a better-documented filter emerges. */
+-static inline int32_t rev_reconstruct(int32_t prev_step, int32_t cur_step) {
+-    return (prev_step + cur_step) >> 1;
++/* The 39-tap half-band FIR the SPU applies at the 44.1 <-> 22.05 kHz
++ * boundary (psx-spx, "SPU Reverb Formula": reverb down/upsampling filter).
++ * Symmetric; every odd tap except the centre is zero; taps sum to 0x8000, so
++ * (acc >> 15) is unity gain. */
++#define REV_FIR_TAPS 39
++static const int32_t REV_FIR[REV_FIR_TAPS] = {
++    -0x0001, 0x0000,  0x0002, 0x0000, -0x000A, 0x0000,  0x0023, 0x0000,
++    -0x0067, 0x0000,  0x010A, 0x0000, -0x0268, 0x0000,  0x0534, 0x0000,
++    -0x0B90, 0x0000,  0x2806, 0x4000,  0x2806, 0x0000, -0x0B90, 0x0000,
++     0x0534, 0x0000, -0x0268, 0x0000,  0x010A, 0x0000, -0x0067, 0x0000,
++     0x0023, 0x0000, -0x000A, 0x0000,  0x0002, 0x0000, -0x0001,
++};
++
++/* Filter histories, per channel. Deliberately NOT serialised: after a
++ * savestate load they restart from silence and settle within 39 frames
++ * (under 1 ms), inaudible for a delay effect, and it keeps the state format
++ * unchanged. */
++static int32_t rev_dn_hist[2][REV_FIR_TAPS];   /* 44.1 kHz send, pre-decimation */
++static int32_t rev_up_hist[2][REV_FIR_TAPS];   /* zero-stuffed 22.05 kHz engine output */
++static int     rev_dn_pos, rev_up_pos;
++
++static void rev_fir_reset(void) {
++    memset(rev_dn_hist, 0, sizeof(rev_dn_hist));
++    memset(rev_up_hist, 0, sizeof(rev_up_hist));
++    rev_dn_pos = rev_up_pos = 0;
++}
++
++/* FIR dot product over a ring whose NEWEST sample sits at `pos` (tap 38). */
++static inline int32_t rev_fir_apply(const int32_t *hist, int pos) {
++    int64_t acc = 0;
++    int i = pos;
++    for (int k = REV_FIR_TAPS - 1; k >= 0; k--) {
++        acc += (int64_t)REV_FIR[k] * hist[i];
++        i = (i == 0) ? REV_FIR_TAPS - 1 : i - 1;
++    }
++    return (int32_t)(acc >> 15);
++}
++
++/* One 44.1 kHz frame of the reverb path, shared by the idle and active mix
++ * loops.
++ *
++ *   input : the send goes through the FIR, and every other frame the
++ *           band-limited result feeds one 22.05 kHz engine step. Replaces the
++ *           box average of two frames, which let everything above 11 kHz in
++ *           the send alias straight into the reverb.
++ *   output: the engine result is zero-stuffed to 44.1 kHz and filtered by the
++ *           same FIR. Replaces the linear midpoint between steps, which rolled
++ *           the wet signal's highs off. The x2 undoes the stuffing (half the
++ *           samples are zero); at frames aligned to a step only the centre tap
++ *           sees a non-zero sample, so those frames reproduce the engine
++ *           output exactly, as before. The filter's 19-frame group delay is
++ *           ~0.43 ms, inside a delay effect. */
++static inline void reverb_frame(int32_t send_l, int32_t send_r, int wren,
++                                int32_t *wet_l, int32_t *wet_r) {
++    rev_dn_pos = (rev_dn_pos + 1) % REV_FIR_TAPS;
++    rev_dn_hist[0][rev_dn_pos] = send_l;
++    rev_dn_hist[1][rev_dn_pos] = send_r;
++
++    int32_t stuffed_l = 0, stuffed_r = 0;
++    if (rev_phase == 0) {
++        rev_phase = 1;
++    } else {
++        reverb_step(clamp16(rev_fir_apply(rev_dn_hist[0], rev_dn_pos)),
++                    clamp16(rev_fir_apply(rev_dn_hist[1], rev_dn_pos)),
++                    wren);
++        stuffed_l = rev_out_l;
++        stuffed_r = rev_out_r;
++        rev_phase = 0;
++    }
++
++    rev_up_pos = (rev_up_pos + 1) % REV_FIR_TAPS;
++    rev_up_hist[0][rev_up_pos] = stuffed_l;
++    rev_up_hist[1][rev_up_pos] = stuffed_r;
++    *wet_l = clamp16(rev_fir_apply(rev_up_hist[0], rev_up_pos) * 2);
++    *wet_r = clamp16(rev_fir_apply(rev_up_hist[1], rev_up_pos) * 2);
+ }
+ 
+ /* ---- Verified-enhancement shadow tap (opt-in; see spu_shadow.{h,c}) ------
+@@ -909,10 +984,133 @@
      return (int16_t)shaped;
  }
  
@@ -134,7 +227,7 @@
          memset(v, 0, sizeof(*v));
          v->active = 1;
          /* Address registers count 8-byte units but hardware ignores bit0
-@@ -927,6 +1050,8 @@
+@@ -927,6 +1125,8 @@
          v->adsr_divider = 0;
          v->adsr_phase = ADSR_ATTACK;
          key_on_count++;
@@ -143,7 +236,7 @@
          endx_latch &= ~(1u << i);  /* KEYON clears ENDX bit on real hw */
          spu_event_record(SPU_EV_KEYON, i, v->cur_addr);
      }
-@@ -939,7 +1064,10 @@
+@@ -939,7 +1139,10 @@
  static void key_off(uint32_t mask) {
      for (int i = 0; i < SPU_VOICE_COUNT; i++) {
          if (!(mask & (1u << i))) continue;
@@ -155,7 +248,65 @@
          spu_event_record(SPU_EV_KEYOFF, i, voices[i].cur_addr);
          voices[i].adsr_phase = ADSR_RELEASE;
          voices[i].adsr_divider = 0;
-@@ -1297,6 +1425,7 @@
+@@ -972,6 +1175,7 @@
+     rev_in_hold_r = 0;
+     rev_out_l = 0;
+     rev_out_r = 0;
++    rev_fir_reset();
+     capture_pos = 0;
+     memset(sweep_voice_env, 0, sizeof(sweep_voice_env));
+     memset(sweep_main_env, 0, sizeof(sweep_main_env));
+@@ -1075,22 +1279,7 @@
+ 
+             {
+                 int32_t wet_l, wet_r;
+-                if (rev_phase == 0) {
+-                    rev_in_hold_l = rev_send_l;
+-                    rev_in_hold_r = rev_send_r;
+-                    wet_l = rev_out_l;
+-                    wet_r = rev_out_r;
+-                    rev_phase = 1;
+-                } else {
+-                    int32_t prev_l = rev_out_l;
+-                    int32_t prev_r = rev_out_r;
+-                    reverb_step(clamp16((rev_in_hold_l + rev_send_l) >> 1),
+-                                clamp16((rev_in_hold_r + rev_send_r) >> 1),
+-                                rev_wren);
+-                    wet_l = rev_reconstruct(prev_l, rev_out_l);
+-                    wet_r = rev_reconstruct(prev_r, rev_out_r);
+-                    rev_phase = 0;
+-                }
++                reverb_frame(rev_send_l, rev_send_r, rev_wren, &wet_l, &wet_r);
+                 mix_l += wet_l;
+                 mix_r += wet_r;
+             }
+@@ -1237,24 +1426,7 @@
+              * 22.05 <-> 44.1 kHz boundary model. */
+             {
+                 int32_t wet_l, wet_r;
+-                if (rev_phase == 0) {
+-                    /* First frame of the pair: hold the input, output the
+-                     * most recent engine result. */
+-                    rev_in_hold_l = rev_send_l;
+-                    rev_in_hold_r = rev_send_r;
+-                    wet_l = rev_out_l;
+-                    wet_r = rev_out_r;
+-                    rev_phase = 1;
+-                } else {
+-                    int32_t prev_l = rev_out_l;
+-                    int32_t prev_r = rev_out_r;
+-                    reverb_step(clamp16((rev_in_hold_l + rev_send_l) >> 1),
+-                                clamp16((rev_in_hold_r + rev_send_r) >> 1),
+-                                rev_wren);
+-                    wet_l = rev_reconstruct(prev_l, rev_out_l);
+-                    wet_r = rev_reconstruct(prev_r, rev_out_r);
+-                    rev_phase = 0;
+-                }
++                reverb_frame(rev_send_l, rev_send_r, rev_wren, &wet_l, &wet_r);
+                 mix_l += wet_l;
+                 mix_r += wet_r;
+             }
+@@ -1297,6 +1469,7 @@
          }
      }
      render_frames += (uint64_t)frames;
@@ -163,7 +314,7 @@
      last_peak = block_peak;
      if (block_peak > peak) peak = block_peak;
  
-@@ -1392,9 +1521,11 @@
+@@ -1392,9 +1565,11 @@
               * for a sample to finish never advance and downstream voices
               * never get keyed on. */
              if (addr == 0x1F801D9Cu) {
@@ -175,7 +326,7 @@
                  return (endx_latch >> 16) & 0xFFu;
              }
              /* Voice register 6 (byte offset 0x0C) is CURVOL / ADSR_LEVEL —
-@@ -1405,8 +1536,10 @@
+@@ -1405,8 +1580,10 @@
              if (addr >= 0x1F801C00u && addr < 0x1F801D80u
                  && (idx & 7u) == 6u) {
                  int v = (int)(idx >> 3);
@@ -187,3 +338,11 @@
              }
              return spu_regs[idx];
          }
+@@ -1780,6 +1957,7 @@
+             !pst_r_u32(&r, &sweep_main_env[ch].divider))
+             return 0;
+     }
++    rev_fir_reset();   /* histories are not in the state; restart from silence */
+     return 1;
+ }
+ uint8_t*  spu_get_ram_ptr(void){ return spu_ram; }
