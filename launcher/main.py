@@ -56,6 +56,7 @@ def _print_paths() -> int:
     rows = [
         ("runtime", layout.runtime_exe, layout.runtime_exe.is_file()),
         ("recompiler", layout.cli_exe, layout.cli_exe.is_file()),
+        ("bios", layout.bios_rom, layout.bios_rom.is_file()),
         ("codegen", layout.recompiler_exe, layout.recompiler_exe.is_file()),
         ("overlay script", layout.overlay_script, layout.overlay_script.is_file()),
         ("game.toml", layout.game_toml, layout.game_toml.is_file()),

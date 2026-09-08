@@ -218,6 +218,12 @@ class PlayPage(QWidget):
             set_status(self.notice, "Warn",
                        "Settings changed - relaunch to apply.")
 
+    def set_layout(self, layout_: Layout) -> None:
+        """Adopt a freshly resolved layout - after a build the runtime exists
+        and its real name is known, which decides whether Play is enabled."""
+        self.layout_ = layout_
+        self.refresh()
+
     # -- actions -----------------------------------------------------------
     def _on_play(self) -> None:
         self._observed.clear()

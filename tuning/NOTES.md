@@ -1072,3 +1072,84 @@ NOT yet verified end to end: an actual disc -> build -> play run from the
 bundle on a clean machine. That is the remaining acceptance test, and the thing
 to watch in its log is "overlay autocompile enabled (gcc)" rather than
 "overlay gaps -> interpreter".
+
+## The packaged bundle could not build (four bugs, all fixed)
+
+Reported as "packaged cannot build, we can't recompile code to C". Reproduced
+by running the bundle's own recompiler by hand. Four separate faults, in the
+order they fire:
+
+1. **The Setup page never passed --bios.** `psxrecomp.exe build` requires
+   --disc, --bios AND --output; without it the build exits on the usage message
+   having done nothing. This was never a bundle-only bug - the Setup page's
+   build flow could never have worked. It was masked because the workspace
+   project already existed, so nobody ran the flow end to end.
+   Fixed: Layout.bios_rom (cli_exe.parent/framework/bios/openbios.bin, correct
+   in both layouts) and page_setup passes it, with an explicit error if absent.
+
+2. **Windows MAX_PATH.** The build copies the framework into the project, and
+   rabbitizer's instruction tables are ~140 characters of relative path on
+   their own. Past 260 total the copy dies with "cannot copy: No such file or
+   directory" naming a path that plainly exists. Fixed: page_setup checks the
+   project path length before starting and says to move the folder.
+
+3. **The framework was staged with an allow-list, which dropped .gitignore.**
+   This one was subtle and cost the most to find. config_loader.cpp's
+   find_project_root() walks UP from the BIOS profile looking for exactly
+   `.gitignore`, `.git` or `CMakeLists.txt`. Our framework root has a
+   .gitignore; my packaging copied only named directories and named files, so
+   dotfiles never made it. Without the marker the walk went one level too far,
+   and `seeds = "recompiler/seeds/openbios_elf_seeds.json"` resolved against
+   the PROJECT root instead of the framework root:
+       wanted <out>/recompiler/seeds/...   (missing)
+       actual <out>/psxrecomp/recompiler/seeds/...  (present all along)
+   which is why the file "did not exist" while sitting right there. Fixed:
+   package.ps1 copies the framework root wholesale with -Force and prunes,
+   rather than allow-listing, and asserts .gitignore, bios/OpenBIOS.toml and
+   the seed file all reached the bundle. The copyright audit is the control,
+   so an allow-list buys nothing here and cannot express "and whatever else
+   this tree needs".
+
+   Bisecting this needed the full ladder: stock CLI works -> bundle CLI fails
+   -> same binaries (md5) -> same game.toml -> seed file present in both ->
+   only structural difference was the framework tree -> read find_project_root.
+   `ls` hides dotfiles, which is why the diff looked clean for several rounds.
+
+4. **The launcher could not find the game it had just built.** build.ps1
+   configures cmake into <project>/build, so the exe lands at
+   <root>/build/<NAME>_Recompiled.exe, and PLAYER mode searched only <root>.
+   A completely successful build still reported "not built". Fixed: detect()
+   searches root, root/build and root/build-clang. Note the generated name is
+   taken from the disc serial (SCUS_94154_Recompiled.exe), which the existing
+   *Recompiled.exe glob already handles.
+
+Verified end to end from the staged bundle: all four recompiler steps pass
+(Ready), 30 files / 33 MB of generated C, BIOS C produced, the copied framework
+carries our patches (SPU catch-up, GTE S16, audio latency, pause menu), and
+`cmake --build` links SCUS_94154_Recompiled.exe with exit 0. A fully built tree
+then resolves as mode=player with the runtime found.
+
+Still unverified: actually PLAYING the bundle-built binary (the user runs game
+tests), and a clean-machine run where the toolchain and Python are absent.
+
+### Fifth bug: "output directory is not empty"
+
+`psxrecomp.exe build` hard-refuses a non-empty --output (main_cli.cpp:264) and
+has no override flag - the options are only --disc, --bios, --output, --name.
+The bundle root is full of what we ship (the launcher, the recompiler,
+LICENSES, userdata), so building into it could never work.
+
+My earlier end-to-end tests missed this because I ran the CLI by hand into
+clean scratch directories (C:/t8) instead of the path the Setup page actually
+passes, which is layout.project. Testing the tool is not testing the caller.
+
+Fixed: in PLAYER mode the generated project goes to `<root>/game/` rather than
+the bundle root. That directory is entirely launcher-owned, so a rebuild can
+clear it without touching userdata/ (saves, settings) which sits beside it.
+`Layout.project_is_disposable` gates the clearing to PLAYER mode - a workspace
+project is the developer's tree and is never deleted on our initiative; there
+the page says to empty it by hand.
+
+Knock-on: runtime discovery had to follow, since the exe now lands at
+`<root>/game/build/`. find_runtime searches game/build, build, root and
+build-clang in that order.

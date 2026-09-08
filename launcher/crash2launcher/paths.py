@@ -155,6 +155,17 @@ class Layout:
         return self.cli_exe.parent / "libexec" / f"psxrecomp-game{_EXE_SUFFIX}"
 
     @property
+    def bios_rom(self) -> Path:
+        """The BIOS image the recompiler needs in order to build a project.
+
+        `psxrecomp.exe build` requires --disc, --bios AND --output; the Setup
+        page used to omit --bios and the build died on the usage message before
+        doing anything. OpenBIOS ships inside the recompiler's own framework
+        tree, so it is always beside the CLI in both layouts.
+        """
+        return self.cli_exe.parent / "framework" / "bios" / "openbios.bin"
+
+    @property
     def runtime_include(self) -> Path:
         return self.project / "psxrecomp" / "runtime" / "include"
 
@@ -178,6 +189,18 @@ class Layout:
             # compile command cannot be formed at all.
             and find_overlay_python() is not None
         )
+
+    @property
+    def project_is_disposable(self) -> bool:
+        """True when the launcher owns the project directory outright.
+
+        `psxrecomp.exe build` refuses a non-empty --output, so a rebuild has to
+        clear it first. That is only safe where the directory exists solely to
+        hold generated output: the bundle's game/ folder. In a workspace the
+        project is the developer's tree - build outputs, tuning, everything -
+        and must never be deleted on our initiative.
+        """
+        return self.mode is Mode.PLAYER
 
     def ensure_writable_dirs(self) -> None:
         """Create the directories we own. Safe to call repeatedly."""
@@ -243,20 +266,33 @@ def detect(root: Path | None = None) -> Layout:
 
     # Player mode: either the marker a packaged bundle carries, or a runtime
     # sitting next to us (an already-built bundle, or one repackaged by hand).
-    player_runtime = find_runtime(root)
+    #
+    # The generated project goes in its OWN subdirectory rather than the bundle
+    # root, because `psxrecomp.exe build` refuses a non-empty --output and the
+    # root is full of the things we shipped (the launcher, the recompiler,
+    # LICENSES, userdata). game/ is entirely launcher-owned, so a rebuild can
+    # clear it without touching saves or settings.
+    #
+    # Search build/ too, not just the root: build.ps1 configures cmake into
+    # <project>/build, so that is where the compiled game actually lands.
+    # Searching only the root meant a bundle reported "not built" after a
+    # completely successful build.
+    project = root / "game"
+    player_runtime = find_runtime(
+        project / "build", root / "build", root, root / "build-clang")
     if player_runtime is not None or is_bundle(root):
         return Layout(
             mode=Mode.PLAYER,
             root=root,
-            project=root,
+            project=project,
             # Before the first build there is no runtime yet; name where it
             # will land so the Play page can say so instead of crashing.
-            runtime_exe=player_runtime or (root / RUNTIME_EXE),
-            game_toml=root / "game.toml",
+            runtime_exe=player_runtime or (project / "build" / RUNTIME_EXE),
+            game_toml=project / "game.toml",
             disc_data=root / "data",
             userdata=root / "userdata",
             mods=root / "mods",
-            build_dir=root / "build",
+            build_dir=project / "build",
             # The recompiler ships in its own folder so its framework/ tree
             # cannot be mistaken for the generated project.
             cli_exe=root / "recompiler" / "psxrecomp.exe",

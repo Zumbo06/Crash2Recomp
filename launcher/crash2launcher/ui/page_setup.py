@@ -17,6 +17,7 @@ both of which already exist and are tested.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -36,6 +37,7 @@ from .. import disc
 from ..config import Settings
 from ..paths import Layout
 from ..pipeline import EXIT_DISC_VERIFY_FAILED, Job
+from ..runtime import toolchain_env
 from .common import card, dim, heading, section, set_status
 from .dialogs import confirm
 from .theme import ERROR, OK, PAGE_MARGINS, TEXT_DIM, WARN
@@ -86,6 +88,7 @@ class SetupPage(QWidget):
     """Disc selection, verification and the build."""
 
     ready = Signal()          # the game is built and playable
+    relayout = Signal()       # paths changed on disk; re-resolve the layout
 
     def __init__(self, layout_: Layout, settings: Settings,
                  parent: QWidget | None = None):
@@ -318,6 +321,14 @@ class SetupPage(QWidget):
                 "Rebuild"):
             return
 
+        # The recompiler refuses a non-empty --output, so a rebuild has to
+        # start from a clean directory. Only ever clear one the launcher owns
+        # (the bundle's game/ folder); a workspace project is the developer's
+        # tree. Saves and settings live in userdata/, outside this, so nothing
+        # the player cares about is in here.
+        if not self._clear_project():
+            return
+
         self.steps.set_state("generate", ACTIVE)
         self.build_bar.setVisible(True)
         self.build_bar.setRange(0, 0)      # indeterminate until progress arrives
@@ -325,10 +336,38 @@ class SetupPage(QWidget):
         self.cancel_btn.setEnabled(True)
         self.build_note.setText("")
 
+        # Windows MAX_PATH. The build copies the framework into the project,
+        # and the deepest file in it (rabbitizer's instruction tables) is ~140
+        # characters on its own. Past 260 total the copy fails with a bare
+        # "cannot copy: No such file or directory" naming a path that plainly
+        # exists - so check first and say what is actually wrong.
+        DEEPEST_RELATIVE = 150
+        room = 260 - len(str(self.layout_.project))
+        if room < DEEPEST_RELATIVE:
+            set_status(self.build_note, "Error",
+                       "The folder path is too long for Windows to build in "
+                       "(%d characters, and the build needs about %d more). "
+                       "Move this folder somewhere shorter, like C:\\Games\\, "
+                       "and try again."
+                       % (len(str(self.layout_.project)), DEEPEST_RELATIVE))
+            self.steps.set_state("generate", FAILED, "path too long")
+            return
+
+        # --bios is REQUIRED by the recompiler, not optional. Omitting it made
+        # the build exit on the usage message without touching the disc.
+        if not self.layout_.bios_rom.is_file():
+            set_status(self.build_note, "Error",
+                       "The bundled BIOS is missing. It should be at %s - if "
+                       "the download is incomplete, unpack it again."
+                       % self.layout_.bios_rom)
+            self.steps.set_state("generate", FAILED, "BIOS missing")
+            return
+
         self._job = Job(
             str(self.layout_.cli_exe),
             ["build",
              "--disc", str(self._disc_path()),
+             "--bios", str(self.layout_.bios_rom),
              "--output", str(self.layout_.project)],
             cwd=self.layout_.cli_exe.parent,
         )
@@ -356,10 +395,24 @@ class SetupPage(QWidget):
             self._finish_build(False, "No build script at %s" % script, 1)
             return
 
+        # cmake/ninja/clang must be on PATH for build.ps1, and the PINNED pack
+        # must come first - a pip-installed cmake shim ahead of it is enough to
+        # break the build. Without this the job inherited a bare environment.
+        env = toolchain_env()
+        if not env:
+            set_status(self.build_note, "Error",
+                       "No C toolchain was found. The build needs clang, cmake "
+                       "and ninja. Install psxrecomp's toolchain pack, or put "
+                       "them on PATH, then try again.")
+            self.steps.set_state("compile", FAILED, "no toolchain")
+            self._finish_build(False, "No C compiler toolchain on this machine.", 1)
+            return
+
         self._job = Job(
             "powershell",
             ["-ExecutionPolicy", "Bypass", "-File", str(script)],
             cwd=self.layout_.project,
+            env_extra=env,
         )
         self._job.line.connect(self.build_log.append_line)
         self._job.progress.connect(self._on_build_progress)
@@ -367,6 +420,12 @@ class SetupPage(QWidget):
         self._job.start()
 
     def _on_compile_finished(self, code: int, message: str) -> None:
+        # The layout was resolved at startup, when no runtime existed, so
+        # runtime_exe is only a GUESS at the name. The recompiler names the
+        # binary after the disc (SCUS_94154_Recompiled.exe), so the guess was
+        # wrong and a completely successful build still reported "not built",
+        # leaving Play greyed out. Re-resolve now that the file exists.
+        self.relayout.emit()
         ok = code == 0 and self.layout_.has_runtime
         self.steps.set_state("compile", DONE if ok else FAILED,
                              "" if ok else message)
@@ -404,6 +463,42 @@ class SetupPage(QWidget):
         for key, _ in BUILD_STEPS[1:]:
             self.steps.set_state(key, PENDING)
         self._finish_build(False, "Cancelled.", -1)
+
+    def _clear_project(self) -> bool:
+        """Empty the project directory so the recompiler will write into it.
+
+        Returns False (with the reason on screen) if it cannot be made empty.
+        """
+        project = self.layout_.project
+        if not project.exists() or not any(project.iterdir()):
+            return True
+
+        if not self.layout_.project_is_disposable:
+            set_status(self.build_note, "Error",
+                       "The build folder already has files in it and the "
+                       "recompiler needs it empty: %s. This looks like a "
+                       "development tree, so it will not be cleared "
+                       "automatically - empty it yourself and try again."
+                       % project)
+            self.steps.set_state("generate", FAILED, "output not empty")
+            return False
+
+        try:
+            shutil.rmtree(project)
+        except OSError as exc:
+            set_status(self.build_note, "Error",
+                       "Could not clear the previous build at %s: %s. Close "
+                       "anything using those files and try again."
+                       % (project, exc))
+            self.steps.set_state("generate", FAILED, "could not clear")
+            return False
+        return True
+
+    def set_layout(self, layout_: Layout) -> None:
+        """Adopt a freshly resolved layout (called after a build creates files
+        that did not exist when the launcher started)."""
+        self.layout_ = layout_
+        self._refresh()
 
     # -- lifecycle ---------------------------------------------------------
     @property

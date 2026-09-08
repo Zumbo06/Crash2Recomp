@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import config
+from .. import config, paths
 from ..paths import Layout
 from ..runtime import GameSession, apply_config_settings
 from ..version import full_version
@@ -115,6 +115,7 @@ class MainWindow(QWidget):
             self.stack.addWidget(widget)
 
         self.setup_page.ready.connect(self._on_build_ready)
+        self.setup_page.relayout.connect(self._relayout)
         self.play_page.crashed.connect(self._on_crash)
         self.settings_page.changed.connect(self._on_settings_changed)
         self.advanced_page.changed.connect(self._on_settings_changed)
@@ -241,6 +242,19 @@ class MainWindow(QWidget):
         showing_advanced = any(k == "advanced" for k, _, _ in self._pages)
         if showing_advanced != self.settings.developer_mode:
             self._rebuild_nav()
+
+    def _relayout(self) -> None:
+        """Re-resolve every path from disk.
+
+        The layout is worked out once at startup, and a first-run build creates
+        files that did not exist then - above all the game binary, whose name
+        the recompiler takes from the disc serial rather than the name we
+        guessed. Without this a successful build still left Play greyed out.
+        """
+        self.layout_ = paths.detect()
+        self.layout_.ensure_writable_dirs()
+        for page in (self.setup_page, self.play_page):
+            page.set_layout(self.layout_)
 
     def _on_crash(self, code: int, explanation: str) -> None:
         """The game died. Say so in words, and put the evidence in front of
