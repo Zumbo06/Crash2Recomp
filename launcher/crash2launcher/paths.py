@@ -184,10 +184,10 @@ class Layout:
             self.overlay_script.is_file()
             and self.recompiler_exe.is_file()
             and self.runtime_include.is_dir()
-            and find_c_toolchain_bin() is not None
+            and find_c_toolchain_bin(self.root) is not None
             # A frozen bundle has no interpreter of its own; without one the
             # compile command cannot be formed at all.
-            and find_overlay_python() is not None
+            and find_overlay_python(self.root) is not None
         )
 
     @property
@@ -208,7 +208,7 @@ class Layout:
             d.mkdir(parents=True, exist_ok=True)
 
 
-def find_overlay_python() -> Path | None:
+def find_overlay_python(root: Path | None = None) -> Path | None:
     """A real Python interpreter for the overlay compile step.
 
     The runtime shells out to compile_overlays.py while the game runs. From a
@@ -223,6 +223,12 @@ def find_overlay_python() -> Path | None:
     """
     if not is_frozen():
         return Path(sys.executable)
+    # The bundled toolchain carries its own interpreter, which is the whole
+    # reason a player needs nothing installed. Prefer it over whatever Python
+    # they may or may not have.
+    bundled = (root or app_dir()) / "toolchain" / "python" / f"python{_EXE_SUFFIX}"
+    if bundled.is_file():
+        return bundled
     for name in ("python3", "python"):
         found = shutil.which(name)
         if found:
@@ -232,7 +238,7 @@ def find_overlay_python() -> Path | None:
     return Path(found) if found else None
 
 
-def find_c_toolchain_bin() -> Path | None:
+def find_c_toolchain_bin(root: Path | None = None) -> Path | None:
     """Locate a C compiler directory for the runtime's overlay compiler.
 
     Crash 2 streams level code as overlays. Any overlay the runtime cannot
@@ -242,9 +248,16 @@ def find_c_toolchain_bin() -> Path | None:
     putting the toolchain on PATH is all that is needed to unlock the native
     tier.
 
-    Prefers psxrecomp's own pinned clang/MinGW pack - the same toolchain the
-    game itself was built with - then falls back to anything already on PATH.
+    Order: the toolchain shipped INSIDE the bundle, then psxrecomp's pinned
+    pack on a developer machine, then anything already on PATH. The bundled one
+    comes first deliberately - it is the toolchain the runtime was validated
+    against, and preferring a player's own installation would silently swap the
+    compiler for one we have never tested.
     """
+    bundled = (root or app_dir()) / "toolchain" / "bin"
+    if (bundled / f"clang{_EXE_SUFFIX}").is_file():
+        return bundled
+
     pack = Path.home() / ".local" / "share" / "retcomm" / "toolchains" / "cmake-clang-v1"
     if pack.is_dir():
         # Newest version wins; the directory is named by semver.

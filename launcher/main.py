@@ -65,8 +65,8 @@ def _print_paths() -> int:
     ]
     for label, path, present in rows:
         print("  %-16s : [%s] %s" % (label, "ok" if present else "--", path))
-    tc = find_c_toolchain_bin()
-    py = find_overlay_python()
+    tc = find_c_toolchain_bin(layout.root)
+    py = find_overlay_python(layout.root)
     print("  C toolchain      : [%s] %s" % ("ok" if tc else "--", tc or "not found on PATH"))
     print("  python (overlays): [%s] %s" % ("ok" if py else "--", py or "not found on PATH"))
     print("  native overlays  : %s" % ("yes" if layout.can_compile_overlays

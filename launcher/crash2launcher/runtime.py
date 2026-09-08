@@ -215,7 +215,7 @@ def overlay_autocompile_cmd(layout: Layout) -> str:
     """
     # NOT sys.executable: frozen, that is Crash2Launcher.exe and the command
     # would relaunch the launcher rather than compile anything.
-    python = find_overlay_python() or Path(sys.executable)
+    python = find_overlay_python(layout.root) or Path(sys.executable)
     return " ".join([
         _quote(python),
         _quote(layout.overlay_script),
@@ -227,7 +227,7 @@ def overlay_autocompile_cmd(layout: Layout) -> str:
     ])
 
 
-def toolchain_env() -> dict[str, str]:
+def toolchain_env(root: Path | None = None) -> dict[str, str]:
     """Environment for the COMPILE step of the first-run build.
 
     build.ps1 runs `cmake -G Ninja` and needs cmake, ninja and a C/C++ compiler.
@@ -241,7 +241,7 @@ def toolchain_env() -> dict[str, str]:
     empty dict when no toolchain is found, so the caller can say so plainly
     rather than failing three minutes into cmake.
     """
-    toolchain = find_c_toolchain_bin()
+    toolchain = find_c_toolchain_bin(root)
     if not toolchain:
         return {}
     env = {"PATH": str(toolchain) + os.pathsep + os.environ.get("PATH", "")}
@@ -273,7 +273,7 @@ def overlay_env(layout: Layout, settings: Settings) -> dict[str, str]:
     if not settings.native_overlays or not layout.can_compile_overlays:
         return env
 
-    toolchain = find_c_toolchain_bin()
+    toolchain = find_c_toolchain_bin(layout.root)
     if toolchain:
         env["PATH"] = str(toolchain) + os.pathsep + os.environ.get("PATH", "")
 

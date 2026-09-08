@@ -336,6 +336,26 @@ class SetupPage(QWidget):
         self.cancel_btn.setEnabled(True)
         self.build_note.setText("")
 
+        # The recompiler cannot handle a non-ASCII output path: it dies with
+        # "filesystem error: Cannot convert character sequence: Illegal byte
+        # sequence" before doing any work. Verified - an ASCII output builds
+        # fine from the very same tool. This is not an edge case; it hits
+        # anyone whose folder or Windows username is in their own language,
+        # which for this project's audience is most people.
+        try:
+            str(self.layout_.project).encode("ascii")
+        except UnicodeEncodeError:
+            offenders = "".join(sorted({c for c in str(self.layout_.project)
+                                        if ord(c) > 127}))
+            set_status(self.build_note, "Error",
+                       "The folder path contains characters the recompiler "
+                       "cannot read (%s). Move this folder somewhere with a "
+                       "plain English path, like C:\\Games\\Crash2, and try "
+                       "again. Your saves and settings move with it."
+                       % offenders)
+            self.steps.set_state("generate", FAILED, "path has non-English characters")
+            return
+
         # Windows MAX_PATH. The build copies the framework into the project,
         # and the deepest file in it (rabbitizer's instruction tables) is ~140
         # characters on its own. Past 260 total the copy fails with a bare
@@ -398,7 +418,7 @@ class SetupPage(QWidget):
         # cmake/ninja/clang must be on PATH for build.ps1, and the PINNED pack
         # must come first - a pip-installed cmake shim ahead of it is enough to
         # break the build. Without this the job inherited a bare environment.
-        env = toolchain_env()
+        env = toolchain_env(self.layout_.root)
         if not env:
             set_status(self.build_note, "Error",
                        "No C toolchain was found. The build needs clang, cmake "

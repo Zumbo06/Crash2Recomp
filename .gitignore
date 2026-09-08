@@ -105,6 +105,10 @@ dist/
 # Local release-packaging scripts. Anchored to the repo root so it cannot hide
 # a vendored tools/ directory deeper in the tree.
 /tools/
+# Release notes are drafted per release and published with the download rather
+# than kept in history. package.ps1 copies this into the bundle when present
+# and simply omits it when not.
+/RELEASE_NOTES.md
 out/
 cmake-build-*/
 CMakeCache.txt
