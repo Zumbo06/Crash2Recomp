@@ -336,6 +336,22 @@ class SetupPage(QWidget):
         self.cancel_btn.setEnabled(True)
         self.build_note.setText("")
 
+        # Disk space. The generated C alone is ~33 MB, the framework copy and
+        # the object files take the rest; a build that runs out part-way leaves
+        # a confusing linker error rather than an obvious cause.
+        try:
+            free = shutil.disk_usage(self.layout_.root).free
+        except OSError:
+            free = None
+        NEEDED = 3 * 1024**3
+        if free is not None and free < NEEDED:
+            set_status(self.build_note, "Error",
+                       "Not enough free space on this drive. The build needs "
+                       "about %d GB and there is %.1f GB free."
+                       % (NEEDED // 1024**3, free / 1024**3))
+            self.steps.set_state("generate", FAILED, "not enough disk space")
+            return
+
         # The recompiler cannot handle a non-ASCII output path: it dies with
         # "filesystem error: Cannot convert character sequence: Illegal byte
         # sequence" before doing any work. Verified - an ASCII output builds
