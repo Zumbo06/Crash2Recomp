@@ -1,5 +1,10 @@
 # Crash Bandicoot 2 Recompiled
 
+> **An unofficial, non-commercial fan project.** Not affiliated with,
+> authorised or endorsed by Activision, Naughty Dog or Sony Interactive
+> Entertainment. Crash Bandicoot is a trademark of Activision Publishing, Inc.
+> **No game data is distributed here — bring your own disc.**
+
 The PlayStation game *Crash Bandicoot 2: Cortex Strikes Back* translated to
 native code and run directly, rather than emulated. A launcher takes a disc
 image you already own, builds the game on your machine, and runs it.
@@ -8,9 +13,9 @@ image you already own, builds the game on your machine, and runs it.
 > are still minor sound and graphical issues. Treat this as a preview rather
 > than a finished release, and expect rough edges.
 
-**This project contains no game data.** No game code, artwork, audio or disc
-content is distributed here. You supply your own disc image; everything derived
-from it is produced locally and never leaves your machine.
+**This project contains no game data.** No game code, audio or disc content is
+distributed here. You supply your own disc image; everything derived from it is
+produced locally and never leaves your machine. 
 
 ---
 
