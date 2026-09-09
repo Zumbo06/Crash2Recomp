@@ -23,7 +23,7 @@ overlay_autocompile_cmd = "\"C:\\Python313\\python.exe\" \"C:\\Users\\yhgoz\\Des
 
 [video]
 renderer = "opengl"
-supersampling = 1
+supersampling = 5
 aspect_ratio = "4:3"
 
 [controller]

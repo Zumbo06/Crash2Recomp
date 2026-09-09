@@ -27,7 +27,7 @@ from crash2launcher.ui.page_settings import SettingsPage  # noqa: E402
 # handled by a dedicated page rather than a control.
 NOT_IN_UI = {
     "disc_path", "disc_verified", "disc_sha1",   # Setup flow
-    "bindings", "enabled_mods",                  # not implemented yet
+    "enabled_mods",                              # not implemented yet
     "last_page", "window_geometry",              # launcher's own state
     "integer_scaling", "smooth_60fps", "frame_blend",
     "fast_loading", "cd_speed_boost", "turbo_key",

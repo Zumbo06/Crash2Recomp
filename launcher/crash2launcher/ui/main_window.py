@@ -258,6 +258,13 @@ class MainWindow(QWidget):
         self.layout_.ensure_writable_dirs()
         for page in (self.setup_page, self.play_page):
             page.set_layout(self.layout_)
+        # Push settings out NOW that the build directory finally exists.
+        # _settings_targets only returns directories present on disk, so on a
+        # fresh install nothing was written before the build - and nothing
+        # re-ran afterwards. The player's display settings and key bindings
+        # silently did not apply to their first session, until they happened to
+        # change some unrelated option.
+        apply_config_settings(self.layout_, self.settings)
 
     def _on_crash(self, code: int, explanation: str) -> None:
         """The game died. Say so in words, and put the evidence in front of

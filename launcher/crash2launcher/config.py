@@ -278,6 +278,8 @@ class Settings:
         self.debug_port = max(0, min(65535, int(self.debug_port or 0)))
         # The runtime exposes 12 slots.
         self.quick_save_slot = max(0, min(11, int(self.quick_save_slot or 0)))
+        from .keybinds import normalize
+        self.bindings = normalize(self.bindings)
         return self
 
 

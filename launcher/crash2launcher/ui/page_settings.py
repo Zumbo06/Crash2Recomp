@@ -40,6 +40,7 @@ from ..config import (
 )
 from .common import card, dim, heading, row, section
 from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
+from .widgets.key_bindings import KeyBindingsEditor
 
 # Crash 2's own framebuffer, measured from the runtime's gpu_state. The
 # supersampling multiplier scales THIS, not the 320x240 the PS1 is usually
@@ -412,6 +413,8 @@ class SettingsPage(QWidget):
         )
 
     def _input_page(self) -> QWidget:
+        self.bindings = KeyBindingsEditor(self.settings)
+        self.bindings.changed.connect(self._touch)
         self.merge_input = QCheckBox("Player 1 reads keyboard and all controllers")
         self.merge_input.setChecked(self.settings.merge_all_input)
         self.merge_input.toggled.connect(self._on_merge)
@@ -438,10 +441,9 @@ class SettingsPage(QWidget):
             card(
                 section("Controls"),
                 self.merge_input,
-                dim("Leave this on. A release build of the runtime pins player 1 "
-                    "to \"keyboard\" and never opens a gamepad, because it "
-                    "expects its own built-in launcher to assign a device."),
+                dim("Use the keyboard alongside any connected controller."),
             ),
+            card(section("Keyboard configuration · Player 1"), self.bindings),
             card(
                 section("Save states"),
                 row("Quick save slot", self.quick_save_slot),
@@ -563,6 +565,7 @@ class SettingsPage(QWidget):
     def _rebuild_from_settings(self) -> None:
         """Push the dataclass back into the widgets after a bulk change."""
         self._loading = True
+        self.bindings.refresh()
         self.renderer.setCurrentText(self.settings.renderer)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
         self.aspect.setCurrentText(self.settings.aspect)

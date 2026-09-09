@@ -16,7 +16,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from . import gametoml, usersettings
+from . import gametoml, keybinds, usersettings
 from .config import Settings
 from .paths import Layout, find_c_toolchain_bin, find_overlay_python
 
@@ -312,8 +312,18 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
     # a file the running game never opened - so nothing applied at all. Write to
     # every tree that exists; they are alternate builds of one game, not
     # independent installs.
-    for build_dir in _settings_targets(layout):
+    targets = _settings_targets(layout)
+    if not settings.bindings:
+        # Preserve an existing manually edited runtime map on first use of the
+        # launcher editor. Restore defaults writes an explicit complete map.
+        for build_dir in targets:
+            existing = keybinds.read(build_dir / "keybinds.ini")
+            if existing:
+                settings.bindings = existing
+                break
+    for build_dir in targets:
         usersettings.save(build_dir / "settings.toml", settings)
+        keybinds.save(build_dir / "keybinds.ini", settings.bindings)
 
     # game.toml is optional; settings.toml is not. Returning early on a missing
     # game.toml used to skip the settings.toml write above too, so in any tree
