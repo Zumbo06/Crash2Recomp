@@ -46,6 +46,14 @@ OK            = "#4ac97e"
 WARN          = "#e8b339"
 ERROR         = "#e8595b"
 
+# Play-page artwork: cool metal panels against the warm wooden action.
+PLAY_BG       = "#061321"
+PLAY_PANEL    = "#0b1c2e"
+PLAY_EDGE     = "#4d89b4"
+PLAY_GOLD     = "#ffe648"
+PLAY_ORANGE   = "#ff9b20"
+PLAY_GREEN    = "#42ef85"
+
 SCROLL        = "#2c333d"
 SCROLL_HOVER  = "#3c4552"
 
@@ -290,4 +298,46 @@ QToolTip {{
     border-radius: {RADIUS_SM}px;
     padding: {SPACE_1}px 7px;
 }}
+
+/* Play keeps the existing navigation and gives its scene a cool metal HUD. */
+#PlayScene, #PlayScene QWidget {{ background: transparent; }}
+#PlayScene #PlaySubtitle {{
+    background: {PLAY_BG}; color: #e5edf6; border-radius: 5px;
+    font-size: 12px; padding: 1px 4px;
+}}
+#PlayScene QPushButton#ArtworkPlayButton {{
+    background: transparent; border: none; padding: 0;
+}}
+#PlayScene QPushButton#PlaySecondary {{
+    background: rgba(6, 19, 33, 225); border: 1px solid #35516c;
+    color: #dce8f5; font-size: 12px; padding: 6px 10px;
+}}
+#PlayScene QPushButton#PlaySecondary:hover {{
+    background: #173149; border-color: {PLAY_GOLD}; color: white;
+}}
+#PlayScene QPushButton#PlaySecondary:focus {{ border-color: {PLAY_GOLD}; }}
+#PlayScene QFrame#PlayStatusPanel {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #142c43, stop:0.12 {PLAY_PANEL}, stop:1 #071422);
+    border: 2px solid {PLAY_EDGE}; border-radius: 12px;
+}}
+#PlayScene #PlayDivider {{ background: #315777; }}
+#PlayScene #PlayMetaLabel {{ color: #a6b9ce; font-size: 12px; }}
+#PlayScene #PlayMetaValue {{ color: #eff5ff; font-size: 13px; font-weight: 600; }}
+#PlayScene QLabel[playHeading="true"] {{ font-size: 21px; font-weight: 700; }}
+#PlayScene QLabel#Ok {{ color: {PLAY_GREEN}; }}
+#PlayScene QProgressBar#PlayReadyBar {{
+    background: #14304a; border: 1px solid #315777; border-radius: 4px;
+}}
+#PlayScene QProgressBar#PlayReadyBar::chunk {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #21bc75, stop:1 {PLAY_GREEN}); border-radius: 3px;
+}}
+#PlayScene #PlayFooter {{ color: #8da4bb; font-size: 10px; letter-spacing: 0.3px; }}
+#PlayScene QFrame#Card[tone="warn"] {{ background: #2a2518; border-color: {WARN}; }}
+#PlayScene #PlaySubtitle[compact="true"] {{ font-size: 10px; padding: 0 3px; }}
+QDialog#PlayDetails {{ background: {BG}; }}
+#PlayDetails QWidget {{ background: transparent; }}
+#PlayDetails QFrame#Card {{ background: {BG_RAISED}; }}
+#PlayDetails QPushButton {{ background: {BG_INPUT}; }}
 """

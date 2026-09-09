@@ -85,7 +85,7 @@ class MainWindow(QWidget):
         self.settings = settings
 
         self.setWindowTitle("Crash Bandicoot 2 Recompiled  -  %s" % full_version())
-        self.resize(940, 700)
+        self.resize(1440, 740)
         self.setMinimumSize(760, 560)
 
         self.session = GameSession(self)
@@ -117,6 +117,9 @@ class MainWindow(QWidget):
         self.setup_page.ready.connect(self._on_build_ready)
         self.setup_page.relayout.connect(self._relayout)
         self.play_page.crashed.connect(self._on_crash)
+        self.play_page.setup_requested.connect(
+            lambda: self._select(next(i for i, (key, _, _) in enumerate(self._pages)
+                                      if key == "setup")))
         self.settings_page.changed.connect(self._on_settings_changed)
         self.advanced_page.changed.connect(self._on_settings_changed)
         self.session.output.connect(self.log_page.append)

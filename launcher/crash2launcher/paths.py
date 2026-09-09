@@ -87,6 +87,13 @@ def app_dir() -> Path:
         for candidate in (here, *here.parents[:2]):
             if (candidate / BUNDLE_MARKER).is_file():
                 return candidate
+        # A locally built launcher still drives this checkout's existing game
+        # and saves. PyInstaller puts it three levels below the workspace.
+        # Explicit source + project markers keep release bundle detection first.
+        for candidate in (here, *here.parents[:3]):
+            if ((candidate / "launcher" / "crash2launcher" / "paths.py").is_file()
+                    and (candidate / "_build" / "Crash2Recomp" / "game.toml").is_file()):
+                return candidate
         return here
     return Path(__file__).resolve().parents[2]
 

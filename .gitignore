@@ -169,6 +169,8 @@ analysis/
 !launcher/**/assets/**/*.png
 !launcher/**/assets/**/*.ico
 !launcher/**/assets/**/*.svg
+# Personal launcher artwork supplied locally; the native fallback is in code.
+/launcher/crash2launcher/ui/assets/play-reference.png
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +188,7 @@ env/
 
 # PyInstaller
 *.spec
+!launcher/crash2launcher.spec
 launcher/build/
 launcher/dist/
 
