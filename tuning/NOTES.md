@@ -1314,3 +1314,63 @@ ceiling is GPU packet/OT budget, which has not been measured.
 Where the list is FILLED is still unlocated: the buffer is heap-allocated and
 written register-indirect, so address grepping cannot find it, and it may live
 in overlay code rather than the main executable.
+
+## Widescreen, part 4: the meshes end at the 4:3 frustum — result and consequence
+
+Probe run (`PSX_CRASH2_WIDE_PROBE=1`, native-wide, outdoor level): the zone
+meshes contain essentially **no** polygons that project into the widened view
+but were omitted from the authored draw list. `cand` ~ 0.
+
+### What this settles
+
+**The draw list was never the limit.** Extending it cannot help, so the whole
+Phase 4 "extend the render list" approach — and with it the native-wide
+migration as specified — is dead for this title. Native-wide is now strictly
+WORSE than the squash: it reveals 170 px that provably contain nothing.
+
+**It also explains the ORIGINAL complaint.** "Widescreen hack edge issues" was
+never a cull bug. Crash 2's levels are authored to the 4:3 frustum; the world
+geometry simply ends there. ANY widening of the field of view — mode 1's GTE
+squash exactly as much as mode 2's extra columns — walks the camera past the
+authored edge of the world and exposes the void. That is a level-data
+limitation, and no runtime change can conjure geometry that was never shipped.
+
+This is consistent with every measurement taken:
+
+- `ovh_prims = 0` — nothing is ever submitted past the canonical window
+- no screen-extent cull idiom anywhere in the executable (0 width, 0 height
+  immediates) — there is no cull to widen because there is nothing to cull
+- `cand` ~ 0 — and now, no omitted content to add
+
+Three independent measurements agreeing that the world stops at the frame.
+
+### The one unexcluded possibility
+
+The probe only sees the CURRENT zone's resident worlds (`nw <= 8`). If side
+geometry lives in adjacent zones that are not resident, it would read as absent.
+Distinguishing that from "does not exist" means following render-data prefetch,
+i.e. streaming more level data per frame — a far larger problem than widescreen,
+with a memory and load-time cost. Not worth opening unless the edge artifact
+matters more than everything else on the list.
+
+### What to ship instead
+
+No FOV widening is artifact-free on this title, so the real choice is between
+losing content and showing void:
+
+| option | result | cost |
+|---|---|---|
+| 4:3, `letterbox` | fully correct image | pillarbox bars |
+| 4:3, `fill` | fills a 16:9 screen, no void | crops top/bottom — real in a platformer |
+| 16:9 mode 1 (squash) | fills the screen | the void at the edges = the reported artifact |
+| 16:9 mode 2 (native-wide) | fills the screen | same void, plus ~280 MB of surfaces. No reason to use it |
+
+`native_wide` goes back to **false**. Mode 2 buys nothing here and costs memory.
+
+The remaining tractable improvement, if 16:9 is kept, is `[widescreen.backdrop]
+x_sites` (`psx_ws_backdrop_x`): the parallax 2D backdrop computes screen-X
+without the GTE, so it misses the squash and fails to cover the widened FOV.
+Configuring those sites would pull the sky/backdrop out to the new edges. It
+covers the BACKDROP portion of the void only — terrain that simply ends still
+ends — but that is the cheap part of the artifact, and it needs per-game site
+addresses rather than a code change.

@@ -114,10 +114,14 @@ class Settings:
     #   it is gated on the gameplay detector - and predates gte_game_mode being
     #   turned on below.
     #
-    #   It is still False by default because the game continues to CULL at its
-    #   4:3 bounds, so the revealed columns have no geometry submitted into
-    #   them yet. Widening that submission is the open work; see
-    #   tuning/NOTES.md "Widescreen".
+    #   Keep it False anyway, now for a MEASURED reason rather than the wrong
+    #   one above: Crash 2's level meshes are authored to the 4:3 frustum and
+    #   simply end there. Native-wide reveals 170 px per side that provably
+    #   contain no geometry (probe: no omitted polygons project into the
+    #   widened view; the runtime's own overhang counter never fires). So mode 2
+    #   costs ~280 MB of GL surfaces to show the same void the cheaper squash
+    #   shows. There is nothing to gain by turning it on.
+    #   See tuning/NOTES.md "Widescreen, part 4".
     widescreen_native_wide: bool = False
 
     # --- image quality (settings.toml only - no env override exists) -------

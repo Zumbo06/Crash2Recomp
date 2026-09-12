@@ -1,12 +1,19 @@
-# Crash 2 native widescreen — migration tracker
+# Crash 2 native widescreen — migration tracker  (CLOSED)
 
-Migrating from the GTE X-squash hack (mode 1) to the framework's native-wide
-compositor (mode 2) with a Crash 2 rendering profile.
+**Outcome: the migration is closed and `native_wide` stays false.** Not because
+native-wide fails — Phase 3 proved it works — but because there is nothing for
+it to show. Crash 2's level meshes are authored to the 4:3 frustum and end
+there, so widening the field of view exposes void no matter which mode does the
+widening. Jump to **RESULT** at the bottom; the phases above are kept because
+the measurements in them are what closed the question.
 
-Background and the corrected diagnosis are in `NOTES.md`, section
-**"Widescreen, part 2: the native-wide rejection was wrong"**. Read that first;
-it replaces the "Crash 2 has no per-game viewport data" explanation that three
-files and this repo's own notes previously carried.
+This also identifies the root cause of the original "widescreen edge issues"
+report: it was never a cull bug.
+
+Background and the corrected diagnosis are in `NOTES.md`, sections
+**"Widescreen, part 2/3/4"**. Part 2 replaces the "Crash 2 has no per-game
+viewport data" explanation that three files and this repo's own notes
+previously carried.
 
 ---
 
@@ -138,6 +145,11 @@ submit more can fill those columns.
 | Pointers | `[0x8005F390]` + `[0x8005F3D0]` take the first result; `[0x8005F398]` the second |
 | Layout | `+0` count (halfword), `+2` zeroed at alloc, `+4..` polygon ids |
 | **Capacity** | **1520 ids** — the list is read from `[0x8005F390]`, a 3044-byte block |
+| Consumer | `func_80041E5C`, 89 instrs; repurposes `$sp` as the list end pointer |
+| Call sites | `0x80011CB0` **and** `0x8001845C` |
+| Zone | `zone = [[0x800608CC] + 16]`; `nw = [zone]`, 1..8 worlds, 48 bytes each from `zone+4` |
+| Per-world | `+4/+8/+12` origin xyz, `+16` header, `+20` tris, `+24` quads, `+28` verts |
+| Id encoding | `(world << 13) \| index`, bit `0x1800` marks a quad |
 
 > Not established: whether those two blocks are a double-buffer pair.
 > `mipsdis` reports `GAP` for every jump in `func_80029768`, so the call
@@ -145,11 +157,6 @@ submit more can fill those columns.
 > read **only** at teardown (`func_800297C8`) — never by a renderer, which is
 > not how a double buffer behaves. The capacity figure does not depend on this:
 > the consumer takes its list from `[0x8005F390]`, and that block is 3044 bytes.
-| Consumer | `func_80041E5C`, 89 instrs; repurposes `$sp` as the list end pointer |
-| Call sites | `0x80011CB0` **and** `0x8001845C` |
-| Zone | `zone = [[0x800608CC] + 16]`; `nw = [zone]`, 1..8 worlds, 48 bytes each from `zone+4` |
-| Per-world | `+4/+8/+12` origin xyz, `+16` header, `+20` tris, `+24` quads, `+28` verts |
-| Id encoding | `(world << 13) \| index`, bit `0x1800` marks a quad |
 
 The render driver (`func_80011800`) packs each world descriptor to scratchpad
 `0x1F800280`, reading `zone+8,12,16,20,24,28,32` — matching the probe's
@@ -183,67 +190,55 @@ Not started; each depends on Phase 4.
 
 ---
 
-## Handoff — the Phase 4 experiment
+## RESULT — Phase 4 answered, migration closed
 
-Phase 3 is done. The next question is the one that decides how Phase 4 is
-built, and it is cheap to answer because the instrument already exists:
+Probe run on an outdoor level with native-wide active: **`cand` ~ 0**. The zone
+meshes hold essentially no geometry that projects into the widened view but was
+left out of the authored draw list.
 
-> Is there revealable geometry in the zone meshes at all, and how much?
+**The draw list was never the limit**, so extending it cannot help and the
+native-wide migration is closed for this title. Full reasoning in `NOTES.md`,
+"Widescreen, part 4".
 
-`crash2_wide_probe.h` answers it directly. It re-projects each world's polygons
-itself and marks the ones visible in the widened field that the authored list
-omitted. Patch 0015 fixes its reporting first — as found, it clamped the count
-to `room` and then hit `if(!ne)return` **before** logging, so the single most
-informative case (list fully visible, `room == 0`, nothing addable) printed
-nothing at all and read as "the probe never ran". It now reports unconditionally
-for 40 frames:
+The same result explains the original "widescreen edge issues" report: Crash 2's
+levels are authored to the 4:3 frustum and the world ends there. Any FOV
+widening — mode 1's squash exactly as much as mode 2's extra columns — walks
+past the authored edge and exposes the void. It is a level-data limitation.
 
-    C2 wide probe: count=<list> kept=<still visible> cand=<REVEALABLE> added=<permitted> room=<slots free> site1=<n> site2=<n> other=<n>
+Three independent measurements agree: `ovh_prims = 0` (nothing ever submitted
+past the window), zero screen-extent cull immediates in the executable (no cull
+to widen, because nothing is culled), and now `cand` ~ 0 (no omitted content).
 
-**`cand` is the answer.** It is the number of polygons the probe found visible
-in the widened view that the authored list omitted, *before* any cap. `added`
-is only what the probe's self-imposed `room` limit then allowed through.
+### Phases 2 and 5-9: closed, not deferred
 
-`site1`/`site2` count the consumer's two call sites (`0x80011CB0` /
-`0x8001845C`); only site 1 is intercepted, so a large `site2` means a
-list-extension covering one site would be a half-fix.
+They existed to serve the native-wide migration. With no content to reveal
+there is nothing for a title profile, a visibility extension, a HUD pass or a
+transition-safety pass to do. Phase 6's allocation guard (patch 0014) is kept —
+it is correct regardless and protects any future native-wide use.
 
-Run it **with native-wide on**, so anything it adds is actually presented:
+### Settings
 
-1. Keep the Phase 3 launcher setup (16:9, native-wide, supersampling 2,
-   debugtools build, developer mode).
-2. Set the environment variable before launching:
+`native_wide` back to **false**. Mode 2 costs ~280 MB of GL surfaces to show the
+same void the squash shows.
 
-       PSX_CRASH2_WIDE_PROBE=1
-
-   In the launcher this is easiest from a terminal:
-
-       $env:PSX_CRASH2_WIDE_PROBE = "1"
-       .\Crash2Launcher.exe            # or launch the exe directly
-
-3. Load an outdoor level with distant scenery — a wide jungle or ruins area is
-   a better test than a corridor or a tunnel.
-4. Capture the game's stdout (the launcher's **Log** page → Save to file) and
-   paste the `C2 wide probe:` lines.
-5. Say whether the left/right margins visibly gained scenery.
-
-**Reading the result**
-
-| `cand` | meaning | consequence |
+| option | result | cost |
 |---|---|---|
-| consistently > 0 | the zone meshes DO hold geometry outside the 4:3 view | extend the draw list; the probe becomes the basis of the implementation. If `cand > room`, lifting the cap is the next step — against a measured GPU packet budget, not blindly |
-| ~0 | the meshes themselves stop at the 4:3 frustum | a list change cannot help. Filling the margins would need the level data to carry more geometry, which is a different and much larger problem — and the honest answer may be that mode 1's stretch is the better trade for this title |
+| 4:3, `letterbox` | fully correct image | pillarbox bars |
+| 4:3, `fill` | fills a 16:9 screen, no void | crops top/bottom — real in a platformer |
+| 16:9 squash (mode 1) | fills the screen | the void at the edges = the reported artifact |
 
-`added` vs `cand` separates "nothing to reveal" from "the probe refused to
-reveal it" — the distinction the original code destroyed by returning before it
-logged. Ignore `added` when judging feasibility; it measures the probe, not the
-game.
+### Only remaining tractable improvement
 
-**Do not** change aspect or widescreen mode from the in-game pause menu during
-any of this: toggling mode live rewrites emitted cull constants mid-frame and
-is the known crash path. Launching straight into native-wide never crosses it.
+`[widescreen.backdrop] x_sites` (`psx_ws_backdrop_x`): the parallax 2D backdrop
+computes screen-X without the GTE, so it misses the squash and stops short of
+the widened FOV. Configuring those per-game sites pulls the sky/backdrop out to
+the new edges. It covers the BACKDROP part of the void only — terrain that ends
+still ends — but that is the cheap part, and it is configuration, not code.
 
-### Still outstanding from Phase 1
+### Not excluded
 
-Reference scene capture: a 4:3 and a 16:9 screenshot of the same spot, for the
-comparison set. Convenient to grab in the same session.
+The probe sees only the current zone's resident worlds (`nw <= 8`). Side
+geometry living in non-resident adjacent zones would read as absent. Separating
+that from "does not exist" means following render-data prefetch — streaming more
+level data per frame, with memory and load-time cost. A much larger problem than
+widescreen.
