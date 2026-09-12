@@ -344,14 +344,18 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
             # the GTE activity detector. BIOS, FMV and full-2D screens stay 4:3
             # inside the output canvas either way.
             #
-            # native_wide is a MODE choice, not an on/off switch, and it is the
-            # one that decides whether widescreen does anything at all:
-            #   True  - expand the render target. Needs per-game viewport data;
-            #           Crash 2 has none, so nw_extra stays 0 and NOTHING
-            #           widens. This is the framework default.
+            # native_wide is a MODE choice, not an on/off switch:
+            #   True  - expand the render target, rendering real extra columns.
+            #           The reveal is derived from the live display width and
+            #           target aspect (85 px/side at 16:9 on this title's
+            #           512-wide display), NOT from per-game viewport data - the
+            #           earlier note claiming otherwise was native-wide failing
+            #           to ACTIVATE, which gte_game_mode below now addresses.
             #   False - GTE X-squash + stretched present, the DuckStation/Beetle
             #           widescreen hack. Works on any title, verified widening
-            #           Crash 2 edge to edge.
+            #           Crash 2 edge to edge, at the cost of stretching the HUD.
+            # Both modes still leave the game culling at its 4:3 bounds; that is
+            # the open work, not a property of the mode.
             "widescreen": {
                 "offer": True,
                 "offer_ultrawide": False,

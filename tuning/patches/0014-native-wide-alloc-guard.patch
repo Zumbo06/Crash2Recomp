@@ -1,0 +1,150 @@
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3283,6 +3283,51 @@ void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]) {
+  * 4:3 / non-opted games (gpu.c never calls wide_configure for those).
+  * ------------------------------------------------------------------------- */
+ 
++/* Native-wide surfaces are by far the largest allocations this renderer makes:
++ * at supersampling 5 a 682-px-wide surface is 3410x2560 RGBA8 plus a matching
++ * D24S8 renderbuffer — ~70 MB per surface, up to WIDE_MAX_SURF of them, built
++ * synchronously on first engage. Neither glTexImage2D nor glRenderbufferStorage
++ * reports failure through a return value, so an out-of-memory driver handed back
++ * object ids whose storage was never allocated and every later draw mirrored
++ * into them regardless. Check explicitly, and LATCH the failure: retrying a
++ * 70 MB allocation every frame is far worse than the degraded present the
++ * callers already handle (all of them treat 0 as "skip the wide mirror").
++ * wide_free_all() clears the latch, so a reconfigure at a smaller internal
++ * scale gets a fresh attempt. */
++#define PSXGL_MAX_RENDERBUFFER_SIZE 0x84E8
++static int s_wide_alloc_failed = 0;
++
++static void gl_drain_errors(void) {
++    /* Bounded: a lost context reports the same error forever. */
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; i++) { }
++}
++
++/* Reject dimensions the driver cannot represent before asking it to allocate
++ * them — an oversized request is the one failure mode that is cheap to predict.
++ */
++static int wide_dims_supported(int w, int h) {
++    GLint max_tex = 0, max_rb = 0;
++    gl_drain_errors();
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
++    glGetIntegerv(PSXGL_MAX_RENDERBUFFER_SIZE, &max_rb);
++    /* GL_MAX_RENDERBUFFER_SIZE is FBO-era; on a driver that rejects the query
++     * fall back to the texture limit rather than treating 0 as "no limit". */
++    if (glGetError() != GL_NO_ERROR || max_rb <= 0) max_rb = max_tex;
++    if (max_tex > 0 && (w > max_tex || h > max_tex)) return 0;
++    if (max_rb  > 0 && (w > max_rb  || h > max_rb))  return 0;
++    return 1;
++}
++
++static void wide_alloc_fail(const char *what, int w, int h) {
++    if (!s_wide_alloc_failed)
++        fprintf(stdout,
++                "psxrecomp: native-wide %s allocation failed at %dx%d "
++                "(internal scale %dx); falling back to the canonical present. "
++                "Lower [video] supersampling to use native widescreen.\n",
++                what, w, h, s_scale);
++    s_wide_alloc_failed = 1;
++}
++
+ static void wide_free_all(void) {
+     for (int i = 0; i < WIDE_MAX_SURF; i++) {
+         if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
+@@ -3291,19 +3336,30 @@ static void wide_free_all(void) {
+         s_wide_base[i] = -1;
+     }
+     g_wide_cur = 0;
++    s_wide_alloc_failed = 0;
+ }
+ 
+ /* Lazily allocate (or find) the wide FBO+tex for base_x. Returns the FBO id, or
+  * 0 on failure / more distinct buffers than WIDE_MAX_SURF. */
+ static GLuint wide_fbo_for(int base_x) {
+-    if (g_wide_w <= 0) return 0;
++    if (g_wide_w <= 0 || s_wide_alloc_failed) return 0;
+     for (int i = 0; i < WIDE_MAX_SURF; i++)
+         if (s_wide_fbo[i] && s_wide_base[i] == base_x) return s_wide_fbo[i];
+     for (int i = 0; i < WIDE_MAX_SURF; i++) {
+         if (!s_wide_fbo[i]) {
+             int w = g_wide_w * s_scale, h = VRAM_H * s_scale;
++            if (!wide_dims_supported(w, h)) {
++                wide_alloc_fail("surface", w, h);
++                return 0;
++            }
+             s_cw_fbo_creates++;
++            gl_drain_errors();
+             s_wide_tex[i] = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
++            if (!s_wide_tex[i] || glGetError() != GL_NO_ERROR) {
++                if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
++                wide_alloc_fail("colour texture", w, h);
++                return 0;
++            }
+             /* Depth-stencil RB, same as the hr FBO: the stencil carries the
+              * PSX mask-bit mirror for the wide surface, and (the hard lesson)
+              * a stencil-less FBO turns every stencil-enabled mirror draw into
+@@ -3311,9 +3367,16 @@ static GLuint wide_fbo_for(int base_x) {
+             p_glGenRenderbuffers(1, &s_wide_rb[i]);
+             p_glBindRenderbuffer(PSXGL_RENDERBUFFER, s_wide_rb[i]);
+             p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, w, h);
++            if (glGetError() != GL_NO_ERROR) {
++                glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0;
++                p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0;
++                wide_alloc_fail("depth-stencil renderbuffer", w, h);
++                return 0;
++            }
+             if (!make_fbo(&s_wide_fbo[i], s_wide_tex[i], s_wide_rb[i])) {
+                 glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0;
+                 p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0;
++                wide_alloc_fail("framebuffer", w, h);
+                 return 0;
+             }
+             /* Clear to black so unwritten margins are clean (not stale). */
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6187,20 +6187,32 @@ static void pause_menu_flush_pending(void) {
+     const int den = kPauseAspect[index][1];
+     if (num == g_video_aspect_num && den == g_video_aspect_den) return;
+ 
+-    /* Force the GTE X-squash projection (mode 1) for runtime changes.
++    /* Force the GTE X-squash projection (mode 1) for RUNTIME aspect changes.
+      *
+-     * With native_wide set, refresh_widescreen_projection() would pick mode 2,
+-     * whose first engage allocates the wide mirror surfaces: at supersampling
+-     * 5 that is 3410x2560 RGBA8 + D24S8 per surface, up to WIDE_MAX_SURF of
+-     * them - roughly 280 MB of GL objects, built synchronously, with no
+-     * glGetError check on make_tex/glRenderbufferStorage.
++     * Correction to the reason originally recorded here: mode 2 does NOT need
++     * per-game viewport data. ws_nw_configured_offset() (gpu.c) derives the
++     * reveal from the live display width and the target aspect
++     * ((w*(3*num-4*den) + 4*den) / (8*den)), which is 85 px per side for this
++     * title's 512-wide display at 16:9. The earlier "nw_extra stays 0"
++     * observation was native-wide never ACTIVATING - ws_native_wide_active()
++     * is gated on gpu_ws_present_native_43(), i.e. the gameplay detector, and
++     * that observation predates [widescreen] gte_game_mode = true.
+      *
+-     * And it buys nothing here: mode 2 renders extra columns from per-game
+-     * viewport data, which Crash 2 does not have, so nw_extra stays 0 and
+-     * nothing widens (tuning/NOTES.md - the documented fix for this title is
+-     * native_wide = false). Mode 1 squashes the projection and stretches the
+-     * present, allocates no surfaces, and is what the launcher already
+-     * configures. */
++     * What remains true, and is why the force stays for now, is the TRANSITION
++     * hazard - it is a property of changing mode live, not of mode 2 itself:
++     *
++     *   1. Host: the first mode-2 engage allocates the wide mirror surfaces
++     *      synchronously (3410x2560 RGBA8 + D24S8 per surface at supersampling
++     *      5, up to WIDE_MAX_SURF). Those allocations are now checked and
++     *      latched (gpu_gl_renderer.c wide_fbo_for), so a failure degrades to
++     *      the canonical present instead of rendering into dead objects.
++     *   2. Guest: psx_ws_x_margin() jumps 0 -> 85 the instant ws_mode becomes
++     *      2, live-rewriting clip/cull constants the recompiler emitted, on a
++     *      frame already built at 4:3. THIS is still unguarded.
++     *
++     * Launching directly into native-wide never crosses (2), so it is the
++     * supported way to exercise mode 2 today. Removing this force requires
++     * reseting derived widescreen state at a frame boundary. */
+     g_ws_native_wide = 0;
+ 
+     g_video_aspect_num = num;

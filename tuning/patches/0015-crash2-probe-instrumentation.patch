@@ -1,0 +1,51 @@
+--- a/runtime/src/crash2_wide_probe.h
++++ b/runtime/src/crash2_wide_probe.h
+@@ -43,11 +43,21 @@ static int c2depth_cmp(const void *a,const void *b) {
+     return x>y?-1:x<y?1: (int)*(const uint16_t*)a-(int)*(const uint16_t*)b;
+ }
+ 
++/* func_80041E5C has TWO call sites: 0x80011CB0 (ra 0x80011CB8) and 0x8001845C
++ * (ra 0x80018464). Only the first is intercepted, so count the second rather
++ * than silently ignoring it — if it carries a meaningful share of the frame's
++ * geometry, a draw-list extension that covers one site is only half a fix. */
++static unsigned c2site1, c2site2, c2site_other;
++
+ static void crash2_wide_probe(CPUState *cpu,uint32_t pc) {
+     static int enabled=-1;
+     if (pc!=0x80041E5Cu) return;
+     if (enabled<0) { const char *e=getenv("PSX_CRASH2_WIDE_PROBE");enabled=e&&*e=='1'; }
+-    if (!enabled || psx_ws_x_margin()<=0 || cpu->gpr[31]!=0x80011CB8u) return;
++    if (!enabled || psx_ws_x_margin()<=0) return;
++    if      (cpu->gpr[31]==0x80011CB8u) c2site1++;
++    else if (cpu->gpr[31]==0x80018464u) c2site2++;
++    else                                c2site_other++;
++    if (cpu->gpr[31]!=0x80011CB8u) return;
+     if (cpu->read_word(0x80041E5Cu)!=0x27BDFFBCu ||
+         cpu->read_word(0x80011CB0u)!=0x0C010797u) return;
+     uint32_t src=cpu->gpr[4],zp=cpu->read_word(0x800608CCu);
+@@ -107,8 +117,19 @@ static void crash2_wide_probe(CPUState *cpu,uint32_t pc) {
+         uint16_t p=cpu->read_half(src+4+i*2);
+         if(!c2wp[p].valid||c2wp[p].visible)c2keep[nk++]=p;
+     }
++    /* Report BEFORE the room clamp and before the early-out. Previously `ne`
++     * was clamped to `room` and then `if(!ne)return` fired ahead of the log, so
++     * the most informative case — authored list fully visible, room == 0, so
++     * nothing could be added — printed nothing at all and read as "the probe
++     * did not run". cand is the real answer to "is there revealable content";
++     * added is only what this probe's self-imposed cap permitted. */
++    unsigned cand=ne;
+     unsigned room=count-1-nk;
+     if(ne>room)ne=room;
++    if(c2log++<40)
++        fprintf(stderr,"C2 wide probe: count=%u kept=%u cand=%u added=%u room=%u"
++                       " site1=%u site2=%u other=%u\n",
++                count,nk,cand,ne,room,c2site1,c2site2,c2site_other);
+     if(!ne)return;
+     qsort(c2extra,ne,sizeof(c2extra[0]),c2depth_cmp);
+     if(!c2list)c2list=psx_mod_memory_alloc(4+4096*2,4);
+@@ -123,5 +144,4 @@ static void crash2_wide_probe(CPUState *cpu,uint32_t pc) {
+         cpu->write_half(c2list+4+out++*2,p);
+     }
+     cpu->gpr[4]=c2list;
+-    if(c2log++<10)fprintf(stderr,"C2 wide probe: count=%u kept=%u added=%u room=%u\n",count,nk,ne,room);
+ }

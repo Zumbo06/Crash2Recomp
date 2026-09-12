@@ -1,0 +1,145 @@
+--- /dev/null
++++ b/runtime/src/crash2_wide_probe.h
+@@ -0,0 +1,127 @@
++/* Temporary, opt-in visibility experiment. Not enabled in shipping settings. */
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++extern uint32_t psx_mod_memory_alloc(uint32_t size, uint32_t alignment);
++extern int psx_ws_x_margin(void);
++
++typedef struct { float x, y, z; } C2WV;
++typedef struct { float z; unsigned char valid, visible, side; } C2WP;
++static C2WV c2wv[4096];
++static C2WP c2wp[65536];
++static unsigned char c2seen[65536];
++static uint16_t c2keep[4096], c2extra[4096];
++static uint32_t c2list;
++static int c2log;
++
++static int c2ram(uint32_t a, uint32_t n) {
++    return (a & 0xe0000000u)==0x80000000u &&
++        (a & 0x1fffffffu)<0x200000u && n<=0x200000u-(a & 0x1fffffffu);
++}
++
++static void c2poly(unsigned id, const unsigned *indices, int n,
++                   unsigned nv, float margin) {
++    float xmin=1e20f,xmax=-1e20f,ymin=1e20f,ymax=-1e20f,zmin=1e20f,z=0;
++    C2WP *p=&c2wp[id];
++    for (int i=0;i<n;++i) {
++        if (indices[i]>=nv) return;
++        C2WV v=c2wv[indices[i]];
++        if (v.x<xmin)xmin=v.x; if(v.x>xmax)xmax=v.x;
++        if (v.y<ymin)ymin=v.y; if(v.y>ymax)ymax=v.y;
++        if (v.z<zmin)zmin=v.z; z+=v.z;
++    }
++    p->valid=1; p->z=z/n;
++    /* Keep near-plane cases in the authored stream. Only add fully projected
++       polygons; no extra coordinates may rely on GTE saturation/wrapping. */
++    p->visible=zmin<=144 || (xmax>=-margin && xmin<=512+margin && ymax>=-2 && ymin<=219);
++    p->side=zmin>144 && (xmax<0 || xmin>512);
++}
++
++static int c2depth_cmp(const void *a,const void *b) {
++    float x=c2wp[*(const uint16_t*)a].z,y=c2wp[*(const uint16_t*)b].z;
++    return x>y?-1:x<y?1: (int)*(const uint16_t*)a-(int)*(const uint16_t*)b;
++}
++
++static void crash2_wide_probe(CPUState *cpu,uint32_t pc) {
++    static int enabled=-1;
++    if (pc!=0x80041E5Cu) return;
++    if (enabled<0) { const char *e=getenv("PSX_CRASH2_WIDE_PROBE");enabled=e&&*e=='1'; }
++    if (!enabled || psx_ws_x_margin()<=0 || cpu->gpr[31]!=0x80011CB8u) return;
++    if (cpu->read_word(0x80041E5Cu)!=0x27BDFFBCu ||
++        cpu->read_word(0x80011CB0u)!=0x0C010797u) return;
++    uint32_t src=cpu->gpr[4],zp=cpu->read_word(0x800608CCu);
++    if(!c2ram(src,4)||!c2ram(zp,20))return;
++    unsigned count=cpu->read_half(src),nk=0,ne=0;
++    if(count<2||count>4096||!c2ram(src,4+2*count))return;
++    uint32_t zone=cpu->read_word(zp+16);
++    if(!c2ram(zone,4))return;
++    unsigned nw=cpu->read_word(zone);
++    if(nw<1||nw>8||!c2ram(zone,4+48*nw))return;
++    int16_t rot[9];
++    for(unsigned i=0;i<9;++i) rot[i]=(int16_t)(cpu->gte_ctrl[i/2]>>((i&1)*16));
++    const float ofx=(int32_t)cpu->gte_ctrl[24]/65536.0f;
++    const float ofy=(int32_t)cpu->gte_ctrl[25]/65536.0f;
++    const float h=(uint16_t)cpu->gte_ctrl[26];
++    const float margin=psx_ws_x_margin()*512.0f/320.0f;
++    memset(c2wp,0,sizeof(c2wp)); memset(c2seen,0,sizeof(c2seen));
++    for(unsigned i=1;i<count;++i) {
++        uint16_t p=cpu->read_half(src+4+i*2);
++        c2seen[p]=1;
++        if(p&0x1800) for(unsigned st=1;st<=3;++st)c2seen[(p&~0x1800)|(st<<11)]=1;
++    }
++    for(unsigned wi=0;wi<nw;++wi) {
++        uint32_t a=zone+4+wi*48,hdr=cpu->read_word(a+16);
++        if(!c2ram(hdr,76))return;
++        unsigned nv=cpu->read_word(hdr+16),nt=cpu->read_word(hdr+20),nq=cpu->read_word(hdr+24);
++        if(nv>4096||nt>2048||nq>2048)return;
++        uint32_t vb=cpu->read_word(a+28),tb=cpu->read_word(a+20),qb=cpu->read_word(a+24);
++        if(!c2ram(vb,nv*6)||!c2ram(tb,nt*6)||!c2ram(qb,nq*8))return;
++        uint32_t vp=vb+4*nv,tp=tb+4*nt;
++        uint32_t ox=cpu->read_word(a+4),oy=cpu->read_word(a+8),oz=cpu->read_word(a+12);
++        uint32_t packed=((oy&0xfffe)<<16)|(ox&65535);
++        for(unsigned vi=0;vi<nv;++vi) {
++            uint32_t xy=((cpu->read_word(vp-4-vi*4)&0xfff0fff0u)+packed)&0xfffeffffu;
++            int16_t v[3]={(int16_t)xy,(int16_t)(xy>>16),(int16_t)((cpu->read_half(vp+vi*2)&0xfff0)+oz)};
++            float t[3];
++            for(int j=0;j<3;++j)t[j]=((int64_t)rot[j*3]*v[0]+(int64_t)rot[j*3+1]*v[1]+(int64_t)rot[j*3+2]*v[2])/4096.0f;
++            c2wv[vi]=(C2WV){ofx+h*t[0]/fmaxf(t[2],1),ofy+h*t[1]/fmaxf(t[2],1),t[2]};
++        }
++        for(unsigned pi=0;pi<nt;++pi) {
++            uint32_t w=cpu->read_word(tp-4-pi*4),b=cpu->read_half(tp+pi*2);
++            unsigned vs[]={w>>20,(w>>8)&4095,b>>4};
++            unsigned id=(wi<<13)|pi;
++            c2poly(id,vs,3,nv,margin);
++            if(!c2seen[id]&&c2wp[id].visible&&c2wp[id].side&&ne<4096)c2extra[ne++]=(uint16_t)id;
++        }
++        for(unsigned pi=0;pi<nq;++pi) {
++            uint32_t w=cpu->read_word(qb+pi*8),b=cpu->read_word(qb+pi*8+4);
++            unsigned vs[]={w>>20,(w>>8)&4095,b>>20,(b>>8)&4095};
++            unsigned id=(wi<<13)|0x1800|pi;
++            c2poly(id,vs,4,nv,margin);
++            c2wp[id^0x1000]=c2wp[id];c2wp[id^0x0800]=c2wp[id];
++            if(!c2seen[id]&&c2wp[id].visible&&c2wp[id].side&&ne<4096)c2extra[ne++]=(uint16_t)id;
++        }
++    }
++    for(unsigned i=1;i<count;++i) {
++        uint16_t p=cpu->read_half(src+4+i*2);
++        if(!c2wp[p].valid||c2wp[p].visible)c2keep[nk++]=p;
++    }
++    unsigned room=count-1-nk;
++    if(ne>room)ne=room;
++    if(!ne)return;
++    qsort(c2extra,ne,sizeof(c2extra[0]),c2depth_cmp);
++    if(!c2list)c2list=psx_mod_memory_alloc(4+4096*2,4);
++    if(!c2list)return;
++    cpu->write_half(c2list,(uint16_t)(1+nk+ne));cpu->write_half(c2list+2,0);
++    cpu->write_half(c2list+4,cpu->read_half(src+4));
++    unsigned k=0,e=0,out=1;
++    while(k<nk||e<ne) {
++        uint16_t p;
++        if(e<ne&&(k==nk||c2wp[c2extra[e]].z>c2wp[c2keep[k]].z))p=c2extra[e++];
++        else p=c2keep[k++];
++        cpu->write_half(c2list+4+out++*2,p);
++    }
++    cpu->gpr[4]=c2list;
++    if(c2log++<10)fprintf(stderr,"C2 wide probe: count=%u kept=%u added=%u room=%u\n",count,nk,ne,room);
++}
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -2050,10 +2050,12 @@ irq_deliver_eval:
+  * interrupts via psx_check_interrupts (cpu->pc / scratch sentinel). Forwarding
+  * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
+  * current generated code on the good baseline for instrumented comparison. */
++#include "crash2_wide_probe.h"
+ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+     uint32_t prev = s_compiled_interrupt_resume_pc;
+     s_compiled_interrupt_resume_pc = resume_pc;
+     psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
++    crash2_wide_probe(cpu, resume_pc);
+     s_compiled_interrupt_resume_pc = prev;
+ }
+ 

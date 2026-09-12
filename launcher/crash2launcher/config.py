@@ -103,9 +103,21 @@ class Settings:
     #   present stretched, net result is a genuinely wider field of view. Works
     #   on any title with no per-game data.
     # True  -> "native-wide", which renders extra columns instead of squashing.
-    #   Higher quality in principle, but it needs per-game viewport data; with
-    #   none, nw_extra stays 0 and NOTHING widens. That is the framework
-    #   default and why widescreen silently did nothing on Crash 2.
+    #   Higher quality: no horizontal stretch, so the HUD and 2D art keep their
+    #   authored proportions.
+    #
+    #   CORRECTION to what was recorded here: native-wide does NOT need
+    #   per-game viewport data. The runtime derives the reveal from the live
+    #   display width and the target aspect (gpu.c ws_nw_configured_offset),
+    #   which is 85 px per side for Crash 2's 512-wide display at 16:9. The
+    #   original "nw_extra stays 0" reading was native-wide never ACTIVATING -
+    #   it is gated on the gameplay detector - and predates gte_game_mode being
+    #   turned on below.
+    #
+    #   It is still False by default because the game continues to CULL at its
+    #   4:3 bounds, so the revealed columns have no geometry submitted into
+    #   them yet. Widening that submission is the open work; see
+    #   tuning/NOTES.md "Widescreen".
     widescreen_native_wide: bool = False
 
     # --- image quality (settings.toml only - no env override exists) -------

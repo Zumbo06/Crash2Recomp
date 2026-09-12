@@ -1153,3 +1153,164 @@ the page says to empty it by hand.
 Knock-on: runtime discovery had to follow, since the exe now lands at
 `<root>/game/build/`. find_runtime searches game/build, build, root and
 build-clang in that order.
+
+## Widescreen, part 2: the native-wide rejection was wrong
+
+Three files independently recorded the same explanation for why Crash 2 uses
+the GTE X-squash hack (mode 1) instead of native-wide (mode 2):
+
+> mode 2 renders extra columns from per-game viewport data, which Crash 2 does
+> not have, so `nw_extra` stays 0 and nothing widens
+
+(`main.cpp` pause flush, `launcher/.../config.py`, `launcher/.../runtime.py`,
+and this file at the "SOLVED: it was mode selection" section.)
+
+**That is not what the code does.** `ws_nw_configured_offset()` (gpu.c:390)
+derives the per-side reveal from the LIVE DISPLAY WIDTH and the target aspect:
+
+    numr = 3*num - 4*den;  w = ws_disp_w();
+    offset = (w*numr + 4*den) / (8*den)
+
+No per-game table is consulted. At 16:9 that is `(w*12 + 36)/72`. There is no
+viewport data to be missing.
+
+What `nw_extra = 0` actually meant is that native-wide never **activated**:
+
+    ws_native_wide_active() = ws_mode == 2 && !gpu_ws_present_native_43()
+
+and `gpu_ws_present_native_43()` returns 1 for any frame the gameplay detector
+does not classify as gameplay. That observation predates
+`[widescreen] gte_game_mode = true`, which is exactly the opt-in for a fully-3D
+title with no sprite-tag hook. With it set, `ws_game_mode()` (gpu.c:273) takes
+the GTE-activity branch — 3 verts, 45-frame hysteresis — and `ws_2d_only_scene()`
+returns 0 unconditionally (gpu.c:308). So the gate that held mode 2 shut is
+already open; nobody re-tested mode 2 after opening it.
+
+### Arithmetic that settles the display width
+
+Two margins were recorded at the same 16:9 aspect and looked contradictory:
+85 px (this file, the pause-menu crash section) and ~53 px (the Night Fight
+suspect list). Both are right, and the difference identifies a real defect:
+
+| path | formula | at 16:9 |
+|---|---|---|
+| mode 2 `ws_nw_configured_offset` | uses real `ws_disp_w()` | `(512*12+36)/72` = **85** |
+| mode 1 `psx_ws_x_margin` | hardcodes **160** = 320/2 | `160*(den-num)/num` = **53** |
+
+Only `w = 512` produces the observed 85, so **Crash 2 renders 512 wide**. That
+is corroborated independently by `crash2_wide_probe.h`, which rescales the
+margin by `512.0f/320.0f` and bounds polygons against `512+margin`.
+
+So `psx_ws_x_margin()` (gpu.c:966) is **computed for a 320-wide game**. Its own
+comment says as much: "the game's draw classifier works in objX-camX where 1
+unit ~= 1 native-4:3 screen pixel ... half-view of 160/s pixels". For a 512-wide
+title every margin it returns is short by 512/320 = 1.6x. This is currently
+LATENT — see below — but it bites the moment any cull hook is enabled.
+
+### Why the edges pop today: nothing widens the cull at all
+
+Crash 2's `[widescreen]` has no `cull` table, so every site list is empty and
+every predicate is false. Walking the interpreter's SLTI/SLTIU cases
+(dirty_ram_interp.c:1994-2046), every widening branch falls through to vanilla:
+
+- `psx_ws_is_cull_{keep,depth,slti,slti_lower,vxrange,range,bias}_site()` — no sites
+- `psx_ws_auto_cull_on()` — `[widescreen.cull] auto_screen_x` is default-OFF
+
+The FOV widens; the game keeps culling, activating and clipping at its original
+4:3 bounds. That is the edge popping, and it is mode-independent — switching to
+mode 2 reveals more columns but does not make the game submit geometry for them.
+
+### auto_screen_x cannot help this title
+
+The automatic path scans for a screen-extent trivial-reject — a width compare
+AND a height compare in the same function (`psx_ws_func_has_screen_cull`),
+immediates defaulting to 0x140/0x141 + 0xE0/0xF1 (Tomba, 320-wide; Ape Escape
+uses 0x181 on 368). Census of the 69,095 instructions in `generated/`:
+
+    SLTI  (0x28) = 271 sites    SLTIU (0x2C) = 263 sites
+    imm 0x140/0x141 : 0 / 0     imm 0x0E0/0x0F0/0x0F1 : 0 / 0 / 0
+    imm 0x200/0x201 : slti 1 / 2, sltiu 0 / 0
+
+Zero width signatures and zero height signatures. Crash 2 does not use the
+idiom, so `auto_screen_x` would find nothing even with corrected immediates —
+and with no height compare anywhere the detector cannot fire regardless.
+
+Crash 2 culls by building an authored **draw list** of polygon ids instead,
+which is what `crash2_wide_probe.h` (now recorded, patch 0013) intercepts at
+`0x80041E5C`.
+
+### Patch 0014 — native-wide allocation guard
+
+Prerequisite for testing mode 2 at all. The first mode-2 engage allocates
+3410x2560 RGBA8 + D24S8 per surface at supersampling 5, up to WIDE_MAX_SURF —
+~280 MB, synchronously, and NEITHER `glTexImage2D` NOR `glRenderbufferStorage`
+reports failure through a return value. An out-of-memory driver handed back
+object ids with no storage and every later draw mirrored into them.
+
+`wide_fbo_for()` now pre-checks against GL_MAX_TEXTURE_SIZE /
+GL_MAX_RENDERBUFFER_SIZE, checks `glGetError()` after each allocation, and
+LATCHES failure (retrying 70 MB every frame is worse than degrading). All three
+callers already treated 0 as "skip the wide mirror", so the graceful path
+existed — it was simply never reached. `wide_free_all()` clears the latch so a
+reconfigure at a lower scale retries.
+
+The pause-menu force of `g_ws_native_wide = 0` **stays** for now. Its stated
+reason was wrong, but a second, real hazard remains: `psx_ws_x_margin()` jumps
+0 -> 85 the instant `ws_mode` becomes 2, live-rewriting emitted clip/cull
+constants on a frame already built at 4:3. That is a property of the live
+TRANSITION, not of mode 2 — launching directly into native-wide never crosses
+it, which is why that is the supported way to exercise mode 2 today.
+
+## Widescreen, part 3: mode 2 measured working; the real problem is submission
+
+Native-wide validated in-game (frame 13696, 16:9):
+
+    mode 2   squash [1,1]   nw_extra 170   present_native_43 0
+    x_margin 85   activation_margin 85   game_mode 1   gte_verts 206
+
+`nw_extra = 170 = 2*85` and 85 = `(512*12+36)/72`, so the 512-wide display
+derived in part 2 is now measured, not inferred. `game_mode 1` with
+`last_tag_frame` at its never-set sentinel confirms the GTE-activity branch is
+the only thing classifying gameplay here — `gte_game_mode` is exactly what
+opens the gate that the old "no viewport data" note mistook for a missing
+feature. `aspect_cone` / `terrain_angle` counters are all zero, confirming
+those hooks are Tomba-specific.
+
+**The decisive number is `ovh_prims = 0`**, with `last_ovh_frame` still at the
+never-set sentinel: the >=4-prim overhang threshold has not been crossed once
+since boot. `ws_note_overhang` (gpu.c:4791) measures against the real
+`ws_disp_w()` and uses raw pre-draw-offset SX, so our own offset injection
+cannot feed it. Crash 2 submits **zero** geometry past its own window. The
+compositor reveals 170 px the game will never draw into — so this was never a
+compositor problem, and switching modes cannot fix it.
+
+Draw-list structures mapped (detail and the Phase 4 plan in
+`tuning/WIDESCREEN-PLAN.md`):
+
+- two 3044-byte (`0x0BE4`) blocks allocated at `func_80029768`;
+  `[0x8005F390]`/`[0x8005F3D0]` take the first, `[0x8005F398]` the second.
+  Whether they are a double-buffer pair is NOT established: `mipsdis` reports
+  `GAP` for every jump in that function so the call structure is unrecoverable
+  from the emitted comments, and `[0x8005F398]` is read only at teardown
+  (`func_800297C8`), never by a renderer. The capacity figure is independent of
+  this — the consumer's list comes from `[0x8005F390]`, a 3044-byte block
+- layout `+0` count (halfword), `+2` zeroed at alloc, `+4..` polygon ids
+  => **1520 ids capacity**
+- consumer `func_80041E5C` (repurposes `$sp` as the list end pointer), called
+  from **two** sites: `0x80011CB0` and `0x8001845C`
+- `zone = [[0x800608CC]+16]`, `nw = [zone]` (1..8), 48-byte world descriptors
+  from `zone+4`; ids encode `(world<<13)|index` with `0x1800` marking a quad
+- the render driver `func_80011800` packs those descriptors to scratchpad
+  `0x1F800280`, reading `zone+8,12,16,20,24,28,32` — which matches the probe's
+  world-entry model for `wi=0` exactly, so the probe reads the data correctly
+
+Two probe defects found while mapping this: it guards on
+`gpr[31] == 0x80011CB8` so it misses the second call site entirely, and
+`room = count-1-nk` means it can never grow the list — it only refills slots
+vacated by now-invisible polygons. Its own buffer is 4096 entries, so the
+game's 1520 is not the binding constraint; the cap is self-imposed and the true
+ceiling is GPU packet/OT budget, which has not been measured.
+
+Where the list is FILLED is still unlocated: the buffer is heap-allocated and
+written register-indirect, so address grepping cannot find it, and it may live
+in overlay code rather than the main executable.

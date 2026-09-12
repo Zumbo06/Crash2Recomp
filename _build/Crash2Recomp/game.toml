@@ -32,6 +32,6 @@ p1_device = "auto"
 [widescreen]
 offer = true
 offer_ultrawide = false
-native_wide = false
+native_wide = true
 gte_game_mode = true
 precise_nclip = true
