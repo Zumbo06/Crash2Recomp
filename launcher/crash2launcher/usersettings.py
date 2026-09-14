@@ -66,7 +66,10 @@ def render(settings: Settings) -> str:
         # on a single-monitor desktop is indistinguishable from fullscreen - so
         # picking Windowed + Auto looked like the mode was ignored. Resolve Auto
         # to a real window that leaves the desktop visible.
-        width, height = _auto_windowed_size(settings.aspect)
+        # Shape the window like the CANVAS, not like the rendered content: under
+        # Pan & Scan the game renders 4:3 into a 16:9 window, and using `aspect`
+        # here would hand back a 4:3 box with nothing for the zoom to crop.
+        width, height = _auto_windowed_size(settings.canvas_aspect())
 
     if width and height:
         lines.append(f"window_width      = {width}")

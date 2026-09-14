@@ -1,0 +1,374 @@
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -2608,6 +2608,44 @@
+                    ? mode : GL_SCALE_LETTERBOX;
+ }
+ 
++/* Pan-and-scan dial, 0..100. 0 = the largest rect that FITS the canvas
++ * (letterbox: bars on the short axis); 100 = the smallest rect that COVERS it
++ * (fill: overflow cropped). Aspect is exact at both ends and everywhere
++ * between, so this can never stretch - it only trades bars for crop. That is
++ * what makes "fake widescreen" possible: render the true 4:3 frustum, then
++ * zoom until it fills a 16:9 canvas, cropping top and bottom instead of
++ * widening the field of view (which is what exposes the unauthored edges).
++ *
++ * -1 means "whatever the scaling mode implies", which reproduces the historical
++ * letterbox and fill rects exactly - so leaving it unset changes nothing. */
++static int s_present_zoom = -1;
++/* Slides the zoomed window up (negative) or down (positive), in SOURCE
++ * scanlines out of 240, so a HUD hugging one edge can be kept on screen.
++ * Resolution-independent for the same reason the overscan crop is. */
++static int s_present_pan_240 = 0;
++/* Partial stretch, 0..100. 0 keeps the shape exact; 100 fills the canvas
++ * exactly (what the all-or-nothing "stretch" mode always did). In between, the
++ * leftover mismatch is split between distortion and bars/crop - a few percent
++ * of stretch is invisible in motion and buys back the crop that zooming alone
++ * would cost, which is the usual compromise for showing 4:3 on a 16:9 panel. */
++static int s_present_stretch = 0;
++
++void gl_renderer_set_present_zoom(int pct) {
++    s_present_zoom = (pct < 0) ? -1 : (pct > 100 ? 100 : pct);
++}
++int gl_renderer_get_present_zoom(void) { return s_present_zoom; }
++
++void gl_renderer_set_present_pan(int lines_240) {
++    s_present_pan_240 = lines_240 < -120 ? -120
++                      : (lines_240 > 120 ? 120 : lines_240);
++}
++int gl_renderer_get_present_pan(void) { return s_present_pan_240; }
++
++void gl_renderer_set_present_stretch(int pct) {
++    s_present_stretch = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
++}
++int gl_renderer_get_present_stretch(void) { return s_present_stretch; }
++
+ /* Overscan crop, in PS1 scanlines out of the standard 240.
+  *
+  * Many PS1 titles draw fewer than the full 240 lines and leave the remainder
+@@ -2651,6 +2689,27 @@
+     if (cl + cr < *w) { *x += cl; *w -= cl + cr; }
+ }
+ 
++/* Fold the overscan trim into the content aspect.
++ *
++ * apply_overscan_crop shrinks the SOURCE rect, but the destination rect is
++ * sized from the aspect alone and never sees that. Without this, the surviving
++ * band gets magnified to fill a rect built for the UNCROPPED frame - i.e.
++ * scaled vertically but not horizontally. That is a real stretch, and with the
++ * shipped 16/16 overscan it was ~1.15x tall. The kept band is a sub-rectangle
++ * of the picture and is genuinely wider than the whole frame, so describe it
++ * that way and let the normal letterbox/zoom math size it correctly.
++ *
++ * NOT the same as a game selecting a short display mode: there the short band
++ * IS the entire picture and must fill the rect, which is why gl_renderer_present
++ * handles that case on its own and why this keys on what WE removed. */
++static void overscan_aspect_mul(int *num, int *den) {
++    const int kw = 240 - s_crop_left_240 - s_crop_right_240;
++    const int kh = 240 - s_crop_top_240  - s_crop_bot_240;
++    if (kw <= 0 || kh <= 0 || (kw == 240 && kh == 240)) return;
++    *num *= kw;
++    *den *= kh;
++}
++
+ void gl_renderer_set_display_aspect(int num, int den) {
+     if (num <= 0 || den <= 0) { num = 4; den = 3; }
+     s_aspect_num = num; s_aspect_den = den;
+@@ -2675,24 +2734,93 @@
+         *w = dw; *h = dh;
+         return;
+     }
+-    if (s_scale_mode == GL_SCALE_FILL) {
+-        /* Cover the canvas with aspect preserved, cropping the overflow: pick
+-         * the axis that leaves NO gap, i.e. the opposite choice to letterbox.
+-         * The rect is allowed to exceed the window; the centring offsets go
+-         * negative and the excess is clipped by the viewport. */
+-        if (dh < wh) { dh = wh; dw = (wh * num) / den; }
+-    } else if (dh > wh) {
+-        /* Letterbox: shrink until it fits entirely. */
+-        dh = wh; dw = (wh * num) / den;
++    /* The two endpoints of the zoom dial, each aspect-exact:
++     *   fit   - largest rect that fits entirely (what letterbox has always used)
++     *   cover - smallest rect that covers the canvas, overflow clipped by the
++     *           viewport (what fill has always used; the centring offsets go
++     *           negative, which is how the crop is realised). */
++    int fw = ww, fh = (ww * den) / num;
++    if (fh > wh) { fh = wh; fw = (wh * num) / den; }
++    int cw = ww, ch = (ww * den) / num;
++    if (ch < wh) { ch = wh; cw = (wh * num) / den; }
++
++    int t = s_present_zoom;
++    if (t < 0) t = (s_scale_mode == GL_SCALE_FILL) ? 100 : 0;
++    if (t <= 0) {
++        dw = fw; dh = fh;            /* identical to the historical letterbox */
++    } else if (t >= 100) {
++        dw = cw; dh = ch;            /* identical to the historical fill */
++    } else {
++        /* Interpolate the rect itself, not the aspect, so no intermediate
++         * value can distort: both axes move by the same fraction. */
++        dw = fw + (int)(((int64_t)(cw - fw) * t + 50) / 100);
++        dh = fh + (int)(((int64_t)(ch - fh) * t + 50) / 100);
++    }
++    /* Partial stretch, applied AFTER the zoom: pull whatever mismatch the zoom
++     * left toward filling the canvas exactly. At 100 both axes land on the
++     * drawable, which is the old all-or-nothing stretch; at 0 nothing moves and
++     * the shape stays exact. */
++    if (s_present_stretch > 0) {
++        dw += (int)(((int64_t)(ww - dw) * s_present_stretch + 50) / 100);
++        dh += (int)(((int64_t)(wh - dh) * s_present_stretch + 50) / 100);
+     }
+     *x = (ww - dw) / 2;
+     *y = (wh - dh) / 2;
++    if (s_present_pan_240) {
++        /* Only meaningful while something is off-screen (or there are bars to
++         * slide within), so clamp to the actual overflow rather than letting a
++         * large pan walk the picture off the canvas. */
++        int pan = (int)(((int64_t)s_present_pan_240 * dh) / 240);
++        const int lim = (dh > wh ? dh - wh : wh - dh) / 2;
++        if (pan >  lim) pan =  lim;
++        if (pan < -lim) pan = -lim;
++        *y += pan;
++    }
+     *w = dw; *h = dh;
+ }
+ static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
+     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
+ }
+ 
++/* Destination rect for a source that HAS been through apply_overscan_crop.
++ * Every present path that crops must use this; gl_renderer_present (24-bit FMV
++ * and the forced-CPU path) must NOT, because it never crops and would then be
++ * sized for a trim it did not apply. */
++static void present_rect_cropped(int ww, int wh, int force_4_3,
++                                 int *x, int *y, int *w, int *h) {
++    int num = force_4_3 ? 4 : s_aspect_num;
++    int den = force_4_3 ? 3 : s_aspect_den;
++    overscan_aspect_mul(&num, &den);
++    letterbox_rect_aspect(ww, wh, num, den, x, y, w, h);
++}
++
++/* Report the destination rect the current zoom/pan/overscan settings produce,
++ * for the live drawable. The rect is the whole story of a pan-and-scan present:
++ * h > drawable height means the picture is being cropped top and bottom, and by
++ * exactly how much. Diagnostic only - nothing in the present path reads this. */
++void gl_renderer_debug_present_rect(int force_4_3, int *x, int *y, int *w, int *h,
++                                    int *out_ww, int *out_wh,
++                                    int *out_num, int *out_den) {
++    int ww = 0, wh = 0;
++    if (s_win) SDL_GL_GetDrawableSize(s_win, &ww, &wh);
++    if (out_ww) *out_ww = ww;
++    if (out_wh) *out_wh = wh;
++    /* The aspect this rect was built from, so a caller can tell how far the
++     * rect has been pushed off-shape by the stretch dial. */
++    int num = force_4_3 ? 4 : s_aspect_num;
++    int den = force_4_3 ? 3 : s_aspect_den;
++    overscan_aspect_mul(&num, &den);
++    if (out_num) *out_num = num;
++    if (out_den) *out_den = den;
++    int lx = 0, ly = 0, lw = 0, lh = 0;
++    if (ww > 0 && wh > 0)
++        present_rect_cropped(ww, wh, force_4_3, &lx, &ly, &lw, &lh);
++    if (x) *x = lx;
++    if (y) *y = ly;
++    if (w) *w = lw;
++    if (h) *h = lh;
++}
++
+ static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
+     GLuint t = 0;
+     glGenTextures(1, &t);
+@@ -3968,10 +4096,10 @@
+         return 0;
+     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+     int lx, ly, lw, lh;
+-    if (s_interp_force_4_3)
+-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+-    else
+-        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
++    /* The blended pair was captured from the already-cropped VRAM rect, so this
++     * path is overscan-aware too. It also owns the frame interval whenever
++     * interpolation is on, which makes it the path zoom/pan must not miss. */
++    present_rect_cropped(ww, wh, s_interp_force_4_3, &lx, &ly, &lw, &lh);
+     glDisable(GL_SCISSOR_TEST);
+     glViewport(0, 0, ww, wh);
+     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+@@ -4271,10 +4399,7 @@
+         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
+                             0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0);
+     } else {
+-        if (s_hold_force_4_3)
+-            letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+-        else
+-            letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
++        present_rect_cropped(ww, wh, s_hold_force_4_3, &lx, &ly, &lw, &lh);
+         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
+                             0, 0, s_hold_tw, s_hold_th, s_hold_linear,
+                             lx, ly, lw, lh, 1);
+@@ -4318,13 +4443,11 @@
+     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
+     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+     int lx, ly, lw, lh;
+-    if (force_4_3)
+-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+-    else
+-        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+-    /* No short-band adjustment on the 15-bit FBO path: a game's native short
+-     * display mode (e.g. 216/224-line menus) must fill the rect as before.
+-     * The FMV band fix lives in the depth24/CPU present paths only. */
++    present_rect_cropped(ww, wh, force_4_3, &lx, &ly, &lw, &lh);
++    /* Still no short-band adjustment here: a game's native short display mode
++     * (e.g. 216/224-line menus) must fill the rect as before, and the FMV band
++     * fix stays in the depth24/CPU paths. What present_rect_cropped adds is
++     * different - it corrects only for the lines OUR overscan trim removed. */
+ 
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+     glDisable(GL_SCISSOR_TEST);
+@@ -4434,7 +4557,7 @@
+     gl_perf_present_enter();
+     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+     int lx, ly, lw, lh;
+-    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
++    present_rect_cropped(ww, wh, 0, &lx, &ly, &lw, &lh);
+     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
+ 
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -129,6 +129,30 @@
+  * cannot be scaled away. */
+ void gl_renderer_set_overscan_crop(int top, int bottom, int left, int right);
+ 
++/* Pan-and-scan dial, 0..100: 0 = letterbox (fits, bars on the short axis),
++ * 100 = fill (covers, overflow cropped). Aspect is exact at every value, so
++ * this trades bars for crop and never stretches. -1 restores "follow the
++ * scaling mode", which is the historical behaviour. Pan slides the zoomed
++ * window vertically, in source scanlines out of 240: POSITIVE reveals more of
++ * the top of the picture (use it to rescue a top-edge HUD), negative more of
++ * the bottom. Clamped to whatever is actually off-screen. */
++void gl_renderer_set_present_zoom(int pct);
++int  gl_renderer_get_present_zoom(void);
++void gl_renderer_set_present_pan(int lines_240);
++int  gl_renderer_get_present_pan(void);
++/* Diagnostic: the destination rect the current zoom/pan/overscan produce for
++ * the live drawable. h greater than the drawable height means the picture is
++ * cropped top and bottom by (h - wh)/2 each. */
++void gl_renderer_debug_present_rect(int force_4_3, int *x, int *y, int *w, int *h,
++                                    int *out_ww, int *out_wh,
++                                    int *out_num, int *out_den);
++
++/* Partial stretch, 0..100: 0 keeps the shape exact, 100 fills the canvas
++ * exactly (the old all-or-nothing stretch mode). Applied after the zoom, so a
++ * few percent buys back crop without a visible distortion. */
++void gl_renderer_set_present_stretch(int pct);
++int  gl_renderer_get_present_stretch(void);
++
+ /* Present-time reconstruction filter: 0 plain tap, 1 sharp-bilinear,
+  * 2 Catmull-Rom bicubic. Matters most when a high internal resolution is
+  * downsampled to the window - a single tap undersamples and shimmers. */
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -13240,6 +13240,37 @@
+         static const char *kNames[] = { "plain", "sharp-bilinear", "bicubic" };
+         std::fprintf(stdout, "psxrecomp: present filter = %s\n", kNames[mode]);
+     }
++    /* Pan-and-scan zoom, 0..100. This is how "fake widescreen" is configured:
++     * leave the aspect at 4:3 so the game renders its authored frustum (no GTE
++     * squash, no widened FOV, so no unauthored edges to pop), then zoom until
++     * the picture fills a 16:9 canvas. Both axes scale together, so it crops
++     * top and bottom rather than distorting. 100 == the old "fill". */
++    if (const char *e = std::getenv("PSX_PRESENT_ZOOM")) {
++        const int pct = std::atoi(e);
++        gl_renderer_set_present_zoom(pct);
++        std::fprintf(stdout, "psxrecomp: present zoom = %d%% (0 letterbox, "
++                             "100 fill)\n", pct < 0 ? 0 : (pct > 100 ? 100 : pct));
++    }
++    /* Vertical pan for the zoomed window, in source scanlines out of 240.
++     * POSITIVE shifts the image down in the window, which brings more of the
++     * TOP of the picture into view - that is the direction that rescues a HUD
++     * hugging the top edge. Negative does the reverse. Clamped to the part that
++     * is actually off-screen. */
++    if (const char *e = std::getenv("PSX_PRESENT_PAN")) {
++        const int lines = std::atoi(e);
++        gl_renderer_set_present_pan(lines);
++        std::fprintf(stdout, "psxrecomp: present pan = %d/240 lines\n", lines);
++    }
++    /* Partial stretch, 0..100. Zoom trades bars for crop without distorting;
++     * this trades a little distortion for the rest. A few percent is invisible
++     * in motion and is the classic way to fill a 16:9 panel from 4:3 without
++     * throwing away scanlines. 100 reproduces the old "stretch" fit mode. */
++    if (const char *e = std::getenv("PSX_PRESENT_STRETCH")) {
++        const int pct = std::atoi(e);
++        gl_renderer_set_present_stretch(pct);
++        std::fprintf(stdout, "psxrecomp: present stretch = %d%%\n",
++                     pct < 0 ? 0 : (pct > 100 ? 100 : pct));
++    }
+     /* Overscan crop, in PS1 scanlines out of 240: "top,bottom[,left,right]".
+      * Games that draw fewer than 240 lines leave real black pixels in the
+      * frame; those bars are content and survive every scaling mode, so the
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7832,6 +7832,57 @@
+              id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
+ }
+ 
++/* Pan & Scan dial, live so the crop can be tuned by eye in one session instead
++ * of one game boot per value:
++ *   present_fit                    -> current zoom/pan
++ *   present_fit {"zoom":0..100}    -> 0 letterbox, 100 fills the screen;
++ *                                     -1 restores "follow the image-fit mode"
++ *   present_fit {"pan":N}          -> vertical pan in source scanlines of 240;
++ *                                     POSITIVE reveals more of the top
++ *   present_fit {"stretch":0..100} -> 0 keeps the shape exact, 100 fills the
++ *                                     canvas exactly; in between splits the
++ *                                     mismatch between distortion and bars
++ * Zoom alone never distorts; only the stretch dial does, and distort_pct in the
++ * reply says by how much. */
++static void handle_present_fit(int id, const char *json)
++{
++    int zoom    = json_get_int(json, "zoom", -1000);
++    int pan     = json_get_int(json, "pan", -1000);
++    int stretch = json_get_int(json, "stretch", -1000);
++    int crop    = json_get_int(json, "crop", -1000);
++    if (zoom    != -1000) gl_renderer_set_present_zoom(zoom);
++    if (pan     != -1000) gl_renderer_set_present_pan(pan);
++    if (stretch != -1000) gl_renderer_set_present_stretch(stretch);
++    /* Symmetric top/bottom overscan trim, live. Crash 2 leaves 12 undrawn
++     * scanlines at each end of its 240-line field, and those are black IMAGE,
++     * not letterboxing - only trimming the source removes them. Doing so also
++     * makes the drawn content wider relative to its height, so it needs less
++     * stretch to fill a 16:9 panel. */
++    if (crop != -1000) gl_renderer_set_overscan_crop(crop, crop, 0, 0);
++    /* Report the GAMEPLAY rect (force_4_3 = 0): that is the one the game is
++     * presented through once widescreen engages. A 4:3-presented frame (FMV,
++     * menus) uses the other branch and is never the interesting case here. */
++    int lx = 0, ly = 0, lw = 0, lh = 0, ww = 0, wh = 0, num = 4, den = 3;
++    gl_renderer_debug_present_rect(0, &lx, &ly, &lw, &lh, &ww, &wh, &num, &den);
++    /* crop_lines = scanlines of the 240-line source lost off EACH of top and
++     * bottom; negative means bars instead. distort_pct = how far the rect has
++     * been pushed off its true shape by the stretch dial, in percent (0 is
++     * geometrically exact; positive is horizontally wide). Both make the cost
++     * of a setting readable without eyeballing the window. */
++    const int crop_px = (lh - wh) / 2;
++    const int crop_v  = lh > 0 ? (crop_px * 240) / lh : 0;
++    int distort = 0;
++    if (lh > 0 && den > 0 && num > 0)
++        distort = (int)(((int64_t)lw * den * 100) / ((int64_t)lh * num)) - 100;
++    send_fmt("{\"id\":%d,\"ok\":true,\"zoom\":%d,\"pan\":%d,\"stretch\":%d,"
++             "\"drawable\":[%d,%d],\"rect\":[%d,%d,%d,%d],\"aspect\":[%d,%d],"
++             "\"crop_px_per_edge\":%d,\"crop_lines_per_edge\":%d,"
++             "\"distort_pct\":%d}",
++             id, gl_renderer_get_present_zoom(), gl_renderer_get_present_pan(),
++             gl_renderer_get_present_stretch(),
++             ww, wh, lx, ly, lw, lh, num, den, crop_px, crop_v, distort);
++}
++
+ /* Crash 2's eight-corner render cull recovery (crash2_wide_bbox.h). Live, so a
+  * single launch can A/B all three states:
+  *   c2_bbox                 -> counters
+@@ -13474,6 +13525,7 @@
+     { "gl_coh_ring",       handle_gl_coh_ring },
+     { "gl_present_ring",   handle_gl_present_ring },
+     { "present_ring",      handle_present_ring },
++    { "present_fit",       handle_present_fit },
+     { "frame_perf",        handle_frame_perf },
+     { "gl_ws_ablate",      handle_gl_ws_ablate },
+     { "gl_interp",         handle_gl_interp },

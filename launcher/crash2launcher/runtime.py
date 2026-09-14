@@ -180,6 +180,15 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # How the internal buffer is resampled down to the window.
     env["PSX_PRESENT_FILTER"] = settings.present_filter
 
+    # Pan & Scan. Only emitted when actually dialled, so an untouched setting
+    # leaves the historical letterbox/fill rects byte-identical.
+    if settings.present_zoom >= 0:
+        env["PSX_PRESENT_ZOOM"] = str(settings.present_zoom)
+    if settings.present_pan:
+        env["PSX_PRESENT_PAN"] = str(settings.present_pan)
+    if settings.present_stretch:
+        env["PSX_PRESENT_STRETCH"] = str(settings.present_stretch)
+
     # Slot for the quick save/load keys (F5 / F9 by default).
     env["PSX_QUICK_SLOT"] = str(settings.quick_save_slot)
 
@@ -352,10 +361,14 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
             #           earlier note claiming otherwise was native-wide failing
             #           to ACTIVATE, which gte_game_mode below now addresses.
             #   False - GTE X-squash + stretched present, the DuckStation/Beetle
-            #           widescreen hack. Works on any title, verified widening
-            #           Crash 2 edge to edge, at the cost of stretching the HUD.
-            # Both modes still leave the game culling at its 4:3 bounds; that is
-            # the open work, not a property of the mode.
+            #           widescreen hack. Works on any title, at the cost of
+            #           stretching the HUD.
+            # Both modes widen the field of view past the edge Crash 2's levels
+            # were authored to, so scenery appears and vanishes at the frame
+            # border. That is a level-data limit, not something either mode can
+            # fix - see tuning/NOTES.md "Widescreen, part 6". The default
+            # presets avoid it by presenting a 14:9 render into a 16:9 canvas
+            # instead (part 7), which is why native_wide stays off here.
             "widescreen": {
                 "offer": True,
                 "offer_ultrawide": False,

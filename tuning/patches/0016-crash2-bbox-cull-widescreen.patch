@@ -1,0 +1,283 @@
+--- a/runtime/src/gte.cpp
++++ b/runtime/src/gte.cpp
+@@ -1750,12 +1750,25 @@
+     }
+ }
+ 
+-/* Crash 2's eight-corner visibility test uses "any corner inside". A box
+- * spanning the viewport can fail that test. Retest conservatively using the
+- * same squashed projection and packed-coordinate construction as 80041D14.
+- * Replay is pure: no guest cycles, CPU/GTE writes, PGXP vertices or gameplay
+- * activity stamps. This is only called for a rejected box in hack mode. */
+-extern "C" int gte_crash2_bbox_overlaps(CPUState* cpu) {
++/* Crash 2's eight-corner visibility test (0x80041D14) accepts a box iff ANY
++ * corner lands inside the screen rect, so a box that SPANS the viewport with
++ * every corner outside is wrongly rejected. Retest conservatively with a
++ * separating-axis test over the same eight corners, using the same packed
++ * coordinate construction and the same projection the guest just used.
++ *
++ * [xlo,xhi) is the visible X window, supplied by the caller: the guest's own
++ * [0,512) in squash mode — where gte_rtps below squashes X exactly as it did
++ * for the guest, so the guest's window is already the widened one — and that
++ * window grown by the per-side reveal in native-wide mode, where the frame
++ * really does get wider. Y is never widened: neither mode grows the frame
++ * vertically, so the guest's [0,216) stands in both.
++ *
++ * Replay is pure: no guest cycles, CPU/GTE register writes, PGXP vertices,
++ * trace entries or gameplay activity stamps. Only called for a box the guest
++ * has already rejected. NOTE: gte_replay_side_effects_begin() deliberately
++ * PRESERVES s_gte_caller_ra, so ws_dome_call_matches() inside gte_rtps makes
++ * the same dome decision the guest's own RTPT just made. Do not "fix" that. */
++extern "C" int gte_crash2_bbox_overlaps(CPUState* cpu, int xlo, int xhi) {
+     using namespace PSXRecomp::GTE;
+     if (!gte_replay_side_effects_begin()) return 0;
+     GTEState gte;
+@@ -1763,27 +1776,38 @@
+     const uint32_t xy = cpu->read_word(0x1F800118u);
+     const uint32_t z = cpu->read_word(0x1F80011Cu);
+     const uint32_t right = (xy + 1020u) & cpu->gpr[10];
++    /* The eight cube corners in the guest's own order: four XY columns at Z,
++     * then the same four at Z+1020. points[3] == points[4] is correct — it is
++     * one XY column visited at both Z values, matching the guest's third RTPT
++     * re-transforming corner 4 as a throwaway V0. */
+     const uint32_t points[8] = {xy, right, right + 0x03FC0000u,
+         xy + 0x03FC0000u, xy + 0x03FC0000u, xy,
+         right, right + 0x03FC0000u};
++    /* Opposite-corner order: a box straddling the window clears `common`
++     * after two projections instead of eight. `common` is an AND and the
++     * result cannot change once it reaches 0 with a positive Z, so both the
++     * ordering and the early break are semantically free. */
++    static const unsigned order[8] = {0u, 7u, 1u, 6u, 2u, 5u, 3u, 4u};
+     unsigned common = 15;
+-    bool near = false, positive = false;
+-    for (unsigned i = 0; i < 8; ++i) {
++    bool near_plane = false, positive = false;
++    for (unsigned k = 0; k < 8; ++k) {
++        const unsigned i = order[k];
+         gte.V0[0] = gte_unpack_s16(points[i]);
+         gte.V0[1] = gte_unpack_s16(points[i] >> 16);
+         gte.V0[2] = gte_unpack_s16(z + (i >= 4 ? 1020u : 0u));
+         gte_rtps(&gte, 0x4A280001u);
+         const int x = gte_unpack_s16(gte.SXY[2]);
+         const int y = gte_unpack_s16(gte.SXY[2] >> 16);
+-        common &= (x < 0 ? 1u : 0u) | (x >= 512 ? 2u : 0u) |
+-                  (y < 0 ? 4u : 0u) | (y >= 216 ? 8u : 0u);
+-        near |= (gte.FLAG & FLAG_DIV_OVF) != 0;
++        common &= (x < xlo ? 1u : 0u) | (x >= xhi ? 2u : 0u) |
++                  (y < 0   ? 4u : 0u) | (y >= 216 ? 8u : 0u);
++        near_plane |= (gte.FLAG & FLAG_DIV_OVF) != 0;
+         positive |= gte.SZ[3] > 0;
++        if (positive && common == 0u) break;
+     }
+     gte_replay_side_effects_end();
+     /* Crossing the near plane makes a projected AABB unreliable: keep such
+      * boxes conservatively, but never revive a box entirely behind the eye. */
+-    return positive && (common == 0 || near);
++    return positive && (common == 0 || near_plane);
+ }
+ 
+ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
+--- a/runtime/src/crash2_wide_bbox.h
++++ b/runtime/src/crash2_wide_bbox.h
+@@ -1,22 +1,93 @@
+ /* SCUS-94154 only: conservative rendering visibility, never object activation.
+- * Called at the LAST corner test, after the original test rejected seven
+- * corners. No host accumulator: mid-function save states cannot retain stale
+- * corners from a different object. The replay uses a private GTE copy. */
+-extern int gte_crash2_bbox_overlaps(CPUState *cpu);
++ *
++ * func_80041D14 projects a 1020-unit AABB and calls func_80041E20 once per
++ * corner. That helper returns ALL THE WAY OUT of 80041D14 with t8=0 the moment
++ * a corner lands inside [0,512)x[0,216); only the eighth call site links to
++ * 0x80041E10, which sets t8=-1. So the box is visible iff ANY corner is
++ * inside, and rejected iff ALL EIGHT are outside. Two defects follow:
++ *
++ *   A. A box that SPANS the viewport has every corner outside and is culled.
++ *      Present in the original game, independent of aspect.
++ *   B. In native-wide the frame grows by ws_nw_extra()/2 px per side via the
++ *      GPU draw offset, but the guest still tests [0,512) — so everything in
++ *      the revealed margins is culled and snaps in at the old 4:3 edge.
++ *
++ * We hook the LAST corner test, i.e. exactly the moment the box is about to be
++ * rejected, and re-test it conservatively against the window that is actually
++ * visible. On overlap we rewrite only the helper's packed corner argument so it
++ * takes its own normal visible return. No host accumulator: mid-function save
++ * states cannot retain stale corners from a different object. The replay uses a
++ * private GTE copy and writes nothing back. Collision, object updates, guest
++ * memory, draw-list capacity and render-buffer limits are all untouched.
++ *
++ * The game itself has an always-visible path — 0x8001AFF8 installs 0x80041E50
++ * ("li $t8,0; jr $ra") instead of the cull when flag bit 0x00040000 is set —
++ * which is what PSX_CRASH2_WIDE_BBOX=2 imitates as a measurement upper bound. */
++extern int gte_crash2_bbox_overlaps(CPUState *cpu, int xlo, int xhi);
++
++/* 0 = off (vanilla cull), 1 = conservative re-test, 2 = force visible. */
++static int c2bb_mode = -1;                  /* -1 = not yet read from env */
++static int c2bb_budget = 64;                /* max revives per frame */
++static unsigned long long c2bb_hits, c2bb_guest_keep, c2bb_fast,
++                          c2bb_replays, c2bb_recovered, c2bb_budget_drops;
++static unsigned long long c2bb_frame = ~0ull;
++static int c2bb_this_frame;
++
++void crash2_bbox_control(int mode, int budget, int reset) {
++    if (mode >= 0 && mode <= 2) c2bb_mode = mode;
++    if (budget >= 0) c2bb_budget = budget;
++    if (reset) {
++        c2bb_hits = c2bb_guest_keep = c2bb_fast = 0;
++        c2bb_replays = c2bb_recovered = c2bb_budget_drops = 0;
++    }
++}
++
++void crash2_bbox_stats(unsigned long long out[6], int *mode, int *budget) {
++    out[0] = c2bb_hits;     out[1] = c2bb_guest_keep; out[2] = c2bb_fast;
++    out[3] = c2bb_replays;  out[4] = c2bb_recovered;  out[5] = c2bb_budget_drops;
++    if (mode)   *mode = c2bb_mode < 0 ? 1 : c2bb_mode;
++    if (budget) *budget = c2bb_budget;
++}
++
++/* Zero-projection fast accept. At the eighth corner the guest's GTE FIFO still
++ * holds the third RTPT's three vertices — cube corners 4, 7 and 8 — in SXY0/1/2
++ * and SZ1/2/3. `common` is an AND over corners, so if those three already fail
++ * to share an outside edge then the full eight-corner AND is 0 too. Catches the
++ * straddle case (defect A) for free, without touching the GTE. */
++static int c2bb_fifo_straddles(CPUState *cpu, int xlo, int xhi) {
++    unsigned common = 15;
++    int positive = 0;
++    for (int i = 0; i < 3; ++i) {
++        const int x = (int16_t)cpu->gte_data[12 + i];
++        const int y = (int16_t)(cpu->gte_data[12 + i] >> 16);
++        common &= (unsigned)((x < xlo ? 1 : 0) | (x >= xhi ? 2 : 0) |
++                             (y < 0   ? 4 : 0) | (y >= 216 ? 8 : 0));
++        if ((uint16_t)cpu->gte_data[17 + i] > 0) positive = 1;
++    }
++    return positive && common == 0u;
++}
+ 
+ static void crash2_wide_bbox(CPUState *cpu, uint32_t pc) {
+     if (pc != 0x80041E20u || cpu->gpr[31] != 0x80041E10u ||
+         cpu->gpr[3] != 0x1F800000u) return;
+-    GpuWsDebug ws;
+-    gpu_ws_get_debug(&ws);
+-    if (!ws.active || ws.mode != 1) return;
+-    static int enabled = -1;
+-    if (enabled < 0) {
++    if (c2bb_mode < 0) {
+         const char *e = getenv("PSX_CRASH2_WIDE_BBOX");
+-        enabled = !(e && *e == '0'); /* explicit A/B override */
++        c2bb_mode = (e && *e == '0') ? 0 : (e && *e == '2') ? 2 : 1;
+     }
+-    if (!enabled) return;
+-    /* Fail closed on another executable/revision or modified cull routine. */
++    GpuWsDebug ws;
++    gpu_ws_get_debug(&ws);
++    /* Engaged in EITHER wide mode. ws.active is squash-only: gpu_ws_configure
++     * forces xnum==xden under native-wide, so ws_configured() — and with it
++     * ws_active() — is FALSE in mode 2. Gating on ws.active alone would leave
++     * this dead in the one mode that has defect B. 4:3 (mode 0) and frames
++     * presented 4:3 (FMV / full-2D) return here, staying byte-identical. */
++    const int off = ws.nw_extra / 2;   /* per-side reveal: 0 mode 1, 85 mode 2 */
++    if (ws.present_native_43) return;
++    if (!((ws.mode == 1 && ws.active) || (ws.mode == 2 && off > 0))) return;
++    /* Fail closed on another executable/revision or modified cull routine.
++     * Pins the scratchpad base, both wrap-mask sites, the RTPT, the eighth
++     * jal, the helper entry, and the -216/-512 window immediates that the
++     * pre-check below and the replay's Y bound both depend on. */
+     if (cpu->read_word(0x80041D14u) != 0xAC7F0064u ||
+         cpu->read_word(0x80041D28u) != 0x20F803FCu ||
+         cpu->read_word(0x80041D2Cu) != 0x030AC024u ||
+@@ -26,15 +97,39 @@
+         cpu->read_word(0x80041E38u) != 0x2084FF28u ||
+         cpu->read_word(0x80041E40u) != 0x20C6FE00u ||
+         cpu->read_word(0x80041E50u) != 0x24180000u) return;
+-    int x = (int16_t)cpu->gpr[4], y = (int16_t)(cpu->gpr[4] >> 16);
+-    if (x >= 0 && x < 512 && y >= 0 && y < 216) return;
+-    if (!gte_crash2_bbox_overlaps(cpu)) return;
+-    /* Let the original helper take its normal visible return. Only its
+-     * temporary corner argument changes; no vertex, matrix, packet, GTE FIFO,
+-     * guest code, capacity limit, or simulation register is patched. */
++    /* Count every candidate BEFORE the mode gate, so the on:0 baseline still
++     * reports whether the hook fires at all - that is the whole point of the
++     * vanilla A/B leg. on:0 then returns having counted but patched nothing. */
++    c2bb_hits++;
++    if (c2bb_mode == 0) return;
++    if (ws.cur_frame != c2bb_frame) { c2bb_frame = ws.cur_frame; c2bb_this_frame = 0; }
++    if (c2bb_mode != 2) {
++        int x = (int16_t)cpu->gpr[4], y = (int16_t)(cpu->gpr[4] >> 16);
++        /* Mirrors the GUEST's accept test exactly — the -512/-216 immediates
++         * pinned above. It means "the guest is about to keep this box anyway,
++         * so do nothing". Do NOT widen it: in native-wide the whole point is
++         * that a corner at X in [-off,0) IS visible while the guest rejects
++         * it, so widening here would skip the very boxes defect B is about. */
++        if (x >= 0 && x < 512 && y >= 0 && y < 216) { c2bb_guest_keep++; return; }
++        if (c2bb_fifo_straddles(cpu, -off, 512 + off)) {
++            c2bb_fast++;
++        } else {
++            c2bb_replays++;
++            if (!gte_crash2_bbox_overlaps(cpu, -off, 512 + off)) return;
++        }
++    }
++    /* Bound the blast radius. Whether this cull feeds the 1520-id draw list at
++     * [0x8005F390] is unproven, and its consumer func_80041E5C sits directly
++     * after this routine in memory — so cap revives per frame and report it
++     * rather than risk overrunning a guest buffer. */
++    if (c2bb_this_frame >= c2bb_budget) { c2bb_budget_drops++; return; }
++    c2bb_this_frame++;
++    c2bb_recovered++;
++    /* Centre of 512x216, packed (Y<<16)|X. Only the helper's temporary corner
++     * argument changes; $a0 is caller-saved and 80041D14 clobbers it via mfc2
++     * at every corner, so no caller can observe this. No vertex, matrix,
++     * packet, GTE FIFO, guest code, capacity limit or simulation register is
++     * touched. (PGXP's shadow for $a0/$a2 goes stale here, which is harmless:
++     * they are scalar compare temporaries that never reach a GPU packet.) */
+     cpu->gpr[4] = (108u << 16) | 256u;
+-    static unsigned recovered;
+-    if (recovered++ < 5)
+-        fprintf(stdout, "psxrecomp: Crash2 widescreen bbox overlap recovered (%u)\n",
+-                recovered);
+ }
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7832,6 +7832,35 @@
+              id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
+ }
+ 
++/* Crash 2's eight-corner render cull recovery (crash2_wide_bbox.h). Live, so a
++ * single launch can A/B all three states:
++ *   c2_bbox                 -> counters
++ *   c2_bbox {"on":0|1|2}    -> 0 vanilla cull, 1 conservative re-test,
++ *                              2 force visible (the upper bound the game's own
++ *                              0x80041E50 stub would give)
++ *   c2_bbox {"budget":N}    -> per-frame revive cap, N>=0 (0 = never revive but
++ *                              keep counting; default 64; use a large N for
++ *                              effectively unlimited)
++ *   c2_bbox {"reset":1}     -> zero the counters
++ * hits = boxes the guest was about to reject; guest_keep = it would have kept
++ * them anyway; fast = accepted from the GTE FIFO with no projection; replays =
++ * full eight-corner re-tests; recovered = boxes actually revived. */
++extern void crash2_bbox_control(int mode, int budget, int reset);
++extern void crash2_bbox_stats(unsigned long long out[6], int *mode, int *budget);
++static void handle_c2_bbox(int id, const char *json)
++{
++    crash2_bbox_control(json_get_int(json, "on", -1),
++                        json_get_int(json, "budget", -1),
++                        json_get_int(json, "reset", 0));
++    unsigned long long s[6];
++    int mode = 0, budget = 0;
++    crash2_bbox_stats(s, &mode, &budget);
++    send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d,\"budget\":%d,"
++             "\"hits\":%llu,\"guest_keep\":%llu,\"fast\":%llu,"
++             "\"replays\":%llu,\"recovered\":%llu,\"budget_drops\":%llu}",
++             id, mode, budget, s[0], s[1], s[2], s[3], s[4], s[5]);
++}
++
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+  * fire, live extent/camera/DL-count, orig vs final bound). Read-only; small
+  * heap envelope so the per-byte stall of a giant read is never in play. */
+@@ -13430,6 +13459,7 @@
+     { "kernel_bless",      handle_kernel_bless },
+     { "ws_aspect",         handle_ws_aspect },
+     { "ws_nw",             handle_ws_nw },
++    { "c2_bbox",           handle_c2_bbox },
+     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
+     { "ws_backdrop_margin", handle_ws_backdrop_margin },
+     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },

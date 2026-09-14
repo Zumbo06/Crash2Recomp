@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 RENDERERS = ("opengl", "vulkan", "software")
-ASPECTS = ("4:3", "16:9")
+# 14:9 is the useful middle: it widens the field of view by ~1.17x instead of
+# 16:9's ~1.33x, so it reaches only about half as far past the edge Crash 2's
+# levels were actually authored to - which is where scenery pops in and out.
+# It also leaves only a 14% gap to a 16:9 panel, small enough that the stretch
+# dial can close it without a visible distortion.
+ASPECTS = ("4:3", "14:9", "16:9")
 
 # Exact output canvases offered by the launcher.  Aspect ratio is deliberately
 # separate: a 4:3 BIOS/FMV can pillarbox inside (say) a 3840x2160 canvas, while
@@ -85,6 +90,30 @@ class Settings:
     #               image is shorter, cropped when taller. Never side bars.
     scaling_mode: str = "letterbox"
 
+    # Shape of the OUTPUT CANVAS, deliberately separate from `aspect` (which is
+    # the shape the GAME renders at). "auto" means "same as aspect", which is
+    # what every older setting assumed.
+    #
+    # Pan & Scan needs them apart: the game renders a true 4:3 frustum - so it
+    # never widens its field of view into level edges that were never authored -
+    # while the canvas is 16:9 and `present_zoom` scales the picture up until it
+    # fills, cropping top and bottom. Without this split the launcher would size
+    # a 4:3 window for a 4:3 aspect and leave nothing to crop.
+    output_aspect: str = "auto"
+
+    # Pan-and-scan dial, 0..100: 0 = letterbox (bars), 100 = fill (crop the
+    # overflow). Aspect is exact at every value, so it never stretches - it only
+    # trades bars for crop. -1 = follow scaling_mode (historical behaviour).
+    present_zoom: int = -1
+    # Vertical pan for the zoomed window, in source scanlines out of 240.
+    # POSITIVE reveals more of the TOP (rescues a top-edge HUD).
+    present_pan: int = 0
+    # Partial stretch, 0..100. Zoom trades bars for crop without distorting;
+    # this trades a little distortion for the rest. 100 fills the canvas
+    # exactly. Small values are invisible in motion and cost no picture at all,
+    # which is why they are usually preferable to cropping.
+    present_stretch: int = 0
+
     # Overscan crop, in PS1 scanlines out of 240 (scale independent).
     #
     # Many PS1 titles draw fewer than 240 lines and leave the rest genuinely
@@ -114,14 +143,20 @@ class Settings:
     #   it is gated on the gameplay detector - and predates gte_game_mode being
     #   turned on below.
     #
-    #   Keep it False anyway, now for a MEASURED reason rather than the wrong
-    #   one above: Crash 2's level meshes are authored to the 4:3 frustum and
-    #   simply end there. Native-wide reveals 170 px per side that provably
-    #   contain no geometry (probe: no omitted polygons project into the
-    #   widened view; the runtime's own overhang counter never fires). So mode 2
-    #   costs ~280 MB of GL surfaces to show the same void the cheaper squash
-    #   shows. There is nothing to gain by turning it on.
-    #   See tuning/NOTES.md "Widescreen, part 4".
+    #   Keep it False, but for the COST, not the reason previously given here.
+    #   The "reveals 170 px that provably contain no geometry" claim was
+    #   RETRACTED: it generalised from a single overhang sample. A 78,769-prim
+    #   draw census then found 5,735 primitives extending past the canonical
+    #   window (xmin -429, xmax 629 against 512). Geometry does reach into the
+    #   margins.
+    #
+    #   The real reason to leave it False: mode 2 costs ~280 MB of GL surfaces
+    #   at supersampling 5, for a reveal the cheaper squash already delivers.
+    #   Both modes widen the same field of view - mode 1 squashes the
+    #   projection, mode 2 renders extra columns - so this is a quality/memory
+    #   trade, not a capability one. Toggle it live with the debug server's
+    #   `ws_nw` command instead of shipping it on.
+    #   See tuning/NOTES.md "Widescreen, part 5" and "part 6".
     widescreen_native_wide: bool = False
 
     # --- image quality (settings.toml only - no env override exists) -------
@@ -243,6 +278,15 @@ class Settings:
     last_page: str = "play"
     window_geometry: str = ""
 
+    def canvas_aspect(self) -> str:
+        """Shape of the output canvas.
+
+        Distinct from `aspect`, which is the shape the game RENDERS at. They are
+        equal for everything except Pan & Scan, where a 4:3 render is zoomed to
+        fill a 16:9 canvas.
+        """
+        return self.aspect if self.output_aspect == "auto" else self.output_aspect
+
     def clamp(self) -> "Settings":
         """Coerce out-of-range values back to something usable.
 
@@ -277,10 +321,18 @@ class Settings:
         # The loader rejects an output size outside these bounds; 0/0 means
         # "auto". Migrate old width-only settings by deriving the missing height
         # once, then persist an exact pair on the next save.
+        if self.output_aspect not in ("auto",) + ASPECTS:
+            self.output_aspect = "auto"
+        self.present_zoom = (-1 if int(self.present_zoom) < 0
+                             else min(100, int(self.present_zoom)))
+        self.present_pan = max(-120, min(120, int(self.present_pan or 0)))
+        self.present_stretch = max(0, min(100, int(self.present_stretch or 0)))
         width = int(self.window_width or 0)
         height = int(self.window_height or 0)
         if width and not height:
-            num, den = (int(part) for part in self.aspect.split(":"))
+            # Derive from the CANVAS shape, never from the render aspect - under
+            # Pan & Scan those differ and using `aspect` would rebuild a 4:3 box.
+            num, den = (int(part) for part in self.canvas_aspect().split(":"))
             height = round(width * den / num)
         if width == 0:
             height = 0
@@ -413,6 +465,10 @@ PRESETS: dict[str, dict[str, Any]] = {
     "Authentic": {
         "supersampling": 1,
         "aspect": "4:3",
+        "output_aspect": "auto",
+        "present_zoom": -1,
+        "present_pan": 0,
+        "present_stretch": 0,
         "scaling_mode": "letterbox",
         "texture_filter": "nearest",
         "present_filter": "plain",
@@ -425,19 +481,34 @@ PRESETS: dict[str, dict[str, Any]] = {
         "geometry_correction": False,
         "perspective_texturing": False,
     },
+    # A mild widescreen that fills the screen without throwing picture away.
+    #
+    # 14:9 widens the field of view by ~1.17x rather than 16:9's ~1.33x, so it
+    # reaches only about half as far past the edge Crash 2's levels were
+    # authored to - which is where scenery pops in and out. Trimming the 12
+    # blank scanlines the game leaves at top and bottom brings the DRAWN image
+    # to roughly 16:9 on its own, so the remaining gap is a few percent and the
+    # stretch dial closes it invisibly. Zoom stays at 0: with the blank lines
+    # already gone there is nothing left worth cropping.
     "Enhanced": {
         "supersampling": RECOMMENDED_SUPERSAMPLING,
-        "aspect": "16:9",
+        "aspect": "14:9",
+        "output_aspect": "16:9",
         "widescreen_native_wide": False,
-        "scaling_mode": "fill",
+        "scaling_mode": "letterbox",
+        "present_zoom": 0,
+        "present_pan": 0,
+        "present_stretch": 100,
         "texture_filter": "bilinear",
         "present_filter": "bicubic",
         "crt_filter": "raw",
         "antialiasing": True,
         "frame_interpolation": True,
         "frame_interpolation_fps": 0,
-        "overscan_top": 16,
-        "overscan_bottom": 16,
+        # Crash 2 draws rows 12..227 of its 240-line field; the rest is genuinely
+        # black. Trim it so the picture reaches the top and bottom of the screen.
+        "overscan_top": 12,
+        "overscan_bottom": 12,
         # PGXP stays off: on this engine it trades texture shimmer for
         # geometry pop-in and seam lines.
         "geometry_correction": False,
@@ -445,17 +516,45 @@ PRESETS: dict[str, dict[str, Any]] = {
     },
     "Performance": {
         "supersampling": 2,
-        "aspect": "16:9",
+        "aspect": "14:9",
+        "output_aspect": "16:9",
         "widescreen_native_wide": False,
-        "scaling_mode": "fill",
+        "scaling_mode": "letterbox",
+        "present_zoom": 0,
+        "present_pan": 0,
+        "present_stretch": 100,
         "texture_filter": "nearest",
         "present_filter": "plain",
         "crt_filter": "raw",
         "antialiasing": False,
         "frame_interpolation": False,
         "frame_interpolation_fps": 0,
-        "overscan_top": 16,
-        "overscan_bottom": 16,
+        "overscan_top": 12,
+        "overscan_bottom": 12,
+        "geometry_correction": False,
+        "perspective_texturing": False,
+    },
+    # The real widescreen hack: squash the GTE projection and stretch the
+    # present, which genuinely widens the field of view. Kept because a wider
+    # view is a real benefit, but it walks past the authored edge of Crash 2's
+    # levels, so geometry appears and disappears at the frame border.
+    "Widescreen (wider view)": {
+        "supersampling": RECOMMENDED_SUPERSAMPLING,
+        "aspect": "16:9",
+        "output_aspect": "auto",
+        "widescreen_native_wide": False,
+        "scaling_mode": "fill",
+        "present_zoom": -1,
+        "present_pan": 0,
+        "present_stretch": 0,
+        "texture_filter": "bilinear",
+        "present_filter": "bicubic",
+        "crt_filter": "raw",
+        "antialiasing": True,
+        "frame_interpolation": True,
+        "frame_interpolation_fps": 0,
+        "overscan_top": 0,
+        "overscan_bottom": 0,
         "geometry_correction": False,
         "perspective_texturing": False,
     },
@@ -463,8 +562,15 @@ PRESETS: dict[str, dict[str, Any]] = {
 
 PRESET_NOTES: dict[str, str] = {
     "Authentic": "Original 4:3 presentation, unfiltered - as the console output it.",
-    "Enhanced": "Widescreen, sharper image, smoother motion. A good default.",
-    "Performance": "Lower internal resolution for weaker GPUs.",
+    "Enhanced": ("Slightly wider view (14:9) filling a 16:9 screen, with the "
+                 "game's own blank scanlines trimmed so the picture reaches "
+                 "every edge. Nothing of the drawn image is cropped, and it "
+                 "reaches half as far past the level edges as full widescreen, "
+                 "so far less scenery pops in. A good default."),
+    "Performance": "Same fit as Enhanced, lower internal resolution for weaker GPUs.",
+    "Widescreen (wider view)": ("Genuinely wider field of view, but Crash 2's "
+                                "levels end at the 4:3 edge, so scenery can "
+                                "appear and vanish at the frame border."),
 }
 
 

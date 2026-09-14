@@ -1374,3 +1374,393 @@ Configuring those sites would pull the sky/backdrop out to the new edges. It
 covers the BACKDROP portion of the void only — terrain that simply ends still
 ends — but that is the cheap part of the artifact, and it needs per-game site
 addresses rather than a code change.
+
+## Widescreen, part 5: correcting part 4 — and no backdrop layer exists
+
+Draw census, 120 frames of open-scenery gameplay at 16:9 mode 2, 78,769
+primitives (`_build/ws_census.py`, ring cap 2^21 so nothing wrapped):
+
+    opcode  0x3C 32280   0x30 29428   0x34 6650   0x36 4340   0x3E 1440
+            0x24  1430   0x26  1401   0x2E 1200   0x38  600
+    xmin -429   xmax 629   past the 512 window: 5735 prims
+
+### 1. There are no `[widescreen.backdrop] x_sites`, because there is no 2D layer
+
+Every opcode recorded is in 0x24..0x3E — **polygons only**. Across 120 frames
+there is not one rect, sprite or line (0x40..0x7F), even though the census gate
+is `opcode >= 0x20 && opcode <= 0x7F` and would have caught them. Crash 2 draws
+everything, HUD included, as GTE-projected polygons.
+
+`psx_ws_backdrop_x` exists to correct a parallax 2D backdrop that computes
+screen-X *without* the GTE. Crash 2 has no such layer, so there is nothing to
+correct and no site to configure. That also means the codegen-hash cost and the
+full regeneration it implies are avoided — the feature is simply inapplicable.
+
+### 2. Part 4's "nothing to reveal" was WRONG — retracted
+
+Part 4 concluded the meshes stop at the 4:3 frustum and no FOV widening could
+ever be filled. The census disproves it: **5,735 primitives extend past the
+canonical window**, reaching to xmax 629 and xmin -429 against a 512-wide
+display. Geometry does reach into the revealed margins.
+
+The error was mine: I generalised from `ovh_prims = 0` in a single `gpu_state`
+sample. That field is `ws_ovh_prev` (gpu.c:1630) — ONE previous frame's count,
+in whatever scene happened to be on screen at that instant — and
+`last_ovh_frame` only stamps when a frame crosses the >=4-prim bar. A single
+instant in one scene is not evidence about the game; 120 frames of open-scenery
+play is. The two disagree, and the larger sample wins.
+
+### 3. The two results are compatible
+
+`cand ~ 0` (probe) and 5,735 past-edge prims (census) are not in conflict. The
+polygons reaching into the margins are ALREADY in the authored draw list —
+large near-camera surfaces naturally spanning beyond the view. `cand` measured
+something different: polygons the list OMITTED. Nothing needs adding because
+what covers the margins is already submitted.
+
+### 4. What is actually still unmeasured
+
+The probe walks the zone's static world meshes only. **Dynamic objects — Crash,
+enemies, crates, pickups, platforms — are drawn by a different path and have
+never been measured.** The original report was edge *popping*, which is the
+signature of object activation bounds, not of static terrain. That is Phase 5
+territory (`psx_ws_activation_margin`, the bias/range cull sites), and it was
+never tested because Phase 4 was closed prematurely.
+
+## Widescreen, part 6: the eight-corner render cull
+
+Patches 0016 (the cull fix) and 0017 (the margin hardcodes). This is the first
+part of the widescreen work that changes what the game *submits* rather than how
+the compositor presents it.
+
+### The routine
+
+`func_80041D14` is Crash 2's render-visibility test. It reads a packed XY at
+scratchpad `0x1F800118` and Z at `0x1F80011C`, builds a 1020-unit (`0x3FC`) AABB,
+projects the eight corners with three RTPTs, and calls `func_80041E20` once per
+corner. Decoded from the executable:
+
+    80041E20: 0480FFFD  bltz $a0, 80041E18    ; bit 31 of packed = Y < 0  -> out
+    80041E24: 00043400  sll  $a2, $a0, 16
+    80041E28: 04C0FFFB  bltz $a2, 80041E18    ; X < 0                     -> out
+    80041E2C: 00042402  srl  $a0, $a0, 16
+    80041E30: 04A0FFF9  bltz $a1, 80041E18    ; SZ < 0   (DEAD - see below)
+    80041E34: 00063402  srl  $a2, $a2, 16
+    80041E38: 2084FF28  addi $a0, $a0, -216
+    80041E3C: 0481FFF6  bgez $a0, 80041E18    ; Y >= 216                  -> out
+    80041E40: 20C6FE00  addi $a2, $a2, -512
+    80041E44: 04C1FFF4  bgez $a2, 80041E18    ; X >= 512                  -> out
+    80041E4C: 8C7F0064  lw   $ra, 0x64($v1)   ; INSIDE: restore 80041D14's ra
+    80041E50: 24180000  li   $t8, 0           ; visible
+    80041E54: 03E00008  jr   $ra              ; ...and return ALL THE WAY OUT
+
+The inside path restores `func_80041D14`'s own saved return address from
+scratchpad, so a corner landing on screen exits the whole routine immediately.
+Only the eighth call site links to `0x80041E10`, which sets `t8 = -1`.
+
+> **The box is visible iff ANY corner is inside; rejected iff ALL EIGHT are
+> outside.**
+
+`bltz $a1` is provably dead. `$a1` is `mfc2` of SZ (`gte_data[19]`), and
+`gte_export_cpu_state` writes `d[16+i] = gte->SZ[i]` from a `uint16_t`, so it is
+always in `[0,65535]`. Same on real hardware - `mfc2` of SZ zero-extends. That is
+why patching `$a0` alone is sufficient to force the visible path.
+
+### Two defects, not one
+
+**A. A box that spans the viewport is culled.** Every corner is outside while the
+box covers the screen. Present in the original game, independent of aspect.
+
+**B. The revealed margins are culled - native-wide only.** Mode 2 does not squash
+the GTE; it grows the frame by `ws_nw_configured_offset()` = 85 px per side via
+the GPU draw offset. The guest still tests `[0,512)`, so everything in `[-85,0)`
+and `[512,597)` is rejected and snaps in at the old 4:3 edge. **This is the
+reported artifact.** Mode 1 is structurally immune: `gte.cpp` squashes X *before*
+the guest's own test, so that test already sees widened coordinates.
+
+### Why the previous gate was dead
+
+`crash2_wide_bbox.h` shipped gated `if (!ws.active || ws.mode != 1) return;` -
+scoped to the one mode where defect B does not exist, and with hardcoded 512/216
+bounds that could not address it anyway. Worse, the obvious repair (gate on
+`ws.active`) is *equally* dead:
+
+    gpu.c gpu_ws_configure():  else { ws_xnum = ws_xden = 1; }   /* modes 0 and 2 */
+    gpu.c ws_configured():     return ws_xnum != ws_xden;
+    gpu.c ws_active():         return ws_configured() && !gpu_ws_present_native_43();
+
+Mode 2 forces the squash factor to 1/1, so `ws_configured()` - and with it
+`ws_active()` and `GpuWsDebug.active` - is **false under native-wide**. `ws.active`
+means "squashing", not "widescreen is on". The working gate has to name both
+modes explicitly:
+
+    const int off = ws.nw_extra / 2;        /* 0 in mode 1, 85 in mode 2 */
+    if (ws.present_native_43) return;
+    if (!((ws.mode == 1 && ws.active) || (ws.mode == 2 && off > 0))) return;
+
+`ws_nw_extra()` is `2 * ws_nw_offset()` and returns 0 unless native-wide is live
+*this frame*, so `off > 0` already implies mode 2 is engaged. 4:3 returns at the
+mode test - byte-identical, deliberately: defect A is original-game behaviour and
+4:3 stays the untouched reference build.
+
+### The pre-check must NOT be widened
+
+`if (x >= 0 && x < 512 && y >= 0 && y < 216) return;` is **not** a consistency
+check against the replay window. It mirrors the guest's own accept test and
+means *"the guest is about to keep this box anyway, so do nothing"*. Widening it
+to `[-off, 512+off)` makes the hook return for a corner at X = -50, which the
+guest then rejects - i.e. it would skip precisely the geometry defect B is about.
+This was caught in review, not in testing; it would have looked like "the fix
+does nothing" while every counter read plausibly.
+
+### Why the replay is safe
+
+- **`$t2` (the wrap mask) is live at corner 8.** Nothing in `0x80041D14..0x80041E0C`
+  writes it, and `func_80041E20` writes only `$a0`, `$a2`, `$t8`, `$ra`. The replay
+  reads the *live* `cpu->gpr[10]` rather than reconstructing it, so the argument
+  does not depend on identifying the caller - which matters, because there is no
+  `jal 0x80041D14` anywhere: the routine is reached only through a function
+  pointer at `[$s3+0x1C]`.
+- **Patching `$a0` is invisible.** It is caller-saved and `func_80041D14` clobbers
+  it via `mfc2` at every corner, so no correct caller can read it across the call.
+  Both exits touch only `$ra` and `$t8`.
+- **The replay writes nothing back.** `gte_replay_side_effects_begin/end` suppress
+  the exec counter, PGXP vertex pushes, gameplay stamps, SZ statistics, the dome
+  probe and the trace rings; the projection runs on a private `GTEState` copy and
+  never passes through `gte_export_cpu_state`.
+- **The replay still squashes.** `do_squash` is deliberately *not* sandbox-guarded,
+  so in mode 1 the replay's coordinates match the guest's exactly. Likewise
+  `s_gte_caller_ra` is preserved across the sandbox, so `ws_dome_call_matches()`
+  makes the same decision the guest's own RTPT just made. Both are load-bearing;
+  neither is obvious from reading `gte_replay_side_effects_begin` alone.
+- **The eight corners are reconstructed exactly**, including `points[3] ==
+  points[4]` (one XY column visited at both Z values, matching the third RTPT
+  re-transforming corner 4 as a throwaway V0).
+
+### Cost control
+
+The hook fires once per *rejected* box, which for a cull routine is the common
+case, so a naive eight-projection replay is not free. Three mitigations:
+
+1. **Zero-projection fast accept.** At corner 8 the guest's GTE FIFO still holds
+   the third RTPT's vertices - cube corners 4, 7, 8 - in SXY0/1/2 and SZ1/2/3.
+   `common` is an AND over corners, so if those three already fail to share an
+   outside edge, the full eight-corner AND is 0 too. Catches the straddle case
+   with no GTE work at all.
+2. **Opposite-corner ordering** `{0,7,1,6,2,5,3,4}` plus an early break once
+   `positive && common == 0`. The result cannot change after that, so both are
+   semantically free; a straddling box typically settles in 2 projections.
+3. **Per-frame revive budget** (default 64). Whether this cull feeds the 1520-id
+   draw list at `[0x8005F390]` is unproven, and its consumer `func_80041E5C` sits
+   directly after this routine in memory. `budget_drops` reports if it ever binds.
+
+### Measuring it
+
+`c2_bbox` on the debug server switches all three states live, so one launch
+covers the whole A/B: `{"on":0}` vanilla, `{"on":1}` the
+conservative re-test, `{"on":2}` force-visible. That last one imitates something
+the game already ships - `0x8001AFF8` installs `0x80041E50` ("li $t8,0; jr $ra")
+in place of the cull when flag bit `0x00040000` is set - giving a true upper
+bound on what this routine can possibly reveal. If `on:2` shows substantially
+more than `on:1`, the residue is either an over-strict replay or, more likely,
+**object activation** rather than render visibility (part 5) - which this change
+explicitly does not touch.
+
+Counters: `hits` (boxes about to be rejected), `guest_keep` (would have been kept
+anyway), `fast` (accepted from the FIFO), `replays`, `recovered`, `budget_drops`.
+At 4:3 every one of them must stay zero.
+
+The handler and its table entry sit outside every `PSX_NO_DEBUG_TOOLS` guard, so
+`c2_bbox` is present in **both** build trees and works wherever the debug server
+is listening (`--debug-port`). The debugtools tree is simply what the launcher
+selects in Developer mode, and it additionally carries the per-block
+instrumentation that `PSX_DEBUG_TOOLS=ON` compiles in.
+
+`PSX_CRASH2_WIDE_BBOX` sets the initial state (`0`/`1`/`2`) before the first
+`c2_bbox` command arrives; a debug-server call always wins over it afterwards.
+**Set it to `0` for any `PSX_COSIM` run** - this is an intentional divergence and
+would otherwise be reported as a defect.
+
+### Measured in-game, 2026-09-14 (attract-demo scenes only)
+
+Run against `build-debugtools`, settings 16:9, ss=5, via the attract demo - see
+the caveat at the end. Frame budget held at **16.68 ms avg / 24.29 ms max**
+(60 fps, GPU-bound: scene_gpu 13.76 ms avg), and `budget_drops` stayed **0**
+throughout at the default 64/frame - the hook fires only ~0.3-3 times per frame,
+nowhere near the cap.
+
+**Patch 0017 confirmed live.** Mode 1, squash `[3,4]`, `x_margin` reads **85**,
+not the old 53. That is the same value mode 2 derives independently, which is
+the cross-check that the two paths now agree.
+
+**The gate reasoning confirmed empirically.** In mode 2 `gpu_state` reports:
+
+    mode=2  nw_extra=170  squash=[1,1]  configured=0  active=0  x_margin=85
+
+`active` really is **0** under native-wide. The shipped `mode != 1` gate *and*
+the obvious `!ws.active` repair would both have been dead here; only the explicit
+two-mode form runs. This is now measured, not merely read off the source.
+
+**Test F - 4:3 byte-identity: PASS.** Forced to `on:1` (the shipping mode) across
+~3,300 frames of real 3D gameplay (`gte_verts` 2400-2800), every counter stayed
+at zero: `hits=0 keep=0 fast=0 replays=0 recovered=0`.
+
+**Mode 2 A/B**, interleaved 6 s legs x 3 rounds to average out scene drift:
+
+    on:0  vanilla        1081 frames   hits=535   recovered=0
+    on:1  conservative   1082 frames   hits=752   recovered=34     (4.5% of hits)
+    on:2  force visible  1081 frames   hits=690   recovered=690    (100%, by definition)
+
+**Draw census**, ~208k primitives per leg, raw pre-draw-offset SX extent:
+
+    on:0  861 prims/frame   past_right(>512) 56.9/frame   xmax 875
+    on:1  858 prims/frame   past_right       58.2/frame   xmax 875
+    on:2  867 prims/frame   past_right       65.9/frame   xmax 980
+
+So forcing every rejected box visible *does* push measurably more geometry into
+the revealed columns (+14.8% past-right, xmax 875 -> 980), which proves the
+routine is a real gate on margin content. The conservative test, though, revives
+only ~5% of rejected boxes and moves past-right by ~2% with no change in xmax.
+
+### What that means, and what it does not
+
+The mechanism works and is correct: it fires, it recovers, it is inert at 4:3,
+and it costs nothing measurable. But in these scenes the honest reading is that
+**most boxes the guest rejects really are off-screen** - the conservative test
+agrees with the original cull 95% of the time. That is what a correct culling fix
+should look like; it is not evidence of a large visual win.
+
+Two things this run could NOT establish, both for the same reason - the debug
+server has no input injection, so the only gameplay available was the attract
+demo, on a route nobody chose:
+
+1. **Whether the reported edge popping is fixed.** The demo may simply never
+   visit the level edges where it was seen. No visual comparison was made.
+2. **A clean same-scene A/B.** `gte_verts` varied 470-2800 between legs, so the
+   per-frame rates above carry real scene noise. The interleaving reduces it but
+   does not remove it.
+
+The `on:2` upper bound is the useful diagnostic here: it says this routine gates
+at most ~15% more past-window geometry. If the popping persists with `on:1` in a
+hand-played level, that ceiling is the argument for looking at **object
+activation** (part 5) rather than tightening this test further.
+
+### Incidental finding: `ovh_prims` is unreliable
+
+`ovh_prims` stayed **0** through every leg - including `on:2`, where the census
+independently counted ~66 past-window primitives per frame and 500+ forced
+revives. `ws_note_overhang` is not seeing what the census sees. This is the same
+counter whose zero reading produced the retracted part-4 conclusion, so the
+retraction was right for a deeper reason than part 5 recorded: the counter is not
+merely a one-frame sample, it does not appear to work. Do not use it as evidence
+for anything until it is re-derived.
+
+## Widescreen, part 7: fill the screen without widening the view
+
+Patch 0018, plus launcher changes (tracked in git). This is the answer to the
+edge popping that parts 5 and 6 could not remove: stop trying to reveal more
+world, and change how the picture is PRESENTED instead.
+
+### Why this, and not more cull work
+
+Part 6's cull fix landed and works, but measured in-game it recovers ~5% of the
+boxes the guest rejects and moves past-window geometry by ~2%. The popping
+persisted in native-wide. The remaining cause is either object activation
+(never measured, part 5) or simply that Crash 2's levels end where the 4:3
+frustum ends - and neither is fixable from the present path.
+
+So the goal changed: fill a 16:9 panel *without* asking the engine to draw
+anything it was not authored to draw. Three dials do that, and the interesting
+result is that combining them beats any one of them.
+
+### The three dials (all in `letterbox_rect_aspect`)
+
+Everything routes through that one function - all five present paths call it,
+including `interp_present`, which matters because frame interpolation OWNS the
+frame interval when enabled and returns before `present_target_quad`. A dial
+added anywhere else would silently do nothing for anyone with interpolation on.
+
+1. **Zoom** (`PSX_PRESENT_ZOOM`, 0..100). Interpolates between the largest rect
+   that FITS the canvas (letterbox) and the smallest that COVERS it (fill).
+   Both endpoints are special-cased to reproduce the historical rects exactly,
+   so leaving it unset changes nothing. Aspect is exact at every value: this
+   trades bars for crop and can never distort.
+2. **Stretch** (`PSX_PRESENT_STRETCH`, 0..100). Pulls whatever mismatch the zoom
+   left toward filling the canvas exactly. 100 reproduces the old all-or-nothing
+   stretch mode. This is the only dial that distorts.
+3. **Pan** (`PSX_PRESENT_PAN`, source scanlines of 240). Slides the zoomed
+   window; POSITIVE reveals more of the TOP. Clamped to the actual overflow.
+
+### The overscan bug this exposed
+
+`apply_overscan_crop` trims the SOURCE rect; `letterbox_rect_aspect` sized the
+destination from the aspect alone and never saw that. The surviving band was
+therefore magnified to fill a rect built for the UNCROPPED frame - scaled
+vertically but not horizontally. **The shipped Enhanced and Performance presets
+used overscan 16/16, so they had a ~1.15x vertical stretch.**
+
+Fixed by `overscan_aspect_mul`: fold the kept fractions into the aspect, so the
+band is described as the sub-rectangle it actually is. Applied via
+`present_rect_cropped` at the four paths that crop, and deliberately NOT at
+`gl_renderer_present` (24-bit FMV / forced-CPU), which never crops and would
+otherwise be sized for a trim it did not apply. This is distinct from the
+short-display-mode case the old comment defended: there the short band IS the
+whole picture and must fill the rect, which is why the fix keys on what WE
+removed rather than on absolute height.
+
+### The measured result, and why 14:9 is the setting
+
+Measured live at 2560x1440 via the new `present_fit` command. Crash 2 renders
+512x240 but only DRAWS rows 12..227 - 12 blank scanlines at each end that are
+black image, not letterboxing, and that no scaling mode can remove.
+
+Trimming those 12 lines does two things at once: it removes the bands, and it
+makes the drawn content wider relative to its height, which collapses the
+stretch needed to fill a 16:9 panel:
+
+    trim   drawn aspect   stretch to fill 16:9
+    0      1.556          +14%
+    4      1.609          +10%
+    8      1.667          +6%
+    12     1.728          +2%
+    16     1.795          -1%
+
+Combined with a 14:9 render aspect the result is:
+
+    14:9 + trim 12 + zoom 0 + stretch 100
+      -> fills 2560x1440 exactly, ZERO crop of drawn picture, +2% distortion
+
+14:9 is the useful middle because the widening is a dial, not a switch:
+`parse_aspect_ratio` (config_loader.cpp) accepts anything from 4:3 to 32:9. At
+14:9 the GTE squash is `[6,7]` and `x_margin` is **43**, against 85 at 16:9 -
+so it reaches about half as far past the authored edge, halving the exposure
+that causes the popping, while the remaining gap to the panel is small enough
+for the stretch dial to close invisibly.
+
+Full pan-and-scan (4:3 + zoom 100) also works and is genuinely distortion-free,
+but costs 30 of 240 scanlines per edge - 18 of them real picture. Kept as an
+option; not the default, because +2% distortion is cheaper than 17% of the
+image, and because zoom cannot add field of view: zoom 0 IS the maximum view in
+that mode.
+
+### Launcher
+
+`aspect` (what the GAME renders) and the new `output_aspect` (the shape of the
+CANVAS) are now separate - they had been conflated in two places that both
+rebuilt a 4:3 window whenever the render aspect was 4:3, leaving nothing to
+crop: `usersettings._auto_windowed_size` and the width-without-height back-fill
+in `Settings.clamp`. Both now use `Settings.canvas_aspect()`.
+
+Enhanced and Performance are repointed at 14:9 + trim 12 + stretch 100. The
+FOV-widening hack is kept as an opt-in preset ("Widescreen (wider view)") since
+a genuinely wider view is a real benefit for anyone who prefers it to the
+popping. `test_settings_coverage.py` caught all three new settings as orphans
+until real UI controls existed - that guard did its job.
+
+### Live tuning
+
+`present_fit` on the debug server takes `zoom`, `stretch`, `pan` and `crop`
+(symmetric overscan) and reports the resulting rect, the crop in source
+scanlines per edge, and `distort_pct` - so a setting can be judged by number
+rather than by eye, and the whole space explored in one session instead of one
+game boot per value.

@@ -86,6 +86,11 @@ _build/*
 !_build/*.ps1
 !_build/*.py
 !_build/padprobe.c
+# Widescreen investigation probes (ws_census, ws_send, wsdiag, ...). Throwaway
+# attach-only diagnostics written against whatever the debug server exposed
+# that week; the findings they produced live in tuning/NOTES.md. Re-ignored
+# after the !_build/*.py negation above, which would otherwise keep them.
+_build/ws*.py
 
 # The generated project: keep ONLY the reproducible inputs. Everything derived
 # from the disc stays out - see section 1.
@@ -109,6 +114,10 @@ dist/
 # than kept in history. package.ps1 copies this into the bundle when present
 # and simply omits it when not.
 /RELEASE_NOTES.md
+# Working migration tracker for the widescreen investigation. It is a live
+# scratchpad that has already been retracted and rewritten in place; the
+# durable conclusions live in tuning/NOTES.md instead.
+/tuning/WIDESCREEN-PLAN.md
 out/
 cmake-build-*/
 CMakeCache.txt
@@ -191,6 +200,12 @@ env/
 !launcher/crash2launcher.spec
 launcher/build/
 launcher/dist/
+
+# Test/check scripts. These are development aids, not part of what a player
+# downloads or what the repo distributes, and they pull in PySide6 and a Qt
+# offscreen platform to run. Kept on disk, out of git.
+test_*.py
+*_test.ps1
 
 
 # --------------------------------------------------------------------------

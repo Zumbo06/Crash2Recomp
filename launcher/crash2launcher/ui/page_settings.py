@@ -91,6 +91,47 @@ SCALING_MODES_UI = [
     ("Stretch - fill exactly, distorts", "stretch"),
 ]
 
+# Shape of the output canvas, separate from the shape the game RENDERS at.
+# Pan & Scan is 4:3 gameplay inside a 16:9 screen.
+OUTPUT_ASPECTS_UI = [
+    ("Match gameplay aspect", "auto"),
+    ("4:3", "4:3"),
+    ("16:9 widescreen", "16:9"),
+]
+
+# How far to zoom the picture toward filling the screen. The shape is exact at
+# every step, so this only ever trades bars for crop - it never stretches.
+PRESENT_ZOOMS = [
+    ("Follow image fit", -1),
+    ("None - letterbox (0%)", 0),
+    ("Slight (25%)", 25),
+    ("Half (50%)", 50),
+    ("Most (75%)", 75),
+    ("Full - fills the screen (100%)", 100),
+]
+
+# Which edge to favour once the picture is cropped. Positive keeps more of the
+# top, which is where Crash 2 puts its mask and counters.
+PRESENT_PANS = [
+    ("Centred", 0),
+    ("Favour top (+4)", 4),
+    ("Favour top (+8)", 8),
+    ("Favour top (+12)", 12),
+    ("Favour bottom (-4)", -4),
+    ("Favour bottom (-8)", -8),
+]
+
+# Closes whatever gap Zoom leaves, by accepting a little horizontal distortion
+# instead of bars or crop. From 14:9 the whole gap to a 16:9 panel is only 14%,
+# so even "Full" here is mild; from 4:3 it would be 33%.
+PRESENT_STRETCHES = [
+    ("None - exact shape", 0),
+    ("Slight (25%)", 25),
+    ("Half (50%)", 50),
+    ("Most (75%)", 75),
+    ("Full - fills the width (100%)", 100),
+]
+
 OVERSCAN_PRESETS = [
     ("None (0)", 0),
     ("Slight (4)", 4),
@@ -287,6 +328,9 @@ class SettingsPage(QWidget):
                                    self._on_ws_mode)
         self.scaling = self._combo(SCALING_MODES_UI, self.settings.scaling_mode,
                                    self._on_scaling)
+        self.output_aspect = self._combo(OUTPUT_ASPECTS_UI,
+                                         self.settings.output_aspect,
+                                         self._on_output_aspect)
 
         return self._wrap(
             card(
@@ -294,6 +338,7 @@ class SettingsPage(QWidget):
                 row("Renderer", self.renderer),
                 row("Fullscreen", self.fullscreen),
                 row("Output resolution", self.output_resolution),
+                row("Screen shape", self.output_aspect),
                 row("Image fit", self.scaling),
                 dim("Alt+Enter or Ctrl+F toggles fullscreen while playing."),
             ),
@@ -302,6 +347,10 @@ class SettingsPage(QWidget):
                 row("Internal resolution", self.scale),
                 row("Gameplay aspect", self.aspect),
                 row("Widescreen mode", self.ws_mode),
+                dim("Gameplay aspect is what the GAME renders; Screen shape is "
+                    "the window it is shown in. Keeping gameplay at 4:3 inside a "
+                    "16:9 screen, with Zoom turned up, fills the display without "
+                    "widening the view - so nothing pops in at the edges."),
                 dim("Leave Widescreen mode on the projection hack - native-wide "
                     "needs per-game data Crash 2 does not have, and without it "
                     "nothing widens at all."),
@@ -318,6 +367,13 @@ class SettingsPage(QWidget):
         self.crt = self._combo(CRT_FILTERS, self.settings.crt_filter, self._on_crt)
         self.overscan = self._combo(OVERSCAN_PRESETS, self.settings.overscan_top,
                                     self._on_overscan)
+        self.present_zoom = self._combo(PRESENT_ZOOMS, self.settings.present_zoom,
+                                        self._on_present_zoom)
+        self.present_pan = self._combo(PRESENT_PANS, self.settings.present_pan,
+                                       self._on_present_pan)
+        self.present_stretch = self._combo(PRESENT_STRETCHES,
+                                           self.settings.present_stretch,
+                                           self._on_present_stretch)
 
         self.aa = QCheckBox("Anti-aliasing (smooths the supersample downscale)")
         self.aa.setChecked(self.settings.antialiasing)
@@ -341,10 +397,23 @@ class SettingsPage(QWidget):
             ),
             card(
                 section("Framing"),
+                row("Zoom", self.present_zoom),
+                row("Stretch", self.present_stretch),
+                row("Vertical pan", self.present_pan),
+                dim("Two ways to fill the screen. Zoom scales the picture up "
+                    "and crops top and bottom - the shape stays exact but you "
+                    "lose scanlines. Stretch widens it instead - nothing is "
+                    "lost but the image is slightly wide. Mix them to taste; "
+                    "from 14:9 even full Stretch is only about 14%."),
+                dim("Vertical pan favours one edge once Zoom is cropping - "
+                    "use it if the mask and counters lose their top."),
                 row("Overscan crop", self.overscan),
                 dim("PS1 games often draw fewer than 240 scanlines and leave "
                     "the rest black. Those bars are part of the image, so no "
-                    "image-fit mode can remove them - only this can."),
+                    "image-fit mode can remove them - only this can. Leave it "
+                    "at None when Zoom is filling the screen: the zoom crop "
+                    "already swallows those lines, and doing both throws away "
+                    "picture twice."),
             ),
             card(
                 section("Geometry (PGXP)"),
@@ -632,6 +701,22 @@ class SettingsPage(QWidget):
 
     def _on_scaling(self, index: int) -> None:
         self.settings.scaling_mode = self.scaling.itemData(index)
+        self._touch()
+
+    def _on_output_aspect(self, index: int) -> None:
+        self.settings.output_aspect = self.output_aspect.itemData(index)
+        self._touch()
+
+    def _on_present_zoom(self, index: int) -> None:
+        self.settings.present_zoom = self.present_zoom.itemData(index)
+        self._touch()
+
+    def _on_present_pan(self, index: int) -> None:
+        self.settings.present_pan = self.present_pan.itemData(index)
+        self._touch()
+
+    def _on_present_stretch(self, index: int) -> None:
+        self.settings.present_stretch = self.present_stretch.itemData(index)
         self._touch()
 
     def _on_tex_filter(self, index: int) -> None:

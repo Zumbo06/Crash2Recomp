@@ -1,0 +1,29 @@
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -977,7 +977,12 @@
+     if (ws_native_wide_configured())
+         return ws_nw_configured_offset() + ws_cull_guard_pixels;
+     if (!ws_active()) return 0;
+-    return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum
++    /* Half the LIVE display width, not a hardcoded half-of-320: a 512-wide
++     * title was short by 1.6x. Byte-identical for 320-wide titles; at 512 wide
++     * and 16:9 it yields 85, which is exactly mode 2's independently derived
++     * per-side reveal (ws_nw_configured_offset) — as it must be, since both
++     * modes reveal the same field of view. */
++    return ((int)ws_disp_w() / 2 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum
+            + ws_cull_guard_pixels;
+ }
+ 
+@@ -990,7 +995,11 @@
+ {
+     const int margin = psx_ws_x_margin();
+     if (margin <= 0) return vanilla;
+-    return (int32_t)(((int64_t)vanilla * (320 + 2 * margin)) / 320);
++    /* Same live-width correction as psx_ws_x_margin above: this 320 was the
++     * same hardcoded reference width, wrong by 1.6x for a 512-wide title. */
++    const int32_t w = ws_disp_w();
++    if (w <= 0) return vanilla;
++    return (int32_t)(((int64_t)vanilla * (w + 2 * margin)) / w);
+ }
+ 
+ #define WS_SIGNED_BOUND_MAX 64
