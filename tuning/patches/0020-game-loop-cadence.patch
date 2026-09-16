@@ -1,0 +1,79 @@
+--- /dev/null
++++ b/runtime/src/crash2_sim_tick.h
+@@ -0,0 +1,23 @@
++/* SCUS-94154 main-loop cadence probe. Diagnostic only, no guest writes.
++ *
++ * Do not count the camera helper at 800200A8/RA 80022854 as a simulation
++ * tick: it runs twice per loop. Entry 80011848 is the outer game loop; a
++ * PC probe measured one visit for each displayed gameplay frame at stock
++ * speed. This is not proof that every subsystem simulates once. */
++static unsigned long long c2game_loop_steps;
++static int c2game_loop_verified = -1;
++
++unsigned long long crash2_sim_tick_count(void) { return c2game_loop_steps; }
++int crash2_sim_tick_verified(void) { return c2game_loop_verified; }
++
++static void crash2_sim_tick(CPUState *cpu, uint32_t pc)
++{
++    if (pc != 0x80011848u) return;
++    if (c2game_loop_verified < 0) {
++        c2game_loop_verified =
++            cpu->read_word(0x80011848u) == 0x3C028007u &&
++            cpu->read_word(0x8001184Cu) == 0x8C429944u &&
++            cpu->read_word(0x80011854u) == 0x30420800u;
++    }
++    if (c2game_loop_verified) c2game_loop_steps++;
++}
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -2053,3 +2053,4 @@
+ #include "crash2_wide_probe.h"
+ #include "crash2_wide_bbox.h"
++#include "crash2_sim_tick.h"
+ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+@@ -2061,3 +2062,4 @@
+     crash2_wide_probe(cpu, resume_pc);
+     crash2_wide_bbox(cpu, resume_pc);
++    crash2_sim_tick(cpu, resume_pc);
+     s_compiled_interrupt_resume_pc = prev;
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7857,3 +7857,3 @@
+ static uint64_t s_fr_base_ms = 0;
+ static uint64_t s_fr_base_raise, s_fr_base_deliver, s_fr_base_present;
+-static uint64_t s_fr_base_flip, s_fr_base_swap;
++static uint64_t s_fr_base_flip, s_fr_base_swap, s_fr_base_sim;
+@@ -7865,2 +7865,3 @@
+     extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+     extern uint64_t g_display_flip_count;
++    extern unsigned long long crash2_sim_tick_count(void);
+@@ -7876,2 +7877,3 @@
+     s_fr_base_flip    = g_display_flip_count;
+     s_fr_base_swap    = g_gl_swap_total;
++    s_fr_base_sim     = crash2_sim_tick_count();
+@@ -7884,2 +7886,4 @@
+     extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+     extern uint64_t g_display_flip_count;
++    extern unsigned long long crash2_sim_tick_count(void);
++    extern int crash2_sim_tick_verified(void);
+@@ -7902,2 +7906,7 @@
+     const double flip_s    = (double)(g_display_flip_count   - s_fr_base_flip)    / secs;
+     const double swap_s    = (double)(g_gl_swap_total        - s_fr_base_swap)    / secs;
++    /* This is an outer-loop entry count, not physics/AI proof. -1 means the
++     * title anchor has not been reached or its instruction signature failed. */
++    const int loop_ok = crash2_sim_tick_verified();
++    const double loop_s = loop_ok == 1
++        ? (double)(crash2_sim_tick_count() - s_fr_base_sim) / secs : -1.0;
+@@ -7923,4 +7935,5 @@
+              "\"vblank_raise\":%.2f,\"vblank_deliver\":%.2f,"
+              "\"present_bodies\":%.2f,\"distinct_frames\":%.2f,"
+-             "\"host_swaps\":%.2f,\"vblanks_per_frame\":%.3f,"
++             "\"host_swaps\":%.2f,\"game_loop_steps\":%.2f,"
++             "\"game_loop_verified\":%d,\"vblanks_per_frame\":%.3f,"
+              "\"speed\":%.3f,\"perf_samples\":%d,"
+@@ -7936,2 +7950,3 @@
+              "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
+-             id, secs, raise_s, deliver_s, present_s, flip_s, swap_s, vpf,
++             id, secs, raise_s, deliver_s, present_s, flip_s, swap_s,
++             loop_s, loop_ok, vpf,
+              raise_s / 59.94, psamples, p[0], p[1], p[2], (int)p[3]);

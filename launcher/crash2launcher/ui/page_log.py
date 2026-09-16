@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
+
+from PySide6.QtCore import QTimer
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -24,11 +27,18 @@ from .common import heading
 from .dialogs import confirm, tell
 from .theme import PAGE_MARGINS
 from .widgets.log_console import LogConsole
+from ..config import Settings
+from ..diagnostics import cadence_sample, save_report
 
 
 class LogPage(QWidget):
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, settings: Settings | None = None,
+                 heartbeat_path: Path | Callable[[], Path] | None = None,
+                 parent: QWidget | None = None):
         super().__init__(parent)
+        self._settings = settings
+        self._heartbeat_path = heartbeat_path
+        self._cadence_samples: list[dict] = []
         self._lines: list[str] = []
         self._max_kept = 5000
 
@@ -50,6 +60,9 @@ class LogPage(QWidget):
         save = QPushButton("Save to file...")
         save.clicked.connect(self._on_save)
 
+        report = QPushButton("Save diagnostic report...")
+        report.clicked.connect(self._on_report)
+
         clear = QPushButton("Clear")
         clear.clicked.connect(self._on_clear)
 
@@ -60,11 +73,17 @@ class LogPage(QWidget):
         row.addWidget(self.filter, 1)
         row.addWidget(self.hide_fps)
         row.addWidget(save)
+        row.addWidget(report)
         row.addWidget(clear)
         root.addWidget(bar)
 
         self.console = LogConsole()
         root.addWidget(self.console, 1)
+
+        self._sample_timer = QTimer(self)
+        self._sample_timer.setInterval(1000)
+        self._sample_timer.timeout.connect(self._sample_cadence)
+        self._sample_timer.start()
 
     # -- api ---------------------------------------------------------------
     def append(self, line: str) -> None:
@@ -109,6 +128,43 @@ class LogPage(QWidget):
             tell(self, "Could not save the log", str(exc), error=True)
         else:
             tell(self, "Log saved", chosen)
+
+    def _on_report(self) -> None:
+        if self._settings is None or self._heartbeat_path is None:
+            tell(self, "Report unavailable", "The runtime location is unknown.", error=True)
+            return
+        default = str(Path.home() / ("crash2-diagnostics-%s.json"
+                                     % datetime.now().strftime("%Y%m%d-%H%M%S")))
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostic report", default, "JSON files (*.json)")
+        if not chosen:
+            return
+        try:
+            source = (self._heartbeat_path() if callable(self._heartbeat_path)
+                      else self._heartbeat_path)
+            save_report(Path(chosen), self._settings, source,
+                        self._cadence_samples)
+        except OSError as exc:
+            tell(self, "Could not save report", str(exc), error=True)
+        else:
+            tell(self, "Report saved", chosen)
+
+    def _sample_cadence(self) -> None:
+        if self._heartbeat_path is None:
+            return
+        source = (self._heartbeat_path() if callable(self._heartbeat_path)
+                  else self._heartbeat_path)
+        sample = cadence_sample(source, datetime.now().timestamp())
+        if sample is None:
+            return
+        if self._cadence_samples:
+            prior = self._cadence_samples[-1]
+            if sample["frame_count"] == prior["frame_count"]:
+                return  # stale heartbeat from a stopped game
+            if sample["frame_count"] < prior["frame_count"]:
+                self._cadence_samples.clear()  # new session
+        self._cadence_samples.append(sample)
+        del self._cadence_samples[:-31]
 
     # -- internals ---------------------------------------------------------
     def _passes(self, line: str) -> bool:

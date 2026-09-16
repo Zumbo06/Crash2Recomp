@@ -1764,3 +1764,122 @@ until real UI controls existed - that guard did its job.
 scanlines per edge, and `distort_pct` - so a setting can be judged by number
 rather than by eye, and the whole space explored in one session instead of one
 game boot per value.
+
+## Frame cadence: Crash 2 presents at 30 Hz. Measured, 8 windows.
+
+Patch 0019. This is Phase 1 of `tuning/FEATURE-PLAN-60FPS-DIAGNOSTICS-CHEATS.md`
+and the gate everything else in that document depends on.
+
+### What was wrong before
+
+The FPS readout counts guest VBLANKS (`main.cpp`, "Count simulated vblanks
+rather than presents"), so it reports ~60 whether the game draws every VBlank or
+every other one. `NOTES.md` already said so at :210-216 and it was still the
+number everyone quoted.
+
+The only real evidence for 30 Hz was **one** measurement in **one** scene -
+:700-701, 982 world-render calls over 30 s of dark play during the Night Fight
+work, and that counted render dispatches, not frames reaching the screen.
+
+Meanwhile the launcher asserted the opposite in three places: a "guarded native
+59.94 Hz title patch". **No such patch exists** - nothing calls
+`psx_mod_set_native_vblank_rate` (its two state variables are write-only and it
+has zero callers repo-wide), `_build/Crash2Recomp/mods/` is empty, and
+`game.toml` declares no patch. Two of those comments also contradicted each
+other: `runtime.py:139` said "duplicate 30 Hz frames", `:131` said "native
+59.94 Hz update". Corrected in the same change; `smooth_60fps`, a launcher
+setting that reached no code at all, is deleted.
+
+### The counter that settles it
+
+`g_display_flip_count` in `gpu.c`, incremented in `gp1_display_area_start()`
+when the display base actually CHANGES. A double-buffered title flips this to
+show the buffer it just finished, so it counts **new images reaching the
+screen** - the one signal a static scene cannot fake. Counting presents answers
+a different question (the present path runs every VBlank regardless), and
+hashing pixels answers a third (identical pixels can follow a real update).
+
+Deliberately counts changes, not writes: games re-send GP1(05h) with the same
+value and that is not a new frame.
+
+Exposed with four existing counters through the new `frame_rates` debug command,
+which never conflates the five things all called "FPS":
+
+    vblank_raise    guest VBlanks raised (cycle-paced, 564480 cycles each)
+    vblank_deliver  ...actually taken by the guest as an exception
+    present_bodies  host present path runs
+    distinct_frames display base changed - a NEW image was scanned out
+    host_swaps      SDL_GL_SwapWindow calls
+
+`vblanks_per_frame = vblank_raise / distinct_frames` is the whole answer in one
+number: 1.0 means every VBlank, 2.0 means every other one.
+
+### Result
+
+Eight 6-second windows across the attract demo, scene complexity 0 to 4813
+GTE verts:
+
+    #   verts   vbl/s    frames/s  swaps/s  vbl/frame  note
+    1    465    60.12    29.98     29.98    2.006
+    2   2976    60.03    29.85     30.02    2.011
+    3   4065    59.91    26.72     26.88    2.242     dropped a few
+    4      0    59.96     7.97      7.81    7.521     load / 2D screen
+    5    947    59.99    29.83     30.00    2.011
+    6   4813    60.05    29.94     30.11    2.006
+    7   1488    59.91    29.87     30.04    2.006
+    8   4725    59.97    29.99     29.99    2.000
+
+**Crash 2 puts up a new image every other VBlank. 30 Hz, and it holds across
+scene complexity** - window 6 has ten times the geometry of window 1 and the
+same 2.006. Window 4 is a load/2D screen where the game legitimately updates
+the display far less often; window 3 is a transition that dropped a few frames.
+
+Two independent counters agree: `distinct_frames` comes from guest GP1(05h)
+register writes, `host_swaps` from host SDL calls, and both read ~30 while
+VBlanks hold at ~60.
+
+Frame pacing itself is excellent: p50 16.683 ms, p95 16.696, p99 16.718.
+
+### What this does NOT establish
+
+**Render cadence is 30 Hz. Simulation cadence is still open.** The game could
+update physics every VBlank and draw every other one; this counter cannot tell
+the difference, and that distinction is the whole point of the feature
+document's Phase 1.
+
+Counting entries to the named frame routines does not answer it either.
+`cyc_watch` on `CORE_Main 0x800117BC`, `CORE_Loop 0x80011800` and
+`CORE_VSync 0x8004A864` returned **zero hits** over 6 s each during live
+gameplay - these are entered once and loop internally, so there is no entry to
+count. The per-frame gate is something called from inside that loop and is not
+yet identified. That is the remaining Phase 1 work.
+
+### Consequences already visible
+
+1. **Interpolation is mis-parameterised.** `main.cpp` hands the interpolator the
+   VBLANK rate as its `source_hz`. The game produces 30 distinct images per
+   second, so half the "source" frames are byte-identical duplicates and the
+   crossfade blends a frame against itself half the time. Fixing it means
+   feeding the measured distinct-frame rate instead.
+2. **`PSX_SMOOTH_60FPS` was right about the game and wrong about the fix.** Its
+   duplicate-frame detection existed precisely because the guest repeats frames
+   - which is now confirmed - but it is a pixel blend, superseded by the
+   interpolation path, and its launcher setting reached no code. Deleted.
+3. **The deadline threshold needs slack.** `frame_rates` first defaulted the
+   missed-deadline budget to exactly the frame period and reported 130 of 256
+   frames "over budget" on a run whose p99 was 16.718 ms. At exactly the period
+   the host frame time IS the pacer period, so about half a healthy run lands
+   microseconds above it. Default is now 1.5x.
+
+### Tooling note
+
+`frame_perf` gained p50/p95/p99 and an over-deadline count
+(`gl_renderer_perf_percentiles`), kept separate from `gl_renderer_perf_aggregate`
+because that function's `out[18]` is indexed positionally by its caller and
+widening it would silently renumber every field.
+
+**This is developer-only.** `gl_perf_init()` returns immediately under
+`PSX_NO_DEBUG_TOOLS`, so release builds have no perf ring and no percentiles.
+Any player-facing report must be built on `psx_freeze_heartbeat.json` instead -
+that writer is explicitly NOT gated, runs in release, and already carries ~60
+counters plus a 64-entry ring.

@@ -1,0 +1,37 @@
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7931,3 +7931,31 @@
+ }
+ 
++/* Developer-only, reversible SCUS-94154 frame-gate ablation. This does not
++ * constitute a 60 FPS feature: it can double game speed and break scripts.
++ * The debug server is absent from release builds. */
++static void handle_crash2_frame_gate(int id, const char *json)
++{
++    const uint32_t addr = 0x8001685Cu;
++    const uint32_t original = 0x2C630019u; /* sltiu v1,v1,25 */
++    const uint32_t skipped = 0x24030000u;  /* addiu v1,zero,0 */
++    uint32_t current = psx_read_word(addr);
++    if (psx_read_word(0x80016838u) != 0x0C012921u ||
++        psx_read_word(0x80016860u) != 0x10600003u ||
++        psx_read_word(0x80016868u) != 0x0C012921u ||
++        (current != original && current != skipped)) {
++        send_err(id, "SCUS-94154 frame gate signature mismatch");
++        return;
++    }
++    int enabled = json_get_int(json, "enabled", -1);
++    if (enabled >= 0) {
++        extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++        uint32_t wanted = enabled ? skipped : original;
++        if (current != wanted) psx_mod_write_code_word(addr, wanted);
++        current = psx_read_word(addr);
++    }
++    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,"
++             "\"instruction\":\"0x%08X\"}",
++             id, current == skipped ? "true" : "false", current);
++}
++
+ /* Pan & Scan dial, live so the crop can be tuned by eye in one session instead
+@@ -13656,1 +13684,2 @@
+     { "frame_rates",       handle_frame_rates },
++    { "crash2_frame_gate", handle_crash2_frame_gate },

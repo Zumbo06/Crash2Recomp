@@ -556,10 +556,10 @@ class SettingsPage(QWidget):
                 row("V-sync", self.vsync),
                 self.interp,
                 row("Interpolation target", self.interp_fps),
-                dim("The game simulates at a fixed 59.94 Hz. Interpolation only "
-                    "changes how many frames are PRESENTED - it blends between "
-                    "real frames rather than adding simulation, so judge it by "
-                    "eye."),
+                dim("Interpolation changes only how many frames are PRESENTED. "
+                    "It blends between frames the game already drew and adds no "
+                    "simulation, so the game does not become more responsive - "
+                    "judge it by eye."),
             ),
             card(
                 section("Execution"),

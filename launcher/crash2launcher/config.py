@@ -196,7 +196,6 @@ class Settings:
     frame_interpolation: bool = False
     # 0 = follow the host panel; otherwise must be >= 90 or the runtime ignores it.
     frame_interpolation_fps: int = 0
-    smooth_60fps: bool = False
     frame_blend: bool = False
 
     # --- performance ------------------------------------------------------

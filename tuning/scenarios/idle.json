@@ -1,0 +1,10 @@
+{
+  "name": "idle-input-route",
+  "require_game_loop": true,
+  "expected_game_loop_hz": [25, 35],
+  "steps": [
+    {"frames": 45, "buttons": "0xFFFF"},
+    {"frames": 45, "buttons": "0xFFBF"},
+    {"frames": 45, "buttons": "0xFFFF"}
+  ]
+}

@@ -1,0 +1,23 @@
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -21,1 +21,4 @@
+ extern uint64_t s_frame_count;                 /* debug_server.c */
++extern unsigned long long crash2_sim_tick_count(void); /* SCUS-94154 main loop */
++extern uint64_t g_display_flip_count;          /* gpu.c */
++extern uint64_t g_gl_swap_total;                /* gpu_gl_renderer.c */
+@@ -858,6 +861,9 @@
+     int n = snprintf(buf, sizeof(buf),
+         "{\n"
+         "  \"backend\":\"%s\",\n"
+        "  \"wall_clock_epoch\":%lld,\n"
+        "  \"frame_count\":%llu,\n"
++        "  \"game_loop_count\":%llu,\n"
++        "  \"display_flip_count\":%llu,\n"
++        "  \"host_swap_count\":%llu,\n"
+         "  \"psx_cycle_count\":%llu,\n"
+@@ -924,2 +930,5 @@
+         wall,
+         (unsigned long long)frame,
++        (unsigned long long)crash2_sim_tick_count(),
++        (unsigned long long)g_display_flip_count,
++        (unsigned long long)g_gl_swap_total,

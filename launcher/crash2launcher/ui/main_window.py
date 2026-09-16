@@ -101,7 +101,10 @@ class MainWindow(QWidget):
         self.setup_page = SetupPage(layout_, settings)
         self.play_page = PlayPage(layout_, settings, self.session)
         self.settings_page = SettingsPage(settings)
-        self.log_page = LogPage()
+        self.log_page = LogPage(
+            settings,
+            lambda: ((self.session.last_plan.cwd if self.session.last_plan
+                      else layout_.runtime_exe.parent) / "psx_freeze_heartbeat.json"))
         self.advanced_page = AdvancedPage(settings)
 
         # Stack order is independent of the nav order now; _select maps.

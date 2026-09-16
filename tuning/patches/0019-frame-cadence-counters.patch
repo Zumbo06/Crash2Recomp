@@ -1,0 +1,238 @@
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -5335,12 +5335,29 @@
+     dma_direction = val & 3;
+ }
+ 
++/* Distinct scanned-out frames: one per actual change of the display base.
++ *
++ * A double-buffered title flips this to show the buffer it just finished
++ * drawing, so a change here means "a NEW image reached the screen" - which is
++ * the one signal a static scene cannot fake. Counting presents or hashing
++ * pixels both answer a different question: the present path runs every VBlank
++ * whether or not the game drew anything, and identical pixels can follow a
++ * perfectly real update.
++ *
++ * Deliberately counts CHANGES, not writes: games re-send GP1(05h) with the same
++ * value, and that is not a new frame. Free in release - two compares and an
++ * increment, no allocation, no gating. */
++uint64_t g_display_flip_count = 0;
++
+ static void gp1_display_area_start(uint32_t val) {
+     /* GP1(05h): Start of display area in VRAM
+      * bits 0-9: X (in halfwords, 0-1023)
+      * bits 10-18: Y (0-511) */
+-    display_area_x = val & 0x3FF;
+-    display_area_y = (val >> 10) & 0x1FF;
++    const uint32_t nx = val & 0x3FF;
++    const uint32_t ny = (val >> 10) & 0x1FF;
++    if (nx != display_area_x || ny != display_area_y) g_display_flip_count++;
++    display_area_x = nx;
++    display_area_y = ny;
+     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
+ }
+ 
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -651,6 +651,8 @@
+ /* Post-load freeze probe (main.cpp): accumulate skip/swap/dirty marks. */
+ static uint64_t s_probe_skip = 0;
+ static uint64_t s_probe_swap = 0;
++/* Monotonic host-swap total (see gl_swap_with_osd). Never reset. */
++uint64_t g_gl_swap_total = 0;
+ static uint64_t s_probe_dirty_marks = 0;
+ 
+ static void present_dirty_rect(int x0, int y0, int x1, int y1, int set) {
+@@ -3961,6 +3963,53 @@
+     return n;
+ }
+ 
++/* Frame-time percentiles over the same ring the averages come from.
++ *
++ * A single average hides exactly the thing that is worth knowing: an average of
++ * 16.6 ms is equally consistent with a steady 60 fps and with half the frames
++ * at 8 ms and half at 25 ms, and only the second is visible as stutter. p95/p99
++ * and a count of frames over the budget say which one you have.
++ *
++ * Kept OUT of gl_renderer_perf_aggregate's out[18]: that array is indexed
++ * positionally by handle_frame_perf, so widening it would silently renumber
++ * every field. Sorting a copy of at most GLPERF_RING doubles is cheap and only
++ * happens when a diagnostic asks.
++ *
++ * out[0]=p50 out[1]=p95 out[2]=p99 out[3]=frames over budget_ms. Returns the
++ * sample count, 0 if perf sampling is off (it is compiled out in release). */
++static int glperf_cmp_double(const void *a, const void *b) {
++    const double x = *(const double *)a, y = *(const double *)b;
++    return (x > y) - (x < y);
++}
++
++int gl_renderer_perf_percentiles(int wide_filter, double budget_ms, double out[4]) {
++    for (int i = 0; i < 4; i++) out[i] = 0.0;
++    if (!s_pf_on) return 0;
++    double v[GLPERF_RING];
++    int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
++    uint64_t start = s_pf_ring_seq - (uint64_t)navail;
++    int n = 0, over = 0;
++    for (int i = 0; i < navail; i++) {
++        const GlPerfSample *s = &s_pf_ring[(start + i) % GLPERF_RING];
++        if (wide_filter >= 0 && s->wide != wide_filter) continue;
++        if (budget_ms > 0.0 && s->total_ms > budget_ms) over++;
++        v[n++] = s->total_ms;
++    }
++    if (n <= 0) return 0;
++    qsort(v, (size_t)n, sizeof(double), glperf_cmp_double);
++    /* Nearest-rank: index = ceil(p*n) - 1, clamped. Exact for small n, which
++     * matters here because the ring holds only 256 frames (~4 s). */
++    const double pct[3] = { 0.50, 0.95, 0.99 };
++    for (int k = 0; k < 3; k++) {
++        int idx = (int)((pct[k] * (double)n) + 0.999999) - 1;
++        if (idx < 0) idx = 0;
++        if (idx >= n) idx = n - 1;
++        out[k] = v[idx];
++    }
++    out[3] = (double)over;
++    return n;
++}
++
+ /* Native-wide mirror ablation (perf attribution): see s_ws_ablate. */
+ void gl_renderer_set_ws_ablate(int mode) { s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
+ int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
+@@ -4262,6 +4311,11 @@
+         }
+     }
+     host_osd_present_done();
++    /* Every host swap in the GL backend funnels through here - this is the
++     * only SDL_GL_SwapWindow call in the file. Monotonic on purpose:
++     * s_probe_swap next to it is ZEROED by present_probe_take(), which the
++     * savestate probe consumes, so it cannot answer "swaps per second". */
++    g_gl_swap_total++;
+     SDL_GL_SwapWindow(s_win);
+ }
+ 
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -238,7 +238,16 @@
+  * [14]=CPU wall in glb_wide_* avg, [15]=batches/frame avg, [16]=wide target
+  * sets/frame avg, [17]=wide FBO creations/frame avg. GPU phases are true
+  * GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
++/* Monotonic count of host buffer swaps. Distinct from the guest's frame rate
++ * and from the present-probe counters, which get zeroed by their consumer. */
++extern uint64_t g_gl_swap_total;
++
+ int gl_renderer_perf_aggregate(int wide_filter, double out[18]);
++/* Frame-time percentiles from the same ring: out[0]=p50 out[1]=p95 out[2]=p99,
++ * out[3]=frames whose total exceeded budget_ms. Returns the sample count (0 when
++ * perf sampling is off, which it always is in a release build). Separate from
++ * the aggregate because out[18] above is indexed positionally by its caller. */
++int gl_renderer_perf_percentiles(int wide_filter, double budget_ms, double out[4]);
+ 
+ /* Native-wide mirror ablation (perf attribution, debug cmd gl_ws_ablate):
+  * 0 = normal, 1 = skip the whole mirror pass (incl. wide_clear), 2 = full mirror
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -44,6 +44,7 @@
+ #include "card_data_writes.h"
+ #include "crash_trace.h"
+ #include "gpu_gl_renderer.h"
++#include "host_time.h"   /* psx_host_mono_ms - frame_rates window */
+ #include "lockstep.h"
+ 
+ #include <stdio.h>
+@@ -7832,6 +7833,89 @@
+              id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
+ }
+ 
++/* frame_rates: the five cadences, separated, over one measured window.
++ *
++ * The existing FPS readout counts guest VBLANKS (main.cpp, "Count simulated
++ * vblanks rather than presents"), so it reports ~60 whether the game updates
++ * every VBlank or every other one. That is the question this answers, by never
++ * conflating the five things that all get called "FPS":
++ *
++ *   vblank_raise    guest VBlanks raised   (cycle-paced, 564480 cycles each)
++ *   vblank_deliver  ...actually taken by the guest as an exception
++ *   present_bodies  host present path runs (once per raised VBlank)
++ *   distinct_frames display base actually CHANGED - a new image was scanned out
++ *   host_swaps      SDL_GL_SwapWindow calls
++ *
++ * distinct_frames is the load-bearing one: a double-buffered title flips the
++ * display base to show the buffer it just finished, so this counts new images
++ * and not repeats. If it reads ~30 while vblank_raise reads ~60, the game
++ * renders every other VBlank.
++ *
++ *   frame_rates              -> rates since the baseline
++ *   frame_rates {"reset":1}  -> re-baseline now (call this, play, call again)
++ *
++ * Percentiles come from the GL perf ring and are 0 when it is off (always, in a
++ * release build). budget_ms defaults to the 59.94 Hz frame budget. */
++static uint64_t s_fr_base_ms = 0;
++static uint64_t s_fr_base_raise, s_fr_base_deliver, s_fr_base_present;
++static uint64_t s_fr_base_flip, s_fr_base_swap;
++
++static void frame_rates_baseline(void)
++{
++    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
++    extern uint64_t g_display_flip_count;
++    s_fr_base_ms      = psx_host_mono_ms();
++    s_fr_base_raise   = g_vblank_raise_count;
++    s_fr_base_deliver = g_vblank_deliver_count;
++    s_fr_base_present = s_frame_count;
++    s_fr_base_flip    = g_display_flip_count;
++    s_fr_base_swap    = g_gl_swap_total;
++}
++
++static void handle_frame_rates(int id, const char *json)
++{
++    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
++    extern uint64_t g_display_flip_count;
++    const double budget = (double)json_get_int(json, "budget_ms", 0);
++    if (json_get_int(json, "reset", 0) || s_fr_base_ms == 0) {
++        frame_rates_baseline();
++        send_fmt("{\"id\":%d,\"ok\":true,\"baseline\":true}", id);
++        return;
++    }
++    const uint64_t now = psx_host_mono_ms();
++    const double secs = (double)(now - s_fr_base_ms) / 1000.0;
++    if (secs <= 0.0) { send_err(id, "window too short; wait and retry"); return; }
++
++    const double raise_s   = (double)(g_vblank_raise_count   - s_fr_base_raise)   / secs;
++    const double deliver_s = (double)(g_vblank_deliver_count - s_fr_base_deliver) / secs;
++    const double present_s = (double)(s_frame_count          - s_fr_base_present) / secs;
++    const double flip_s    = (double)(g_display_flip_count   - s_fr_base_flip)    / secs;
++    const double swap_s    = (double)(g_gl_swap_total        - s_fr_base_swap)    / secs;
++
++    /* Default the deadline to 1.5x the frame period, not 1.0x. At exactly the
++     * period the host frame time IS the pacer period, so roughly half of a
++     * healthy run lands microseconds above it and "over budget" reads ~50% on a
++     * perfectly paced game (measured: 130/256 with p99 at 16.718 ms). A missed
++     * deadline worth reporting is one that cost a frame. */
++    double p[4] = {0,0,0,0};
++    const int psamples = gl_renderer_perf_percentiles(
++        -1, budget > 0.0 ? budget : (1.5 * 1000.0 / 59.94), p);
++
++    /* vblanks_per_frame is the whole answer in one number: 1.0 = the game put a
++     * new image up every VBlank, 2.0 = every other one. */
++    const double vpf = flip_s > 0.0 ? raise_s / flip_s : 0.0;
++
++    send_fmt("{\"id\":%d,\"ok\":true,\"seconds\":%.3f,"
++             "\"vblank_raise\":%.2f,\"vblank_deliver\":%.2f,"
++             "\"present_bodies\":%.2f,\"distinct_frames\":%.2f,"
++             "\"host_swaps\":%.2f,\"vblanks_per_frame\":%.3f,"
++             "\"speed\":%.3f,\"perf_samples\":%d,"
++             "\"frame_ms_p50\":%.3f,\"frame_ms_p95\":%.3f,"
++             "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
++             id, secs, raise_s, deliver_s, present_s, flip_s, swap_s, vpf,
++             raise_s / 59.94, psamples, p[0], p[1], p[2], (int)p[3]);
++}
++
+ /* Pan & Scan dial, live so the crop can be tuned by eye in one session instead
+  * of one game boot per value:
+  *   present_fit                    -> current zoom/pan
+@@ -13527,6 +13611,7 @@
+     { "present_ring",      handle_present_ring },
+     { "present_fit",       handle_present_fit },
+     { "frame_perf",        handle_frame_perf },
++    { "frame_rates",       handle_frame_rates },
+     { "gl_ws_ablate",      handle_gl_ws_ablate },
+     { "gl_interp",         handle_gl_interp },
+     { "gl_wide_fast",      handle_gl_wide_fast },

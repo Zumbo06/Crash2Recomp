@@ -128,17 +128,31 @@ def _build_env(settings: Settings) -> dict[str, str]:
     env["PSX_VSYNC"] = str(settings.vsync)
 
     # The current high-refresh compositor is implemented by the OpenGL path.
-    # It is presentation interpolation above the game's native 59.94 Hz update,
-    # never a guest-clock multiplier.
+    # It is presentation interpolation, never a guest-clock multiplier: it
+    # blends between frames the game produced and adds no simulation.
+    #
+    # It does NOT know how often Crash 2 actually updates. The runtime hands the
+    # interpolator the VBLANK rate as its source rate (main.cpp, the
+    # gl_renderer_set_interpolation call), which is only correct if the game
+    # renders every VBlank. That has never been measured for this title - see
+    # tuning/NOTES.md "frame cadence". If it renders every OTHER VBlank, half
+    # the source frames are byte-identical and the crossfade blends a frame
+    # against itself.
     if settings.frame_interpolation and settings.renderer == "opengl":
         env["PSX_FRAME_INTERPOLATION"] = "1"
         # Only 0 (follow host) or >= 90 is accepted; clamp() already enforced it.
         if settings.frame_interpolation_fps:
             env["PSX_FRAME_INTERPOLATION_FPS"] = str(settings.frame_interpolation_fps)
 
-    # PSX_SMOOTH_60FPS blended duplicate 30 Hz frames. Crash 2 now has a guarded
-    # native 59.94 Hz title patch, so enabling that legacy blend would only blur
-    # already-distinct frames.
+    # Narrow by construction: the runtime only applies PSX_FRAME_BLEND on the
+    # software present path (it requires !gl_active), so with the default
+    # OpenGL renderer this env var is accepted and then ignored. Kept because
+    # it is real for a software-renderer run; not surfaced in the UI.
+    #
+    # An earlier comment here claimed Crash 2 had "a guarded native 59.94 Hz
+    # title patch". No such patch exists: nothing calls
+    # psx_mod_set_native_vblank_rate, the mods directory is empty, and game.toml
+    # declares no patch. The game's update cadence is simply unmeasured.
     if settings.frame_blend:
         env["PSX_FRAME_BLEND"] = "1"
 
@@ -455,6 +469,7 @@ class GameSession(QObject):
         self.proc.finished.connect(lambda code, _st: self.finished.emit(code))
         self.proc.errorOccurred.connect(self._on_error)
         self._buf = ""
+        self.last_plan: LaunchPlan | None = None
 
     def launch(self, plan: LaunchPlan) -> None:
         if not plan.program.is_file():
@@ -463,6 +478,7 @@ class GameSession(QObject):
                 "Build it first, or reinstall the bundle."
             )
             return
+        self.last_plan = plan
         self.proc.setWorkingDirectory(str(plan.cwd))
         if plan.env:
             qenv = QProcessEnvironment.systemEnvironment()
