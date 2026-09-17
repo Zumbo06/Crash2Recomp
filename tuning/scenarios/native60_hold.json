@@ -1,0 +1,13 @@
+{
+  "name": "native60-holds-sixty",
+  "require_game_loop": true,
+  "native_60fps": true,
+  "cpu_percent": 125,
+  "expected_game_loop_hz": [54, 62],
+  "min_one_field_pct": 85,
+  "min_speed": 0.95,
+  "max_backoffs": 0,
+  "steps": [
+    {"frames": 300, "buttons": "0xFFFF"}
+  ]
+}

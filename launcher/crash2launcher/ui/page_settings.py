@@ -538,6 +538,10 @@ class SettingsPage(QWidget):
                                       self.settings.frame_interpolation_fps,
                                       self._on_interp_fps)
 
+        self.native_60fps = QCheckBox("60 FPS game updates")
+        self.native_60fps.setChecked(self.settings.native_60fps)
+        self.native_60fps.toggled.connect(self._on_native_60fps)
+
         self.native_overlays = QCheckBox("Compile level code natively")
         self.native_overlays.setChecked(self.settings.native_overlays)
         self.native_overlays.toggled.connect(self._on_native_overlays)
@@ -560,6 +564,18 @@ class SettingsPage(QWidget):
                     "It blends between frames the game already drew and adds no "
                     "simulation, so the game does not become more responsive - "
                     "judge it by eye."),
+            ),
+            card(
+                section("Game update rate"),
+                self.native_60fps,
+                dim("Runs Crash 2's own game loop at 60 instead of 30. This is "
+                    "the simulation, not a smoothing filter: the game removes "
+                    "the second VSync wait it uses to round every frame up to "
+                    "two fields, and its own frame-time compensation keeps "
+                    "world speed the same. The emulated PS1 CPU runs at 125% "
+                    "so a frame's work fits; scenes that still do not fit fall "
+                    "back to 30 the way they do on hardware. Takes effect on "
+                    "the next launch."),
             ),
             card(
                 section("Execution"),
@@ -656,6 +672,7 @@ class SettingsPage(QWidget):
         self.geom.setChecked(self.settings.geometry_correction)
         self.persp.setChecked(self.settings.perspective_texturing)
         self.interp.setChecked(self.settings.frame_interpolation)
+        self.native_60fps.setChecked(self.settings.native_60fps)
         self._loading = False
         self._sync_dependent_controls()
         self._refresh_preset_label()
@@ -776,6 +793,10 @@ class SettingsPage(QWidget):
 
     def _on_developer_mode(self, on: bool) -> None:
         self.settings.developer_mode = on
+        self._touch()
+
+    def _on_native_60fps(self, on: bool) -> None:
+        self.settings.native_60fps = on
         self._touch()
 
     def _on_merge(self, on: bool) -> None:

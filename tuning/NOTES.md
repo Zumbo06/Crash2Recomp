@@ -1883,3 +1883,195 @@ widening it would silently renumber every field.
 Any player-facing report must be built on `psx_freeze_heartbeat.json` instead -
 that writer is explicitly NOT gated, runs in release, and already carries ~60
 counters plus a 64-entry ring.
+
+## Native 60 FPS: the lock is one instruction, and the engine already compensates
+
+The earlier cadence work stopped at "the game presents at 30 Hz and a gate
+ablation reaches 60 in a quiet room", with the open question being whether a
+60 Hz loop would simply run the game at double speed. It does not, and the
+reason is in the game's own code.
+
+**The time base.** `0x800156A0` opens event `0xF2000002` on handler
+`0x8003BE88` and calls `SetRCnt` with target `0x1000`. Root counter 2 at system
+clock / 8 is 4233600 Hz, so that handler - three instructions that do
+`[0x8003BEA4]++` - fires at 4233600/4096 = **1033.6 Hz**. One NTSC field is
+~17.24 ticks. Every timing constant in the engine is in that unit, and they all
+suddenly read as field counts: the gate's `25` is halfway between one field and
+two, the deterministic clock's `+34` at `0x800168D0` is two fields, and the
+forced `17` at `0x800167F4` is one.
+
+**The lock.** `func_8001658C` always calls `VSync(0)` at `0x80016838`. The
+`sltiu v1,v1,25` at `0x8001685C` can send it to a *second* `VSync(0)` at
+`0x80016868` - "if the last frame was shorter than a field and a half, round it
+up to two". That second wait is the entire 30 Hz lock.
+
+**The compensation, which was there all along.** `0x80016F04` is a quantizer:
+`<19 -> 17`, `<36 -> 34`, `<53 -> 51`, else pass through. `0x8001697C` stores
+its result in the draw buffer at +20, and the motion sites read it straight
+back - `0x8001D400`, `0x8001D9D4` and `0x8001DADC` are all
+`clamp(db[20], <=102)`, then `(velocity * that) >> 10`. That is why Crash does
+not slow down when a busy scene drops to 20 FPS, and it is exactly what a 60 Hz
+loop needs: `db[20]` becomes 17 instead of 34, per-frame displacement halves,
+and a second covers the same ground. The "no compensation field has been
+verified" line in 60FPS-FINDINGS.md was wrong only in that nobody had looked
+for it.
+
+**Why the first wait stays.** With it, a frame whose work does not fit in one
+field lands on the next VBlank and the engine falls back to 30 or 20 the way it
+does on hardware, with `db[20]` following. That is why the shipped mode opens
+only the gate. `crash2_no_wait_probe` removes both and is uncapped - it was
+measured at 67 loops/s against 60 VBlanks, which is not a frame rate, it is the
+game running fast.
+
+**Why the CPU clock goes with it.** The gate-only fallback at the Turtle Woods
+crates is a guest budget problem: median 646,373 and p95 672,072 loop cycles
+against 564,480 per field. So the mode also raises the CPU-only clock to 125%
+and leaves VBlank, CD, SPU and the timers alone - including RCnt2, or the
+engine's own frame time would be measured against a different second.
+`frame_rates` reports `guest_ticks_per_s` so that assumption is checked rather
+than asserted.
+
+### Consequences
+
+- `psx_cycles.c`, `psx_cyc.h` and `overlay_loader.c` no longer hide the CPU
+  clock behind `PSX_NO_DEBUG_TOOLS`. A 60 FPS setting that only worked in the
+  diagnostics build would not be a feature. Overlay DLLs route through the same
+  wrapper in both builds now - they were the majority of the work, so scaling
+  only the main executable would have been a half-applied clock.
+- `game_frame_ticks` is the field to read, not the loop rate. 60 loops a second
+  with it still at 34 is double speed; 60 with 17 is 60 FPS.
+- The world-speed A/B was attempted with savestates and removed. It read RAM
+  after requesting a save, ran the route, then reloaded and read again - but
+  the emulator keeps running between a savestate request and its completion at
+  the next safe boundary, so the two "same" worlds never were, and the run
+  aborted on its own sanity check. A replacement has to hold the machine still
+  across each read (`pause`/`continue`) or compare each run against its own
+  measured start. The compensation above is still read from the code, not
+  measured in play.
+
+## Native 60 FPS, part 2: a mode that is only 60 where 60 is actually stable
+
+The first build of the mode was played and was not good. Measured on this
+machine: **Snow Go 55-56 loops/s and stable, Turtle Woods 45-50 on average
+with dips below 30**. A measured 300-frame route in the bad case read 48.49
+loops/s at `speed` 1.0 and 1.236 VBlanks per new image - ~76% of frames on one
+field, against Snow Go's ~93%.
+
+Two distinct faults, and neither is the "guest ran out of budget, fall back to
+30" case the design already relied on.
+
+**1. Host overrun is not frame drop.** The claim that the surviving first
+`VSync(0)` makes the mode degrade gracefully is only true of the *guest*
+budget. When the *host* cannot keep up, an emulator does not drop guest frames
+- guest time dilates. VBlank itself arrives late, `speed` goes below 1.0, and
+the whole machine including audio runs slow. That is worse than the 30 Hz lock
+being removed, and it is the "below 30" in the report.
+
+**2. The one-field boundary is its own failure.** With the gate open a frame
+costs one field if its work fits and two if it does not. A scene sitting *on*
+that line alternates, and three things go wrong together: presentation
+alternates 16.7/33.4 ms; the engine's compensation reads `db_prev[20]`, the
+PREVIOUS frame's field count, so the motion scale lands a frame late; and the
+average is a number like 47 that no display period divides. This is the 45-50.
+A clean 30 is better to watch than a ragged 47, and the game locks itself to
+that clean 30 without being asked.
+
+So `crash2_60fps.h` now judges a one-second window on both - guest VBlank
+against the wall clock, and the share of frames the engine simulated as one
+field (>= 85%, which sits between Turtle Woods' measured 76% and Snow Go's
+93%, and puts the line near 52 loops/s). A host failure drops the CPU headroom first, because the headroom is
+exactly what costs the host its extra guest instructions. Anything else closes
+the gate. Retry is 8 s doubling to a 64 s cap, and ten seconds of sustained 60
+clears the penalty and earns the headroom back. `PSX_CRASH2_60FPS_HOLD_PCT=0`
+turns the hold check off for anyone who prefers the ragged 47; it is not in the
+launcher UI.
+
+Windows with fewer than 20 loops are not judged on hold at all - a load or 2D
+screen legitimately updates about eight times a second, and that is not a
+failing scene.
+
+### The other defect this turned up
+
+`psx_crash2_cpu_clock_charge` did `numerator % pct` and `numerator / pct` on a
+64-bit value, **per cycle charge** - once per basic block of guest code. That
+was written for short debugtools measurements where nothing depended on its
+cost. Moving the clock scale into the release build put two 64-bit divisions in
+the emulator's hottest path, in the one mode whose entire problem is host
+throughput. It is a 32.32 reciprocal computed once in `psx_crash2_cpu_clock_set`
+now; the fractional carry still makes the long-run rate exact.
+
+### Testing moved into the scenario runner
+
+`gameplay_smoke.py` scenarios can now ask for the mode (`"native_60fps"`) and
+assert it (`expected_game_frame_ticks`, `min_speed`, `max_backoffs`), and the
+mode is set before the route and cleared afterwards whatever happens. Route
+segments are consumed per guest VBlank, so a 60 Hz run and a 30 Hz run of the
+same scenario still cover the same real time. `native60_sustain.json` is the
+regression test for this whole section: it asserts only that the game never
+runs *slow*, so Turtle Woods has to pass it by falling back to 30.
+
+The runner also refuses a runtime that does not report the guard's fields. The
+first scenario run went against a debugtools binary that had failed to relink -
+the game was running and holds its own .exe - so it measured the pre-guard code
+and reported it as a plain failure. A stale build answers every command; it has
+to be caught by what it does *not* answer.
+
+That run did confirm the time base from part 1 outright: `guest_ticks_per_s`
+came back **1030** against the predicted 1033.6, and stock `game_frame_ticks`
+**34**, which is the value the motion sites multiply by.
+
+A separate savestate A/B script for world speed was written and deleted. It
+compared a RAM window before and after reloading a state, but a savestate
+request only completes at the next safe boundary and the emulator keeps running
+until then, so the two snapshots were different worlds and the script failed its
+own sanity check. Holding the machine still across the reads, or giving each run
+its own measured baseline, is what a replacement needs.
+
+## Native 60 FPS, part 3: it lands, and most of the win was a division
+
+`native60_hold.json` passes: **59.9 loops/s, 59.9 new images/s, 1.000 VBlanks
+per frame, 100% of frames on one field, `game_frame_ticks` 17, `speed` 0.999,
+`guest_ticks_per_s` 1029.95**, host frame p95 20.8 ms with nothing over budget.
+
+The instructive part is where that came from. The same 300-frame route measured
+**48.49** loops/s before the cycle-charge fix and **59.9** after. The guard did
+not do that - the guard only decides between 60 and a clean 30. Removing two
+64-bit divisions from `psx_crash2_cpu_clock_charge`, which ran once per basic
+block of guest code, was worth about eleven frames a second on its own. The
+lesson is narrow and worth keeping: a helper written for a debugtools
+measurement has no performance budget attached to it, and moving one into the
+player path without re-reading it is how a feature ends up blaming the wrong
+thing. The first diagnosis here was "the host cannot do 2.5x the work", and
+part of the host's work was arithmetic this code had no reason to be doing.
+
+`game_frame_ticks` 17 at 59.9 loops/s is also the engine-side confirmation of
+part 1: the quantizer at `0x80016F04` is emitting one field, which is the value
+`0x8001D400`, `0x8001D9D4` and `0x8001DADC` multiply velocity by. World speed
+is now read from the code AND confirmed by the number the code uses; only the
+end-to-end displacement A/B is outstanding.
+
+### Demo playback is suspended, not backed off
+
+`0x8006CD14` is the engine's timing mode, and its writers name it: 2 for demo
+playback (`0x8002FD10`, which sets the recorded stream up on the next
+instructions), 3 for recording (`0x8002FF34`), 4 when a demo ends
+(`0x80015D60`), 0 for live play (`0x80015D90`, `0x8001F9EC`, `0x8002FCDC`). In
+playback the clock is taken from the recording at `0x80016940` instead of the
+root counter, so the loop rate decides how fast the recorded timeline is
+consumed. The gate is therefore held closed while that word is non-zero.
+
+Deliberately a suspension and not a fall-back: no back-off counted, no retry
+delay, and it returns the instant live play does. Reported separately as
+`native_60fps_demo_mode`, because an attract loop counted as "this scene could
+not hold 60" would send someone chasing performance that was never the problem.
+
+### The world-speed A/B, second attempt
+
+`fps_speed.py` is back, built on the constraint that killed the first one: this
+framework has no pause - `handle_pause` answers "pause is removed; query a ring
+buffer instead" - so nothing can hold the machine still across a RAM read, and
+a savestate is applied at the next safe boundary with the emulator running
+until then. Demanding a shared starting world was therefore never satisfiable.
+It now measures each leg against its own baseline with the same settle on both
+sides, and compares travel, not positions. A few frames of drift against a
+four-second route is noise once the ratio is taken over many words.

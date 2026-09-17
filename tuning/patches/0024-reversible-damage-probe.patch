@@ -1,0 +1,36 @@
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7959,3 +7959,30 @@
+ }
+ 
++/* Developer-only probe for the published SCUS-94154 invincibility branch.
++ * This may suppress pickups/other collisions too; it is not a shipped cheat. */
++static void handle_crash2_damage_probe(int id, const char *json)
++{
++    const uint32_t addr = 0x8001CE34u;
++    const uint32_t original = 0x14400005u; /* bne v0,zero,CE4C */
++    const uint32_t bypass = 0x10000005u;   /* beq zero,zero,CE4C */
++    uint32_t current = psx_read_word(addr);
++    if (psx_read_word(0x8001CE30u) != 0x2C420002u ||
++        psx_read_word(0x8001CE38u) != 0x34A21002u ||
++        psx_read_word(0x8001CE40u) != 0x14620003u ||
++        (current != original && current != bypass)) {
++        send_err(id, "SCUS-94154 damage branch signature mismatch");
++        return;
++    }
++    int enabled = json_get_int(json, "enabled", -1);
++    if (enabled >= 0) {
++        extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++        uint32_t wanted = enabled ? bypass : original;
++        if (current != wanted) psx_mod_write_code_word(addr, wanted);
++        current = psx_read_word(addr);
++    }
++    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,"
++             "\"instruction\":\"0x%08X\"}",
++             id, current == bypass ? "true" : "false", current);
++}
++
+ /* Pan & Scan dial, live so the crop can be tuned by eye in one session instead
+@@ -13684,1 +13711,2 @@
+     { "crash2_frame_gate", handle_crash2_frame_gate },
++    { "crash2_damage_probe", handle_crash2_damage_probe },

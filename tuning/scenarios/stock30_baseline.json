@@ -1,0 +1,11 @@
+{
+  "name": "stock30-baseline",
+  "require_game_loop": true,
+  "native_60fps": false,
+  "expected_game_loop_hz": [25, 35],
+  "expected_game_frame_ticks": 34,
+  "min_speed": 0.95,
+  "steps": [
+    {"frames": 300, "buttons": "0xFFFF"}
+  ]
+}

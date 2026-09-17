@@ -1,0 +1,670 @@
+Native 60 FPS for SCUS-94154: open the game's own 30 Hz frame gate, reuse the
+engine's existing frame-time compensation, give the guest CPU the headroom a
+60 Hz frame needs, and close the gate again whenever the machine cannot
+actually sustain it. Present in BOTH builds - the release runtime is the one
+players run - and driven by PSX_CRASH2_60FPS from the launcher setting.
+
+New runtime/src/crash2_60fps.h carries the full reasoning. In short:
+func_80016F04 already snaps each measured frame time to whole NTSC fields and
+the motion sites multiply by it, so a 60 Hz loop halves per-frame displacement
+instead of doubling world speed - but a scene that sits ON the one-field
+boundary alternates between one and two fields, which measured 45-50 loops/s
+in Turtle Woods and looked worse than the 30 the game locks itself to. The
+sustain guard gives those scenes their own lock back.
+
+psx_cycles.c also loses the two 64-bit divisions it did per cycle charge. They
+were affordable for short debugtools measurements and are not affordable in a
+player build whose whole problem is host throughput.
+
+--- /dev/null
++++ b/runtime/src/crash2_60fps.h
+@@ -0,0 +1,369 @@
++/* SCUS-94154 native 60 FPS: open the game's own 30 Hz frame gate, and close it
++ * again whenever the machine cannot actually sustain it.
++ *
++ * Crash 2 ends a frame in func_8001658C. It always waits one VSync(0) at
++ * 0x80016838, then compares the previous frame's duration against 25 at
++ * 0x8001685C and waits a SECOND VSync(0) at 0x80016868 when it was shorter.
++ * Its time unit is one period of root counter 2, which 0x800156A0 programs
++ * with target 0x1000 off the system clock / 8: 4233600 / 4096 = 1033.6 Hz, so
++ * one NTSC field is ~17.24 ticks. The comparison against 25 therefore means
++ * "round this frame up to two fields", and that second wait - only that one -
++ * is what pins the game to 30 Hz.
++ *
++ * Opening the gate does NOT double game speed, because the engine already
++ * scales motion by measured time. func_80016F04 snaps the last frame's tick
++ * count to a whole number of fields (< 19 -> 17, < 36 -> 34, < 53 -> 51) and
++ * 0x8001697C stores it in the draw buffer at +20. Motion call sites read it
++ * back - 0x8001D400, 0x8001D9D4 and 0x8001DADC all do the same
++ * clamp-to-102 then (velocity * field_ticks) >> 10. At 60 Hz that field count
++ * becomes 17 instead of 34 and per-frame displacement halves. This is the
++ * compensation the original design already carries for dropped frames; we are
++ * reusing it, not inventing one.
++ *
++ * The FIRST wait stays, so a frame whose guest work does not fit in one field
++ * lands on the next VBlank and the game falls back to 30 (or 20) Hz exactly as
++ * it does on hardware, with the field count following it down. That covers the
++ * GUEST running out of budget.
++ *
++ * Two things it does NOT cover, both measured in play, and both of which made
++ * this mode worse than the 30 Hz lock it removes:
++ *
++ *   - the HOST running out. Then guest time dilates instead: VBlank itself
++ *     arrives late and the whole machine, audio included, runs slow.
++ *   - the scene sitting ON the one-field boundary, so frames alternate between
++ *     one field and two. Presentation alternates 16.7/33.4 ms, the engine's
++ *     compensation reads the PREVIOUS frame's field count and so lands a frame
++ *     late, and the average is a number no display period divides. Turtle
++ *     Woods measured 45-50 loops/s this way, with dips below 30; Snow Go on
++ *     the same machine held 55-56 and was fine.
++ *
++ * So the gate is not a one-way switch. Every second c2_60_window_verdict looks
++ * at both, and on a failure this steps back down - for a host failure by
++ * dropping the CPU headroom first, since that is the cheaper half, otherwise
++ * by closing the gate and handing the game back its own lock. It retries later
++ * with a growing delay, and a sustained good run clears the penalty. The point
++ * is that a scene the machine cannot hold at 60 gets a clean 30 rather than a
++ * ragged 47.
++ *
++ * Guest budget is a separate, real limit. At the Turtle Woods crates the outer
++ * loop needed a p95 of 672,072 guest cycles where one NTSC field affords
++ * 564,480, so the mode can also raise the CPU-only clock (see psx_cycles.c),
++ * leaving VBlank, CD, SPU and the timers - including the root counter this
++ * engine measures time with - on their original rate. That costs host
++ * throughput, which is why the guard drops it first.
++ *
++ * Everything here is reversible and signature-guarded: nothing is written
++ * unless all six anchor words of this exact revision read back correctly.
++ */
++#ifndef CRASH2_60FPS_H
++#define CRASH2_60FPS_H
++
++#include <stdlib.h>
++
++#define C2_60_LOOP_PC    0x80011848u
++#define C2_60_GATE_PC    0x8001685Cu
++#define C2_60_GATE_ORIG  0x2C630019u   /* sltiu v1,v1,25  - the 30 Hz gate */
++#define C2_60_GATE_OPEN  0x24030000u   /* addiu v1,zero,0 - never wait twice */
++#define C2_60_DB_CUR     0x80063450u   /* draw buffer shown last; +20 = ticks */
++#define C2_60_TICKS      0x8003BEA4u   /* root-counter-2 tick accumulator */
++/* The engine's timing mode. 0 is live play; the game writes 2 when it starts
++ * demo PLAYBACK (0x8002FD10, which sets up the recorded stream right after),
++ * 3 for demo RECORDING (0x8002FF34) and 4 when the demo ends (0x80015D60),
++ * and back to 0 at 0x80015D90, 0x8001F9EC and 0x8002FCDC. In playback the
++ * clock is taken from the recording itself (0x80016940) rather than from the
++ * root counter, so how fast the loop runs is how fast the recorded timeline is
++ * consumed - which is not something this mode should be deciding. */
++#define C2_60_TIMING     0x8006CD14u
++
++/* One second is long enough to average out a single slow frame and short
++ * enough that a bad scene is not endured. 57 of the 59.94 VBlanks a second is
++ * ~95% speed: below that the slowdown is audible, above it nobody can tell. */
++#define C2_60_WINDOW_MS   1000u
++#define C2_60_MIN_VBLANK  57u
++/* Percentage of the window's frames the engine must have simulated as ONE
++ * field. Measured: Snow Go holds 55-56 loops/s, which is ~93% of frames on 17
++ * ticks; a Turtle Woods route averaging 48.49 loops/s at 1.236 VBlanks per new
++ * image is ~76%. 85 sits between the two and puts the line near 52 loops/s.
++ * Anything below it is the alternating regime this exists to reject - see the
++ * comment on c2_60_window_verdict. */
++#define C2_60_MIN_HOLD    85u
++/* Windows with fewer loops than this are not judged on hold at all: a load or
++ * 2D screen legitimately updates ~8 times a second and is not a failure. */
++#define C2_60_MIN_LOOPS   20u
++#define C2_60_RETRY_MS    8000u    /* doubles per consecutive failure */
++#define C2_60_RETRY_MAX   64000u
++#define C2_60_CLEAR_MS    10000u   /* sustained 60 that forgives past failures */
++
++/* Verdicts from one window. */
++#define C2_60_PENDING     (-1)
++#define C2_60_OK          0
++#define C2_60_FAIL_HOST   1        /* emulator behind the wall clock */
++#define C2_60_FAIL_HOLD   2        /* scene cannot stay on one field */
++
++static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
++static int c2_60_cpu_pct = 125;        /* what the setting asked for */
++static int c2_60_cpu_now = 100;        /* what the guard is currently using */
++static int c2_60_verified = -1;        /* -1 unknown, 0 mismatch, 1 confirmed */
++static int c2_60_gate_open;
++static int c2_60_suspended;            /* held closed by the timing mode */
++static unsigned c2_60_timing_mode;
++static int c2_60_fails;                /* consecutive back-offs */
++static int c2_60_hold_pct = C2_60_MIN_HOLD;
++static unsigned long long c2_60_opened, c2_60_backoffs;
++
++/* Sustain window. Host milliseconds and the VBlank total are both read on the
++ * emulation thread, once per outer loop. */
++static unsigned long long c2_60_win_ms, c2_60_win_vbl, c2_60_good_ms;
++static unsigned long long c2_60_retry_at;
++static unsigned c2_60_win_loops, c2_60_win_one_field;
++static unsigned c2_60_loop_hz, c2_60_hold_seen;
++
++/* Sampled once per outer loop so the release heartbeat thread can report them
++ * without dereferencing a guest pointer the game may be rewriting underneath
++ * it. */
++static unsigned c2_60_last_frame_ticks;
++static unsigned c2_60_last_guest_ticks;
++
++/* The quantizer and both VSync call sites, not just the gate word: the gate is
++ * only safe to remove while the engine's own frame-time compensation is the
++ * one documented above. */
++static int c2_60_signature_ok(CPUState *cpu)
++{
++    return cpu->read_word(0x80016838u) == 0x0C012921u &&  /* jal VSync */
++           cpu->read_word(0x8001683Cu) == 0x00002021u &&  /* a0 = 0 */
++           cpu->read_word(0x80016860u) == 0x10600003u &&  /* beq v1,zero,+3 */
++           cpu->read_word(0x80016868u) == 0x0C012921u &&  /* jal VSync */
++           cpu->read_word(0x80016F04u) == 0x04800008u &&  /* quantizer entry */
++           cpu->read_word(0x80016F18u) == 0x34040011u;    /* ori a0,zero,17 */
++}
++
++static uint32_t c2_60_read_ram_word(uint32_t address)
++{
++    extern uint32_t psx_read_word(uint32_t address);
++    if (address < 0x80000000u || address > 0x801FFFFCu || (address & 3u))
++        return 0u;
++    return psx_read_word(address);
++}
++
++static void c2_60_set_cpu(int percent)
++{
++    extern void psx_crash2_cpu_clock_set(uint32_t percent);
++    if (percent == c2_60_cpu_now) return;
++    c2_60_cpu_now = percent;
++    psx_crash2_cpu_clock_set((uint32_t)percent);
++}
++
++static void c2_60_close_gate(void)
++{
++    extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++    if (c2_60_read_ram_word(C2_60_GATE_PC) == C2_60_GATE_OPEN)
++        psx_mod_write_code_word(C2_60_GATE_PC, C2_60_GATE_ORIG);
++    c2_60_gate_open = 0;
++    c2_60_set_cpu(100);
++}
++
++/* The engine's own opinion of how long the last frame took, in 1/1033.6 s
++ * ticks snapped to whole NTSC fields. 17 means it simulated a 60 Hz step, 34 a
++ * 30 Hz one. This is the number motion is multiplied by, so it - not the host
++ * swap rate - is what says whether the game is really running at 60. */
++unsigned crash2_60fps_frame_ticks(void) { return c2_60_last_frame_ticks; }
++
++/* Free-running guest tick count. Must stay near 1033.6/s in every mode: if a
++ * CPU-clock change ever moved it, the engine's time base would have moved too
++ * and the compensation above would be measuring the wrong second. */
++unsigned crash2_60fps_guest_ticks(void) { return c2_60_last_guest_ticks; }
++
++int crash2_60fps_mode(void) { return c2_60_mode < 0 ? 0 : c2_60_mode; }
++int crash2_60fps_verified(void) { return c2_60_verified; }
++int crash2_60fps_cpu_percent(void) { return c2_60_cpu_now; }
++int crash2_60fps_gate_open(void) { return c2_60_gate_open; }
++unsigned crash2_60fps_loop_hz(void) { return c2_60_loop_hz; }
++/* Percentage of the last window's frames the engine simulated as one field.
++ * This is the number the hold decision is made on, so report it: a scene that
++ * keeps falling back is answering with it. */
++unsigned crash2_60fps_hold_pct(void) { return c2_60_hold_seen; }
++/* Non-zero while the gate is held closed because the game is recording or
++ * replaying a demo, rather than because the scene could not hold 60. The two
++ * are not the same thing and a report that conflated them would send someone
++ * chasing performance in an attract loop. */
++unsigned crash2_60fps_suspended(void) { return c2_60_suspended ? c2_60_timing_mode : 0u; }
++unsigned long long crash2_60fps_open_count(void) { return c2_60_opened; }
++unsigned long long crash2_60fps_backoff_count(void) { return c2_60_backoffs; }
++
++/* Live toggle for the debug server. Turning it off restores the original
++ * comparison and the original CPU clock in the same call, so an aborted
++ * experiment cannot leave a patched word behind. */
++void crash2_60fps_set_mode(int on)
++{
++    c2_60_mode = on ? 1 : 0;
++    if (!on) {
++        c2_60_close_gate();
++    } else {
++        /* A deliberate switch-on clears the guard's penalty: the player asked
++         * again, and the scene may well be a different one. */
++        c2_60_fails = 0;
++        c2_60_retry_at = 0;
++        c2_60_win_ms = 0;
++    }
++}
++
++void crash2_60fps_set_cpu_percent(int percent)
++{
++    if (percent < 100 || percent > 150) return;
++    c2_60_cpu_pct = percent;
++    if (c2_60_gate_open) c2_60_set_cpu(percent);
++}
++
++/* Judge one window. Two different things can go wrong, and they need different
++ * answers.
++ *
++ * FAIL_HOST is guest time falling behind the wall clock: the emulator cannot
++ * keep up, so VBlank itself arrives late and the whole machine - audio
++ * included - runs slow.
++ *
++ * FAIL_HOLD is the regime that actually made this mode unpleasant. With the
++ * gate open, a frame takes one field if its work fits and two if it does not,
++ * and a scene sitting near that boundary alternates. Three things then go
++ * wrong at once: presentation alternates 16.7/33.4 ms, the engine's
++ * compensation reads the PREVIOUS frame's field count so the scale lands a
++ * frame late, and the average is a number like 45-50 that no display period
++ * divides. Measured in Turtle Woods, and it is worse to watch than the clean
++ * 30 the game locks itself to. So a scene that cannot mostly stay on one field
++ * is given back its own lock.
++ *
++ * A window with few loops is not judged on hold: a load or 2D screen updates
++ * a handful of times a second by design and is not a failing scene. */
++static int c2_60_window_verdict(unsigned long long now, unsigned long long vbl)
++{
++    if (c2_60_win_ms == 0) {
++        c2_60_win_ms = now;
++        c2_60_win_vbl = vbl;
++        c2_60_win_loops = c2_60_win_one_field = 0;
++        return C2_60_PENDING;
++    }
++    unsigned long long span = now - c2_60_win_ms;
++    if (span < C2_60_WINDOW_MS) return C2_60_PENDING;
++    const unsigned long long vblanks = vbl - c2_60_win_vbl;
++    const unsigned loops = c2_60_win_loops, one_field = c2_60_win_one_field;
++    c2_60_loop_hz = (unsigned)((unsigned long long)loops * 1000u / span);
++    c2_60_hold_seen = loops ? (unsigned)((unsigned long long)one_field * 100u / loops) : 0u;
++    c2_60_win_ms = now;
++    c2_60_win_vbl = vbl;
++    c2_60_win_loops = c2_60_win_one_field = 0;
++
++    if (vblanks * 1000u < (unsigned long long)C2_60_MIN_VBLANK * span)
++        return C2_60_FAIL_HOST;
++    if (c2_60_hold_pct > 0 && loops >= C2_60_MIN_LOOPS
++        && one_field * 100u < (unsigned)c2_60_hold_pct * loops)
++        return C2_60_FAIL_HOLD;
++    return C2_60_OK;
++}
++
++/* Called at the outer game loop, so at most once per simulated frame: the six
++ * signature reads cost nothing at 30-60 Hz and re-checking every loop is what
++ * makes this survive the title reloading its own executable. */
++static void crash2_60fps(CPUState *cpu, uint32_t pc)
++{
++    extern uint64_t g_vblank_raise_count;
++    extern uint64_t psx_host_mono_ms(void);
++
++    if (pc != C2_60_LOOP_PC) return;
++
++    /* Sampled in every mode: at stock these read 34 and ~1033.6/s, which is
++     * what a 60 FPS run has to be compared against. */
++    c2_60_last_frame_ticks =
++        (unsigned)c2_60_read_ram_word(c2_60_read_ram_word(C2_60_DB_CUR) + 20u);
++    c2_60_last_guest_ticks = (unsigned)c2_60_read_ram_word(C2_60_TICKS);
++    c2_60_timing_mode = (unsigned)c2_60_read_ram_word(C2_60_TIMING);
++
++    if (c2_60_mode < 0) {
++        const char *e = getenv("PSX_CRASH2_60FPS");
++        const char *p = getenv("PSX_CRASH2_60FPS_CPU_PCT");
++        const char *h = getenv("PSX_CRASH2_60FPS_HOLD_PCT");
++        c2_60_mode = (e && *e == '1') ? 1 : 0;
++        if (p) {
++            int want = atoi(p);
++            if (want >= 100 && want <= 150) c2_60_cpu_pct = want;
++        }
++        /* Escape hatch, deliberately not in the launcher UI. 0 disables the
++         * hold check, which is how to get the ragged 45-50 back if someone
++         * genuinely prefers it to a clean 30. */
++        if (h) {
++            int want = atoi(h);
++            if (want >= 0 && want <= 100) c2_60_hold_pct = want;
++        }
++    }
++    if (c2_60_mode != 1) return;
++
++    const unsigned long long now = psx_host_mono_ms();
++    c2_60_win_loops++;
++    if (c2_60_last_frame_ticks == 17u) c2_60_win_one_field++;
++    /* The guest can revert the word itself by reloading its executable. */
++    if (c2_60_gate_open && cpu->read_word(C2_60_GATE_PC) != C2_60_GATE_OPEN)
++        c2_60_gate_open = 0;
++
++    const int verdict = c2_60_window_verdict(now, g_vblank_raise_count);
++
++    /* Demo record/playback: suspend rather than back off. Nothing is wrong
++     * with the scene, so this earns no penalty and no retry delay - the gate
++     * comes straight back when live play resumes. */
++    if (c2_60_timing_mode != 0u) {
++        if (c2_60_gate_open) {
++            c2_60_close_gate();
++            c2_60_suspended = 1;
++            c2_60_good_ms = 0;
++            c2_60_win_ms = 0;
++        }
++        return;
++    }
++    c2_60_suspended = 0;
++
++    if (c2_60_gate_open) {
++        if (verdict == C2_60_FAIL_HOST && c2_60_cpu_now > 100) {
++            /* Cheapest step first: the headroom is what costs the host the
++             * extra guest instructions. Heavy scenes then fall back to 30
++             * through the game's own first VSync wait, which is fine. Hold
++             * failures are not treated this way - more headroom is what got
++             * the scene to the boundary it is now oscillating around. */
++            c2_60_set_cpu(100);
++            c2_60_good_ms = 0;
++        } else if (verdict == C2_60_FAIL_HOST || verdict == C2_60_FAIL_HOLD) {
++            c2_60_close_gate();
++            c2_60_backoffs++;
++            unsigned long long wait = C2_60_RETRY_MS << (c2_60_fails < 3 ? c2_60_fails : 3);
++            if (wait > C2_60_RETRY_MAX) wait = C2_60_RETRY_MAX;
++            c2_60_retry_at = now + wait;
++            if (c2_60_fails < 16) c2_60_fails++;
++            c2_60_good_ms = 0;
++        } else if (verdict == C2_60_OK) {
++            c2_60_good_ms += C2_60_WINDOW_MS;
++            if (c2_60_good_ms >= C2_60_CLEAR_MS) {
++                c2_60_fails = 0;
++                /* Earned the headroom back, if the setting asked for it. */
++                c2_60_set_cpu(c2_60_cpu_pct);
++                c2_60_good_ms = 0;
++            }
++        }
++        return;
++    }
++
++    if (now < c2_60_retry_at) return;
++
++    uint32_t gate = cpu->read_word(C2_60_GATE_PC);
++    if (gate != C2_60_GATE_ORIG || !c2_60_signature_ok(cpu)) {
++        c2_60_verified = 0;
++        return;
++    }
++    {
++        extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++        c2_60_verified = 1;
++        psx_mod_write_code_word(C2_60_GATE_PC, C2_60_GATE_OPEN);
++        c2_60_set_cpu(c2_60_cpu_pct);
++        c2_60_gate_open = 1;
++        c2_60_good_ms = 0;
++        c2_60_win_ms = 0;          /* do not judge the transition window */
++        c2_60_opened++;
++    }
++}
++
++#endif /* CRASH2_60FPS_H */
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -2053,6 +2053,7 @@
+ #include "crash2_wide_probe.h"
+ #include "crash2_wide_bbox.h"
+ #include "crash2_sim_tick.h"
++#include "crash2_60fps.h"
+ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+     uint32_t prev = s_compiled_interrupt_resume_pc;
+     s_compiled_interrupt_resume_pc = resume_pc;
+@@ -2060,6 +2061,7 @@
+     crash2_wide_probe(cpu, resume_pc);
+     crash2_wide_bbox(cpu, resume_pc);
+     crash2_sim_tick(cpu, resume_pc);
++    crash2_60fps(cpu, resume_pc);
+     s_compiled_interrupt_resume_pc = prev;
+ }
+ 
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -21,24 +21,39 @@
+ #endif
+ 
+ uint64_t psx_cycle_count = 0;
+-#ifndef PSX_NO_DEBUG_TOOLS
+-/* SCUS-94154 CPU-only overclock experiment. CPU charges are reduced while
+- * device intervals, VBlank, CD, SPU and timers stay on their original clock.
+- * Fractional carry keeps long-run guest time exact at a given percentage. */
++/* SCUS-94154 CPU-only headroom. CPU charges are reduced while device
++ * intervals, VBlank, CD, SPU and timers stay on their original clock.
++ * Fractional carry keeps long-run guest time exact at a given percentage.
++ *
++ * Present in release as well as debugtools, because the native 60 FPS mode
++ * needs it in the build players actually run: at 100% the only cost is one
++ * predicted compare on a global that never changes while the mode is off. */
+ uint32_t g_crash2_cpu_clock_pct = 100u;
+-static uint32_t s_crash2_cpu_clock_remainder = 0u;
++/* 32.32 fixed point: 100/pct, and the fractional cycles not yet charged.
++ *
++ * This used to divide, and divide twice - `% pct` and `/ pct` on a 64-bit
++ * value, once per cycle charge, which is once per basic block of guest code.
++ * That was affordable while the scale existed only for short debugtools
++ * measurements. It is not affordable in the build players run, in a mode whose
++ * whole problem is host throughput. A reciprocal computed once when the
++ * percentage changes turns the hot path into a multiply and two shifts, and
++ * keeps the same exact long-run rate: the remainder still carries. */
++static uint64_t s_crash2_cpu_clock_recip = 1ull << 32;
++static uint64_t s_crash2_cpu_clock_frac = 0u;
+ 
+ void psx_crash2_cpu_clock_set(uint32_t percent) {
++    if (percent == 0u) return;
+     g_crash2_cpu_clock_pct = percent;
+-    s_crash2_cpu_clock_remainder = 0u;
++    s_crash2_cpu_clock_recip = ((uint64_t)100u << 32) / percent;
++    s_crash2_cpu_clock_frac = 0u;
+ }
+ 
+ uint32_t psx_crash2_cpu_clock_charge(uint32_t cycles) {
+-    uint32_t pct = g_crash2_cpu_clock_pct;
+-    if (pct == 100u) return cycles;
+-    uint64_t numerator = (uint64_t)cycles * 100u + s_crash2_cpu_clock_remainder;
+-    s_crash2_cpu_clock_remainder = (uint32_t)(numerator % pct);
+-    return (uint32_t)(numerator / pct);
++    if (g_crash2_cpu_clock_pct == 100u) return cycles;
++    uint64_t total = (uint64_t)cycles * s_crash2_cpu_clock_recip
++                     + s_crash2_cpu_clock_frac;
++    s_crash2_cpu_clock_frac = total & 0xFFFFFFFFull;
++    return (uint32_t)(total >> 32);
+ }
+ 
+ /* Native overlay DLLs batch their CPU charges before invoking this callback.
+@@ -46,7 +61,6 @@
+ void psx_crash2_overlay_advance_cycles(uint32_t cycles) {
+     psx_advance_cycles(psx_crash2_cpu_clock_charge(cycles));
+ }
+-#endif
+ uint32_t g_psx_cyc_batch = 0;
+ uint32_t g_psx_cyc_batch_limit = 0;
+ int      g_psx_cyc_bb_defer = 0;
+--- a/runtime/include/psx_cyc.h
++++ b/runtime/include/psx_cyc.h
+@@ -91,7 +91,7 @@
+ 
+ static inline void psx_cyc_charge(uint32_t cycles) {
+     if (cycles == 0u) return;
+-#if !defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_OVERLAY_DLL_BUILD)
++#if !defined(PSX_OVERLAY_DLL_BUILD)
+     extern uint32_t g_crash2_cpu_clock_pct;
+     extern uint32_t psx_crash2_cpu_clock_charge(uint32_t cycles);
+     if (g_crash2_cpu_clock_pct != 100u)
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -2229,13 +2229,13 @@
+     s_callbacks.dispatch_call        = overlay_dispatch_call_probed;
+     s_callbacks.check_interrupts     = overlay_ci_wrapper;
+     s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
+-    /* Address of the header inline → out-of-line copy in this TU (host side). */
+-#ifndef PSX_NO_DEBUG_TOOLS
++    /* Address of the header inline → out-of-line copy in this TU (host side).
++     * Both builds route through the crash2 wrapper: native overlay DLLs batch
++     * their charges here, so if this one skipped the CPU-clock scale, overlay
++     * code - where most of this title's work happens - would keep the original
++     * clock while the main executable ran on the raised one. */
+     extern void psx_crash2_overlay_advance_cycles(uint32_t cycles);
+     s_callbacks.advance_cycles     = psx_crash2_overlay_advance_cycles;
+-#else
+-    s_callbacks.advance_cycles     = psx_advance_cycles;
+-#endif
+     s_callbacks.gte_execute          = gte_execute;
+     s_callbacks.psx_syscall          = psx_syscall;
+     s_callbacks.psx_native_bad_entry = psx_native_bad_entry;
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7859,12 +7859,14 @@
+ static uint64_t s_fr_base_ms = 0;
+ static uint64_t s_fr_base_raise, s_fr_base_deliver, s_fr_base_present;
+ static uint64_t s_fr_base_flip, s_fr_base_swap, s_fr_base_sim;
++static uint32_t s_fr_base_guest_ticks;
+ 
+ static void frame_rates_baseline(void)
+ {
+     extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+     extern uint64_t g_display_flip_count;
+     extern unsigned long long crash2_sim_tick_count(void);
++    extern unsigned crash2_60fps_guest_ticks(void);
+     s_fr_base_ms      = psx_host_mono_ms();
+     s_fr_base_raise   = g_vblank_raise_count;
+     s_fr_base_deliver = g_vblank_deliver_count;
+@@ -7872,6 +7874,7 @@
+     s_fr_base_flip    = g_display_flip_count;
+     s_fr_base_swap    = g_gl_swap_total;
+     s_fr_base_sim     = crash2_sim_tick_count();
++    s_fr_base_guest_ticks = crash2_60fps_guest_ticks();
+ }
+ 
+ static void handle_frame_rates(int id, const char *json)
+@@ -7880,6 +7883,14 @@
+     extern uint64_t g_display_flip_count;
+     extern unsigned long long crash2_sim_tick_count(void);
+     extern int crash2_sim_tick_verified(void);
++    extern unsigned crash2_60fps_frame_ticks(void);
++    extern unsigned crash2_60fps_guest_ticks(void);
++    extern int crash2_60fps_mode(void);
++    extern int crash2_60fps_verified(void);
++    extern int crash2_60fps_gate_open(void);
++    extern unsigned long long crash2_60fps_backoff_count(void);
++    extern unsigned crash2_60fps_hold_pct(void);
++    extern unsigned crash2_60fps_suspended(void);
+     const double budget = (double)json_get_int(json, "budget_ms", 0);
+     if (json_get_int(json, "reset", 0) || s_fr_base_ms == 0) {
+         frame_rates_baseline();
+@@ -7917,19 +7928,85 @@
+      * new image up every VBlank, 2.0 = every other one. */
+     const double vpf = flip_s > 0.0 ? raise_s / flip_s : 0.0;
+ 
++    /* The engine's own frame time, in root-counter-2 ticks snapped to whole
++     * NTSC fields by func_80016F04: 17 means it simulated a 60 Hz step, 34 a
++     * 30 Hz one. Motion is multiplied by this value, so a host rate of 60 with
++     * game_frame_ticks still 34 would be double speed, while 60 with 17 is the
++     * same world speed as stock. guest_ticks_per_s must stay near 1033.6 in
++     * every mode - it is the time base that number is measured against, and a
++     * CPU-clock change that moved it would invalidate the comparison. */
++    const unsigned game_ticks = crash2_60fps_frame_ticks();
++    const double guest_tick_s =
++        (double)(uint32_t)(crash2_60fps_guest_ticks() - s_fr_base_guest_ticks) / secs;
++
+     send_fmt("{\"id\":%d,\"ok\":true,\"seconds\":%.3f,"
+              "\"vblank_raise\":%.2f,\"vblank_deliver\":%.2f,"
+              "\"present_bodies\":%.2f,\"distinct_frames\":%.2f,"
+              "\"host_swaps\":%.2f,\"game_loop_steps\":%.2f,"
+              "\"game_loop_verified\":%d,\"vblanks_per_frame\":%.3f,"
++             "\"game_frame_ticks\":%u,\"guest_ticks_per_s\":%.2f,"
++             "\"native_60fps\":%d,\"native_60fps_verified\":%d,"
++             "\"native_60fps_gate_open\":%d,\"native_60fps_backoffs\":%llu,"
++             "\"native_60fps_one_field_pct\":%u,\"native_60fps_demo_mode\":%u,"
+              "\"speed\":%.3f,\"perf_samples\":%d,"
+              "\"frame_ms_p50\":%.3f,\"frame_ms_p95\":%.3f,"
+              "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
+              id, secs, raise_s, deliver_s, present_s, flip_s, swap_s,
+-             sim_s, sim_ok, vpf,
++             sim_s, sim_ok, vpf, game_ticks, guest_tick_s,
++             crash2_60fps_mode(), crash2_60fps_verified(),
++             crash2_60fps_gate_open(),
++             (unsigned long long)crash2_60fps_backoff_count(),
++             crash2_60fps_hold_pct(), crash2_60fps_suspended(),
+              raise_s / 59.94, psamples, p[0], p[1], p[2], (int)p[3]);
+ }
+ 
++/* The shipped SCUS-94154 native 60 FPS mode, live.
++ *
++ *   crash2_60fps                      -> current state and engine frame time
++ *   crash2_60fps {"enabled":1|0}      -> open/close the 30 Hz gate
++ *   crash2_60fps {"cpu_percent":100..150}
++ *
++ * Unlike the ablation probes below this one drives the same code path the
++ * launcher's setting does (crash2_60fps.h), so what is measured here is what
++ * a player gets. Turning it off restores the original comparison word and the
++ * 100% CPU clock together. */
++static void handle_crash2_60fps(int id, const char *json)
++{
++    extern void crash2_60fps_set_mode(int on);
++    extern void crash2_60fps_set_cpu_percent(int percent);
++    extern int crash2_60fps_mode(void);
++    extern int crash2_60fps_verified(void);
++    extern int crash2_60fps_cpu_percent(void);
++    extern unsigned long long crash2_60fps_open_count(void);
++    extern unsigned long long crash2_60fps_backoff_count(void);
++    extern unsigned crash2_60fps_loop_hz(void);
++    extern unsigned crash2_60fps_hold_pct(void);
++    extern unsigned crash2_60fps_suspended(void);
++    extern int crash2_60fps_gate_open(void);
++    extern unsigned crash2_60fps_frame_ticks(void);
++    int enabled = json_get_int(json, "enabled", -1);
++    int percent = json_get_int(json, "cpu_percent", -1);
++    if (percent >= 0 && (percent < 100 || percent > 150)) {
++        send_err(id, "cpu_percent must be 100..150");
++        return;
++    }
++    if (percent >= 0) crash2_60fps_set_cpu_percent(percent);
++    if (enabled >= 0) crash2_60fps_set_mode(enabled);
++    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"verified\":%d,"
++             "\"gate_open\":%s,\"cpu_percent\":%d,\"loop_hz\":%u,"
++             "\"one_field_pct\":%u,\"demo_mode\":%u,"
++             "\"gate_opened\":%llu,\"backoffs\":%llu,"
++             "\"gate_instruction\":\"0x%08X\",\"game_frame_ticks\":%u}",
++             id, crash2_60fps_mode() ? "true" : "false",
++             crash2_60fps_verified(),
++             crash2_60fps_gate_open() ? "true" : "false",
++             crash2_60fps_cpu_percent(), crash2_60fps_loop_hz(),
++             crash2_60fps_hold_pct(), crash2_60fps_suspended(),
++             (unsigned long long)crash2_60fps_open_count(),
++             (unsigned long long)crash2_60fps_backoff_count(),
++             psx_read_word(0x8001685Cu), crash2_60fps_frame_ticks());
++}
++
+ /* Developer-only, reversible SCUS-94154 frame-gate ablation. This does not
+  * constitute a 60 FPS feature: it can double game speed and break scripts.
+  * The debug server is absent from release builds. */
+@@ -13741,6 +13818,7 @@
+     { "present_fit",       handle_present_fit },
+     { "frame_perf",        handle_frame_perf },
+     { "frame_rates",       handle_frame_rates },
++    { "crash2_60fps",      handle_crash2_60fps },
+     { "crash2_frame_gate", handle_crash2_frame_gate },
+     { "crash2_no_wait_probe", handle_crash2_no_wait_probe },
+     { "crash2_cpu_clock_probe", handle_crash2_cpu_clock_probe },
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -21,6 +21,11 @@
+ extern unsigned long long crash2_sim_tick_count(void); /* SCUS-94154 main loop */
+ extern uint64_t g_display_flip_count;          /* gpu.c */
+ extern uint64_t g_gl_swap_total;                /* gpu_gl_renderer.c */
++extern int      crash2_60fps_mode(void);       /* crash2_60fps.h */
++extern int      crash2_60fps_gate_open(void);  /* 0 while the sustain
++                                   guard has fallen back to 30 Hz */
++extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
++                                   sampled on the emulation thread */
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+ extern uint32_t i_stat;                        /* memory.c */
+@@ -867,6 +872,9 @@
+         "  \"game_loop_count\":%llu,\n"
+         "  \"display_flip_count\":%llu,\n"
+         "  \"host_swap_count\":%llu,\n"
++        "  \"native_60fps\":%d,\n"
++        "  \"native_60fps_gate_open\":%d,\n"
++        "  \"game_frame_ticks\":%u,\n"
+         "  \"psx_cycle_count\":%llu,\n"
+         "  \"current_func\":\"0x%08X\",\n"
+         "  \"last_store_pc\":\"0x%08X\",\n"
+@@ -930,6 +938,9 @@
+         (unsigned long long)crash2_sim_tick_count(),
+         (unsigned long long)g_display_flip_count,
+         (unsigned long long)g_gl_swap_total,
++        crash2_60fps_mode(),
++        crash2_60fps_gate_open(),
++        crash2_60fps_frame_ticks(),
+         (unsigned long long)cyc,
+         cur_fn,
+         last_store,

@@ -197,6 +197,20 @@ class Settings:
     # 0 = follow the host panel; otherwise must be >= 90 or the runtime ignores it.
     frame_interpolation_fps: int = 0
     frame_blend: bool = False
+    # Native 60 FPS for SCUS-94154. Not interpolation and not a host pacer:
+    # it removes the second VSync wait the game uses to round every frame up
+    # to two fields, so the game loop itself runs at 60. World speed is
+    # unchanged because the engine already multiplies motion by the measured
+    # frame time (17 ticks instead of 34); scenes whose work does not fit in
+    # one field fall back to 30 exactly as they do on hardware.
+    native_60fps: bool = False
+    # Guest CPU-only headroom used while the mode is on, as a percentage of
+    # the real PS1 clock. VBlank, CD, SPU and the timers - including the root
+    # counter the engine measures frame time with - stay at their original
+    # rate, so this buys work per field without moving game time. At the
+    # Turtle Woods crates the loop needed p95 672,072 cycles against a
+    # 564,480-cycle field, which is where 125 comes from.
+    native_60fps_cpu_percent: int = 125
 
     # --- performance ------------------------------------------------------
     fast_loading: bool = False
@@ -303,6 +317,10 @@ class Settings:
         self.audio_latency_ms = max(30, min(500, int(self.audio_latency_ms or 90)))
         if self.vsync not in (-1, 0, 1):
             self.vsync = 0
+        # The runtime rejects anything outside this range and would silently
+        # fall back to its own default, so clamp where the value is visible.
+        self.native_60fps_cpu_percent = max(
+            100, min(150, int(self.native_60fps_cpu_percent or 125)))
         if self.fullscreen_mode not in (0, 1, 2):
             self.fullscreen_mode = 0
         if self.texture_filter not in ("nearest", "bilinear"):

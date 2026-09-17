@@ -1,0 +1,91 @@
+Record of the CPU-only clock probe that landed alongside 0025 and was never
+written down. The 60 FPS work in 0027 modifies these hunks, so the record has
+to exist before it. Reconstructed against _build/psxrecomp-src; the unrelated
+SPU sample-event drift in psx_cycles.c is deliberately not carried here.
+
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -23,0 +23,26 @@
+ uint64_t psx_cycle_count = 0;
++#ifndef PSX_NO_DEBUG_TOOLS
++/* SCUS-94154 CPU-only overclock experiment. CPU charges are reduced while
++ * device intervals, VBlank, CD, SPU and timers stay on their original clock.
++ * Fractional carry keeps long-run guest time exact at a given percentage. */
++uint32_t g_crash2_cpu_clock_pct = 100u;
++static uint32_t s_crash2_cpu_clock_remainder = 0u;
++
++void psx_crash2_cpu_clock_set(uint32_t percent) {
++    g_crash2_cpu_clock_pct = percent;
++    s_crash2_cpu_clock_remainder = 0u;
++}
++
++uint32_t psx_crash2_cpu_clock_charge(uint32_t cycles) {
++    uint32_t pct = g_crash2_cpu_clock_pct;
++    if (pct == 100u) return cycles;
++    uint64_t numerator = (uint64_t)cycles * 100u + s_crash2_cpu_clock_remainder;
++    s_crash2_cpu_clock_remainder = (uint32_t)(numerator % pct);
++    return (uint32_t)(numerator / pct);
++}
++
++/* Native overlay DLLs batch their CPU charges before invoking this callback.
++ * Share the same fractional carry as main-exe and interpreted instructions. */
++void psx_crash2_overlay_advance_cycles(uint32_t cycles) {
++    psx_advance_cycles(psx_crash2_cpu_clock_charge(cycles));
++}
++#endif
+ uint32_t g_psx_cyc_batch = 0;
+--- a/runtime/include/psx_cyc.h
++++ b/runtime/include/psx_cyc.h
+@@ -92,0 +92,7 @@
+ static inline void psx_cyc_charge(uint32_t cycles) {
+     if (cycles == 0u) return;
++#if !defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_OVERLAY_DLL_BUILD)
++    extern uint32_t g_crash2_cpu_clock_pct;
++    extern uint32_t psx_crash2_cpu_clock_charge(uint32_t cycles);
++    if (g_crash2_cpu_clock_pct != 100u)
++        cycles = psx_crash2_cpu_clock_charge(cycles);
++    if (cycles == 0u) return;
++#endif
+ #if defined(PSX_OVERLAY_DLL_BUILD)
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -2232,1 +2232,6 @@
+     /* Address of the header inline -> out-of-line copy in this TU (host side). */
++#ifndef PSX_NO_DEBUG_TOOLS
++    extern void psx_crash2_overlay_advance_cycles(uint32_t cycles);
++    s_callbacks.advance_cycles     = psx_crash2_overlay_advance_cycles;
++#else
+     s_callbacks.advance_cycles     = psx_advance_cycles;
++#endif
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7997,3 +7997,26 @@
+ }
+
++/* Developer-only CPU-clock ceiling probe. This is not game-speed
++ * compensation; a 60 Hz loop may make gameplay twice as fast. */
++static void handle_crash2_cpu_clock_probe(int id, const char *json)
++{
++    extern uint32_t g_crash2_cpu_clock_pct;
++    extern void psx_crash2_cpu_clock_set(uint32_t percent);
++    if (psx_read_word(0x80011848u) != 0x3C028007u ||
++        psx_read_word(0x8001184Cu) != 0x8C429944u ||
++        psx_read_word(0x80016868u) != 0x0C012921u) {
++        send_err(id, "SCUS-94154 CPU-clock signature mismatch");
++        return;
++    }
++    int requested = json_get_int(json, "percent", -1);
++    if (requested >= 0) {
++        if (requested < 100 || requested > 150) {
++            send_err(id, "percent must be 100..150");
++            return;
++        }
++        psx_crash2_cpu_clock_set((uint32_t)requested);
++    }
++    send_fmt("{\"id\":%d,\"ok\":true,\"percent\":%u}",
++             id, (unsigned)g_crash2_cpu_clock_pct);
++}
++
+@@ -13745,1 +13746,2 @@
+     { "crash2_no_wait_probe", handle_crash2_no_wait_probe },
++    { "crash2_cpu_clock_probe", handle_crash2_cpu_clock_probe },

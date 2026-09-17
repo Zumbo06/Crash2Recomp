@@ -19,11 +19,19 @@ SETTING_KEYS = (
     "window_width", "window_height", "supersampling", "vsync",
     "frame_interpolation", "frame_interpolation_fps", "frame_blend",
     "audio_latency_ms", "audio_hq", "developer_mode", "fast_loading",
+    "native_60fps", "native_60fps_cpu_percent",
 )
 HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   "exception_entries", "exception_reentry_blocks", "fatal",
                   "vblank_raise_count", "game_loop_count",
-                  "display_flip_count", "host_swap_count")
+                  "display_flip_count", "host_swap_count",
+                  # native_60fps is the setting; native_60fps_gate_open is
+                  # whether the runtime is actually holding 60 right now, and
+                  # game_frame_ticks (17 or 34) is the engine's own answer.
+                  # A report with the first but not the other two cannot tell
+                  # "on and working" from "on and fallen back".
+                  "native_60fps", "native_60fps_gate_open",
+                  "game_frame_ticks")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",
              "display_flip_count", "host_swap_count")

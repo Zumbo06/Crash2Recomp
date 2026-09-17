@@ -1,0 +1,46 @@
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7960,3 +7960,39 @@
+ }
+ 
++/* Diagnostic ceiling test only. Remove both VSync(0) waits from this title's
++ * frame finalizer, without changing the host VBlank rate. If gameplay still
++ * misses 60, the guest work itself exceeds one VBlank. Always reversible. */
++static void handle_crash2_no_wait_probe(int id, const char *json)
++{
++    const uint32_t wait_pc = 0x80016838u;
++    const uint32_t gate_pc = 0x8001685Cu;
++    const uint32_t wait_call = 0x0C012921u;
++    const uint32_t gate_orig = 0x2C630019u;
++    const uint32_t gate_skip = 0x24030000u;
++    uint32_t wait_word = psx_read_word(wait_pc);
++    uint32_t gate_word = psx_read_word(gate_pc);
++    if ((wait_word != wait_call && wait_word != 0u) ||
++        (gate_word != gate_orig && gate_word != gate_skip) ||
++        psx_read_word(0x8001683Cu) != 0x00002021u ||
++        psx_read_word(0x80016860u) != 0x10600003u ||
++        psx_read_word(0x80016868u) != wait_call) {
++        send_err(id, "SCUS-94154 no-wait signature mismatch");
++        return;
++    }
++    int enabled = json_get_int(json, "enabled", -1);
++    if (enabled >= 0) {
++        extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++        uint32_t wanted_wait = enabled ? 0u : wait_call;
++        uint32_t wanted_gate = enabled ? gate_skip : gate_orig;
++        if (wait_word != wanted_wait) psx_mod_write_code_word(wait_pc, wanted_wait);
++        if (gate_word != wanted_gate) psx_mod_write_code_word(gate_pc, wanted_gate);
++        wait_word = psx_read_word(wait_pc);
++        gate_word = psx_read_word(gate_pc);
++    }
++    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,"
++             "\"wait_instruction\":\"0x%08X\",\"gate_instruction\":\"0x%08X\"}",
++             id, wait_word == 0u && gate_word == gate_skip ? "true" : "false",
++             wait_word, gate_word);
++}
++
+ /* Developer-only probe for the published SCUS-94154 invincibility branch.
+@@ -13711,2 +13711,3 @@
+     { "crash2_frame_gate", handle_crash2_frame_gate },
++    { "crash2_no_wait_probe", handle_crash2_no_wait_probe },
+     { "crash2_damage_probe", handle_crash2_damage_probe },

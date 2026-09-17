@@ -219,3 +219,22 @@ Thumbs.db
 desktop.ini
 Desktop.ini
 .DS_Store
+
+
+# --------------------------------------------------------------------------
+# 7. Markdown
+# --------------------------------------------------------------------------
+# Notes, findings and status documents are working papers: they get retracted
+# and rewritten in place as an investigation moves, and a half-true one in
+# history is worse than none. Sections 3 already ignored RELEASE_NOTES.md and
+# WIDESCREEN-PLAN.md one at a time for exactly that reason; this is the same
+# rule, generalised.
+#
+# Note this only governs NEW files - git does not stop tracking a file because
+# a pattern later matches it - so the three below stay in history either way.
+# They are named anyway so that `git add` still works on them if one ever has
+# to be re-added, instead of failing silently.
+*.md
+!README.md
+!_build/Crash2Recomp/README.md
+!tuning/NOTES.md

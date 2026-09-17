@@ -1,0 +1,11 @@
+{
+  "name": "lives-hold-idle",
+  "require_game_loop": true,
+  "expected_game_loop_hz": [25, 35],
+  "steps": [
+    {"frames": 360, "buttons": "0xFFFF"}
+  ],
+  "assert_ram_delta": [
+    {"addr": "0x8006CBD1", "bytes": 1, "delta": 0}
+  ]
+}

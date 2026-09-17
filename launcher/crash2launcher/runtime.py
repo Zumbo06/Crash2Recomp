@@ -120,6 +120,14 @@ def _build_env(settings: Settings) -> dict[str, str]:
     """
     env: dict[str, str] = {}
 
+    # Native 60 FPS. The runtime opens Crash 2's own 30 Hz frame gate and
+    # raises the CPU-only clock so a frame's work fits in one field; the
+    # engine's existing frame-time compensation keeps world speed the same.
+    # Both builds honour it - see tuning/60FPS-FINDINGS.md.
+    if settings.native_60fps:
+        env["PSX_CRASH2_60FPS"] = "1"
+        env["PSX_CRASH2_60FPS_CPU_PCT"] = str(settings.native_60fps_cpu_percent)
+
     if settings.merge_all_input:
         env["PSX_DEV_INPUT"] = "1"
 
@@ -131,13 +139,13 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # It is presentation interpolation, never a guest-clock multiplier: it
     # blends between frames the game produced and adds no simulation.
     #
-    # It does NOT know how often Crash 2 actually updates. The runtime hands the
-    # interpolator the VBLANK rate as its source rate (main.cpp, the
-    # gl_renderer_set_interpolation call), which is only correct if the game
-    # renders every VBlank. That has never been measured for this title - see
-    # tuning/NOTES.md "frame cadence". If it renders every OTHER VBlank, half
-    # the source frames are byte-identical and the crossfade blends a frame
-    # against itself.
+    # Crash 2's outer loop and display-base flips were measured at ~30 Hz in
+    # gameplay while guest VBlank remains ~60 Hz, and the runtime hands the
+    # interpolator VBlank as source_hz (main.cpp). So at stock, half the
+    # "source" frames are byte-identical and the crossfade blends a frame
+    # against itself. native_60fps is what actually fixes that mismatch - it
+    # makes the game produce a new image every VBlank - and it is a real
+    # simulation change, which this setting is not.
     if settings.frame_interpolation and settings.renderer == "opengl":
         env["PSX_FRAME_INTERPOLATION"] = "1"
         # Only 0 (follow host) or >= 90 is accepted; clamp() already enforced it.
@@ -152,7 +160,7 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # An earlier comment here claimed Crash 2 had "a guarded native 59.94 Hz
     # title patch". No such patch exists: nothing calls
     # psx_mod_set_native_vblank_rate, the mods directory is empty, and game.toml
-    # declares no patch. The game's update cadence is simply unmeasured.
+    # declares no patch. The measured gameplay loop remains ~30 Hz.
     if settings.frame_blend:
         env["PSX_FRAME_BLEND"] = "1"
 

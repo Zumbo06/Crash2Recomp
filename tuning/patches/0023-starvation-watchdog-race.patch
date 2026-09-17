@@ -1,0 +1,43 @@
+--- a/runtime/src/starvation_ring.c
++++ b/runtime/src/starvation_ring.c
+@@ -18,2 +18,3 @@
+ #include <stdio.h>
++#include <stdatomic.h>
+ #include <stdlib.h>
+@@ -48,1 +49,1 @@
+-static uint64_t        s_last_heartbeat_us = 0;
++static _Atomic uint64_t s_last_heartbeat_us = 0;
+@@ -72,3 +73,3 @@
+ void starvation_watchdog_heartbeat(void) {
+-    s_last_heartbeat_us = host_us_now();
++    atomic_store_explicit(&s_last_heartbeat_us, host_us_now(), memory_order_relaxed);
+ }
+@@ -78,1 +79,1 @@
+-    s_last_heartbeat_us = 0;
++    atomic_store_explicit(&s_last_heartbeat_us, 0, memory_order_relaxed);
+@@ -206,1 +207,2 @@
+-                (unsigned long long)s_last_heartbeat_us,
++                (unsigned long long)atomic_load_explicit(
++                    &s_last_heartbeat_us, memory_order_relaxed),
+@@ -246,13 +248,18 @@
+ void starvation_watchdog_check(void) {
+     if (s_dump_done) return;
+-    if (s_last_heartbeat_us == 0) return;  /* not initialized yet */
++    const uint64_t last = atomic_load_explicit(
++        &s_last_heartbeat_us, memory_order_relaxed);
++    if (last == 0) return;  /* not initialized yet */
+     uint64_t timeout = starvation_timeout_us();
+     if (timeout == 0) return;              /* watchdog disabled (renderer bring-up) */
+     uint64_t now = host_us_now();
+-    if (now - s_last_heartbeat_us > timeout) {
++    /* Another thread can publish a heartbeat AFTER our local clock read.
++     * Unsigned subtraction would wrap and falsely report a massive stall. */
++    if (now < last || now - last <= timeout) return;
++    {
+         starvation_ring_dump(NULL);
+         /* Abort cleanly so the dump file is preserved and the user knows
+          * the runtime starved. */
+         fprintf(stderr, "starvation_watchdog: %llu us without heartbeat — "
+                 "ring dumped to starvation_dump.jsonl, aborting\n",
+-                (unsigned long long)(now - s_last_heartbeat_us));
++                (unsigned long long)(now - last));
