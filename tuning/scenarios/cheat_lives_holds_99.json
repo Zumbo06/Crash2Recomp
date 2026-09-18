@@ -1,0 +1,12 @@
+{
+  "name": "cheat-lives-holds-99",
+  "require_game_loop": true,
+  "cheat_lives": true,
+  "expected_game_loop_hz": [25, 35],
+  "steps": [
+    {"frames": 180, "buttons": "0xFFFF"}
+  ],
+  "assert_ram": [
+    {"addr": "0x8006CBD1", "hex": "63"}
+  ]
+}

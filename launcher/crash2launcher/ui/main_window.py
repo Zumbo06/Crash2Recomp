@@ -48,6 +48,7 @@ NAV_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("settings.audio", "Audio", "Audio"),
         ("settings.input", "Input", "Input"),
         ("settings.performance", "Performance", "Performance"),
+        ("settings.cheats", "Cheats", "Cheats"),
     ]),
     ("TOOLS", [
         ("log", "Log", ""),

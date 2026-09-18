@@ -1,0 +1,12 @@
+{
+  "name": "no-damage-holds-invincible-mode",
+  "require_game_loop": true,
+  "cheat_aku": 2,
+  "expected_game_loop_hz": [25, 35],
+  "steps": [
+    {"frames": 180, "buttons": "0xFFFF"}
+  ],
+  "assert_ram": [
+    {"addr": "0x8001CE34", "hex": "05004014"}
+  ]
+}

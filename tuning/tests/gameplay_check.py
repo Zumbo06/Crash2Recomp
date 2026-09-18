@@ -51,7 +51,11 @@ class RouteValidationTests(unittest.TestCase):
                 if command == "frame_rates":
                     return {"game_loop_steps": 30, "game_frame_ticks": 34,
                             "native_60fps_gate_open": 0,
-                            "native_60fps_one_field_pct": 0}
+                            "native_60fps_one_field_pct": 0,
+                            "native_60fps_verdict": 0}
+                if command == "crash2_cheats":
+                    return {"aku": 0, "god_word": "0x14400005",
+                            "suspended": False}
                 if command == "history":
                     return {"newest": 110}
                 return {"ok": True}
@@ -78,6 +82,9 @@ class Native60ScenarioTests(unittest.TestCase):
                     return {"active": False}
                 if command == "frame_range":
                     return {"frames": [{"pad": "0xFFFF"}]}
+                if command == "crash2_cheats":
+                    return {"aku": 0, "god_word": "0x14400005",
+                            "suspended": False}
                 if command == "frame_rates":
                     return rates
                 if command == "history":
@@ -88,13 +95,16 @@ class Native60ScenarioTests(unittest.TestCase):
 
     BASE = {"steps": [{"frames": 10, "buttons": "0xFFFF"}],
             "require_game_loop": False}
-    MODERN = {"native_60fps_gate_open": 1, "native_60fps_one_field_pct": 95}
+    MODERN = {"native_60fps_gate_open": 1, "native_60fps_one_field_pct": 95,
+              "native_60fps_verdict": 0}
 
     def test_a_runtime_without_the_guard_is_refused(self):
         # A stale build answers everything and reports the old behaviour. That
         # already cost one Turtle Woods run, so it has to fail loudly.
         client, _ = self._client({"game_loop_steps": 48, "speed": 1.0,
-                                  "game_frame_ticks": 34})
+                                  "game_frame_ticks": 34,
+                                  "native_60fps_gate_open": 1,
+                                  "native_60fps_one_field_pct": 76})
         with self.assertRaises(RuntimeError) as caught:
             module.run(client, {**self.BASE, "name": "stale",
                                 "native_60fps": True}, timeout=1)
@@ -152,9 +162,28 @@ class Native60ScenarioTests(unittest.TestCase):
                                      "max_backoffs": 0}, timeout=1)
         self.assertTrue(result["passed"], result["failures"])
 
+    def test_assists_are_driven_and_always_cleared(self):
+        client, calls = self._client({**self.MODERN, "game_loop_steps": 30,
+                                      "speed": 1.0, "game_frame_ticks": 34})
+        module.run(client, {**self.BASE, "name": "assists",
+                            "cheat_lives": True, "cheat_aku": 2}, timeout=1)
+        sets = [args for name, args in calls if name == "crash2_cheats" and args]
+        self.assertEqual(sets[0], {"lives": 1, "aku": 2})
+        # Cleared however the route ended, so the next scenario cannot inherit
+        # a patched instruction or a held byte.
+        self.assertEqual(sets[-1], {"lives": 0, "aku": 0})
+
+    def test_a_scenario_that_says_nothing_turns_assists_off(self):
+        client, calls = self._client({**self.MODERN, "game_loop_steps": 30,
+                                      "speed": 1.0, "game_frame_ticks": 34})
+        module.run(client, {**self.BASE, "name": "quiet"}, timeout=1)
+        sets = [args for name, args in calls if name == "crash2_cheats" and args]
+        self.assertEqual(sets[0], {"lives": 0, "aku": 0})
+
     def test_scenario_rejects_impossible_frame_time(self):
         for bad in ({"expected_game_frame_ticks": 20}, {"cpu_percent": 200},
-                    {"min_speed": 2}, {"min_one_field_pct": 101}):
+                    {"min_speed": 2}, {"min_one_field_pct": 101},
+                    {"cheat_aku": 3}, {"cheat_aku": -1}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 module.validate_scenario({**self.BASE, **bad})
 

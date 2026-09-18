@@ -20,6 +20,10 @@ SETTING_KEYS = (
     "frame_interpolation", "frame_interpolation_fps", "frame_blend",
     "audio_latency_ms", "audio_hq", "developer_mode", "fast_loading",
     "native_60fps", "native_60fps_cpu_percent",
+    # Assists can change saved progression, so a report that cannot show
+    # whether they were on cannot tell "the game broke my save" from "I had
+    # assists enabled".
+    "cheat_infinite_lives", "cheat_aku_aku",
 )
 HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   "exception_entries", "exception_reentry_blocks", "fatal",
@@ -31,7 +35,8 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   # A report with the first but not the other two cannot tell
                   # "on and working" from "on and fallen back".
                   "native_60fps", "native_60fps_gate_open",
-                  "game_frame_ticks")
+                  "game_frame_ticks",
+                  "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",
              "display_flip_count", "host_swap_count")

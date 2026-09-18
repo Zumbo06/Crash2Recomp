@@ -1,0 +1,732 @@
+Finish the SCUS-94154 assists and the 60 FPS sustain guard.
+
+Assists: gate every write to live play (the engine's timing mode at 0x8006CD14
+is non-zero during demo playback and recording, so an attract loop could
+previously be written into), add the third loop-signature word, and turn Aku
+Aku into a three-level control: off / keep masks / no damage.
+
+No damage holds the player's own invincibility mode. 0x8001CE1C is
+`bne s0, a0` against the object at 0x8005F38C, so the predicate below it is the
+player's alone; obj+0x108 is a timed mode (0x8001C0A8 gives mode 4 its 61 mercy
+frames, 0x8001C0BC times mode 3, the gold mask). The assist holds mode 3 and
+restamps obj+0x10C from the tick at 0x8006CB64 so it never expires, leaving
+modes 1, 2, 5, 6 and 7 to the engine.
+
+An instruction patch on 0x8001CE34 was tried first and REMOVED, because
+psx_mod_write_code_word marks the whole containing page dirty and this runtime
+dispatches dirty pages through the MIPS interpreter. func_8001CC10 runs for
+every GOOL event on every object, so interpreting it collapsed the frame rate
+until the starvation watchdog aborted the run - 8.4 s without a heartbeat. The
+60 FPS gate survives the same trick only because its page is cold.
+
+Overlay: the Home menu takes the mouse. The panel is drawn stretched over the
+whole window, so window -> panel is a plain proportion; hover moves the cursor
+without changing a value, left click activates, right click steps an option
+back, and the wheel adjusts the row under the cursor.
+
+The overlay's GAME ASPECT row also gains 14:9, which the launcher has always
+offered and defaults to for this title - without it the Home menu could not
+return to the aspect the game had launched in.
+
+60 FPS guard: drop two branches patch 0028 made unreachable - the CPU restore
+on the sustained-good path (every reopen already sets the clock) and the
+RETRY_MAX comparison (the shift is capped at 3 and 8000 << 3 is exactly that) -
+set c2_60_suspended whenever the timing mode is non-zero rather than only on
+the closing edge, reset the window on every suspended tick so demo frames stay
+out of loop_hz and one_field_pct, and export the last verdict so a report can
+tell a host overrun from a scene on the one-field boundary.
+
+--- a/runtime/src/crash2_cheats.h
++++ b/runtime/src/crash2_cheats.h
+@@ -1,20 +1,90 @@
+ /* SCUS-94154-only, deliberately narrow gameplay assists.
+- * Called at the outer game-loop boundary, never from the rendering thread.
+- * No writes are made unless the exact game's loop signature is present.
++ *
++ * Called at the outer game-loop boundary, never from the rendering thread, and
++ * nothing is written unless this exact revision's loop signature is present.
++ *
++ * Both assists work by holding a byte the game already maintains, rather than
++ * by patching code. That is the whole safety argument: the engine keeps
++ * reading and acting on these values exactly as it always did, so no collision,
++ * pickup or scripting path behaves differently from stock.
++ *
++ * Aku Aku is a LEVEL, not a flag, and the two levels use different mechanisms
++ * because the game does:
++ *
++ *   1 (keep masks) - hold the mask count at 2, so a hit is always absorbed.
++ *                    Pure data; the engine behaves exactly as it would if you
++ *                    had collected them.
++ *   2 (no damage)  - hold Crash in the game's own invincible mode, the one
++ *                    the gold Aku Aku mask uses. See c2_god_* below.
++ *
++ * Neither prevents the deaths a mask never prevented: pits, crushing and
++ * drowning still kill. The launcher and README say so.
++ *
++ * Suspended outside live play. The engine's timing mode at 0x8006CD14 is
++ * non-zero during demo playback and recording (see crash2_60fps.h, which gates
++ * on the same word); writing progression bytes into an attract-mode demo, or
++ * before the game has established its own state at boot, is not something an
++ * assist should do.
+  */
+ #ifndef CRASH2_CHEATS_H
+ #define CRASH2_CHEATS_H
+ 
+ #include <stdint.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #define C2_CHEAT_LOOP_PC 0x80011848u
+ #define C2_CHEAT_LIVES   0x8006CBD1u
+ #define C2_CHEAT_AKU     0x8006CBD5u
++#define C2_CHEAT_TIMING  0x8006CD14u   /* 0 = live play; see crash2_60fps.h */
+ 
++/* No-damage, data-side. func_8001CC10 is the GOOL conditional state-change
++ * entry, and 0x8001CE1C (`bne s0, a0` against the object at 0x8005F38C) gates
++ * the interesting part to ONE object - the player. For it, the game reads
++ * obj+0x108, a timed invincibility mode, and when that mode is 2, 3 or 4 it
++ * ORs 0x1002 into the status word before the entry test, which is what makes
++ * the damage states refuse. Mode 3 is the gold Aku Aku mask, timed at
++ * 0x8001C0BC against the tick at 0x8006CB64 and the stamp in obj+0x10C; mode 4
++ * is the 61-frame mercy window after a hit (0x8001C0A8).
++ *
++ * So holding mode 3 and refreshing its stamp keeps the predicate true using the
++ * game's own mechanism. Nothing is invented: this is the state the gold mask
++ * puts Crash in, simply not allowed to expire.
++ *
++ * AN INSTRUCTION PATCH WAS TRIED HERE AND REMOVED. Forcing the branch at
++ * 0x8001CE34 works, and is even narrower - but psx_mod_write_code_word marks
++ * the whole containing PAGE dirty (memory.c, dirty_ram_mark_executable_range),
++ * and dirty pages are dispatched through the MIPS interpreter instead of the
++ * compiled image. func_8001CC10 runs for every GOOL event on every object, so
++ * interpreting it collapsed the frame rate until the starvation watchdog
++ * aborted the run - measured, 8.4 s without a heartbeat. The 60 FPS gate gets
++ * away with the same trick only because its page holds func_8001658C, which
++ * runs once a frame. Patching cold code is cheap here; patching hot code is
++ * not.
++ *
++ * Only modes 0, 3 and 4 are overwritten. The others are owned by the engine's
++ * own mode machine - 5 is gated on a status bit, and 6/7 owe a side effect
++ * when they expire - so they are left to run their course. */
++#define C2_CHEAT_PLAYER  0x8005F38Cu   /* the object the predicate is gated on */
++#define C2_CHEAT_TICK    0x8006CB64u   /* the counter obj+0x10C is stamped from */
++#define C2_CHEAT_MODE_O  264u          /* obj+0x108, invincibility mode */
++#define C2_CHEAT_STAMP_O 268u          /* obj+0x10C, when the mode started */
++#define C2_CHEAT_MODE_GOLD 3u          /* the gold-mask mode */
++
++/* Aku levels. Kept in step with the launcher's cheat_aku_aku enum. */
++#define C2_AKU_OFF        0
++#define C2_AKU_KEEP_MASKS 1
++#define C2_AKU_NO_DAMAGE  2
++
++/* Plain ints, deliberately. The setters below are driven from the Home pause
++ * menu, which main.cpp runs inside the VBlank callback - the same thread that
++ * reaches crash2_cheats_tick through psx_check_interrupts_at. There is no
++ * cross-thread access here to make atomic. */
+ static int c2_cheats_initialized;
+ static int c2_cheat_lives;
+-static int c2_cheat_aku;
++static int c2_cheat_aku;               /* one of C2_AKU_* */
++static int c2_cheat_suspended;         /* held off by the timing mode */
++static int c2_god_active;              /* holding the mode this loop */
+ 
+ static void c2_cheats_init(void)
+ {
+@@ -22,14 +92,63 @@
+     const char *lives = getenv("PSX_CRASH2_CHEAT_LIVES");
+     const char *aku = getenv("PSX_CRASH2_CHEAT_AKU");
+     c2_cheat_lives = lives && lives[0] == '1' && lives[1] == '\0';
+-    c2_cheat_aku = aku && aku[0] == '1' && aku[1] == '\0';
++    /* "1" is the legacy spelling from the first build of this feature, when
++     * the setting was a checkbox. An older launcher must not silently lose the
++     * assist against a newer game. */
++    c2_cheat_aku = C2_AKU_OFF;
++    if (aku) {
++        if (!strcmp(aku, "no_damage"))        c2_cheat_aku = C2_AKU_NO_DAMAGE;
++        else if (!strcmp(aku, "keep_masks"))  c2_cheat_aku = C2_AKU_KEEP_MASKS;
++        else if (!strcmp(aku, "1"))           c2_cheat_aku = C2_AKU_KEEP_MASKS;
++    }
+     c2_cheats_initialized = 1;
+ }
+ 
+ int crash2_cheat_lives_enabled(void) { c2_cheats_init(); return c2_cheat_lives; }
+-int crash2_cheat_aku_enabled(void) { c2_cheats_init(); return c2_cheat_aku; }
++int crash2_cheat_aku_level(void) { c2_cheats_init(); return c2_cheat_aku; }
++int crash2_cheat_suspended(void) { return c2_cheat_suspended; }
++/* Non-zero only while the mode is actually being held, so a report can tell
++ * "asked for" from "in force" - it is off on menus, loads and demos. */
++int crash2_cheat_god_active(void) { return c2_god_active; }
++
+ void crash2_cheat_set_lives(int on) { c2_cheats_init(); c2_cheat_lives = on != 0; }
+-void crash2_cheat_set_aku(int on) { c2_cheats_init(); c2_cheat_aku = on != 0; }
++
++void crash2_cheat_set_aku(int level)
++{
++    c2_cheats_init();
++    if (level < C2_AKU_OFF) level = C2_AKU_OFF;
++    if (level > C2_AKU_NO_DAMAGE) level = C2_AKU_NO_DAMAGE;
++    c2_cheat_aku = level;
++}
++
++/* Kept for callers that only need "is any Aku assist on". */
++int crash2_cheat_aku_enabled(void) { return crash2_cheat_aku_level() != C2_AKU_OFF; }
++
++/* Hold the gold-mask invincibility mode on the player object. Data only: no
++ * guest code is modified, so no page is marked dirty and nothing drops to the
++ * interpreter. See the long comment above for why that matters here. */
++static void c2_god_tick(CPUState *cpu, int want_level, int suspended)
++{
++    extern void psx_write_word(uint32_t addr, uint32_t value);
++    c2_god_active = 0;
++    if (want_level != C2_AKU_NO_DAMAGE || suspended) return;
++
++    /* Null on menus, loads and title screens - there is no player to protect
++     * and the pointer is not one to dereference blind. */
++    const uint32_t player = cpu->read_word(C2_CHEAT_PLAYER);
++    if (player < 0x80000000u || player > 0x801FFF00u || (player & 3u)) return;
++
++    const uint32_t mode = cpu->read_word(player + C2_CHEAT_MODE_O);
++    /* 0 is "not invincible", 3 is already ours, 4 is the post-hit mercy window
++     * we are happy to extend. Anything else belongs to the engine. */
++    if (mode != 0u && mode != 3u && mode != 4u) return;
++
++    if (mode != C2_CHEAT_MODE_GOLD)
++        psx_write_word(player + C2_CHEAT_MODE_O, C2_CHEAT_MODE_GOLD);
++    /* Restamp every loop so the 452-frame expiry at 0x8001C0BC never arrives. */
++    psx_write_word(player + C2_CHEAT_STAMP_O, cpu->read_word(C2_CHEAT_TICK));
++    c2_god_active = 1;
++}
+ 
+ static void crash2_cheats_tick(CPUState *cpu, uint32_t pc)
+ {
+@@ -37,11 +156,24 @@
+     extern void psx_write_byte(uint32_t addr, uint8_t value);
+     if (pc != C2_CHEAT_LOOP_PC ||
+         cpu->read_word(C2_CHEAT_LOOP_PC) != 0x3C028007u ||
+-        cpu->read_word(C2_CHEAT_LOOP_PC + 4u) != 0x8C429944u)
++        cpu->read_word(C2_CHEAT_LOOP_PC + 4u) != 0x8C429944u ||
++        cpu->read_word(C2_CHEAT_LOOP_PC + 12u) != 0x30420800u)
+         return;
+ 
+     c2_cheats_init();
+ 
++    /* Demo playback or recording: write nothing, and say so, so a report can
++     * tell "suspended in an attract loop" from "enabled but doing nothing". */
++    c2_cheat_suspended = cpu->read_word(C2_CHEAT_TIMING) != 0u;
++
++    /* Passed the suspended flag rather than guarded by it, so that it clears
++     * c2_god_active on entering a demo instead of leaving a stale "in force".
++     * A demo replays a recorded input stream against the simulation, and a
++     * Crash who cannot be hurt desyncs it. */
++    c2_god_tick(cpu, c2_cheat_aku, c2_cheat_suspended);
++
++    if (c2_cheat_suspended) return;
++
+     /* 99 rather than an out-of-range sentinel keeps the game's UI and
+      * save-card format inside their normal two-digit range. Turning the cheat
+      * off leaves the current value; it does not erase lives legitimately
+@@ -49,10 +181,15 @@
+     if (c2_cheat_lives && psx_read_byte(C2_CHEAT_LIVES) < 99u)
+         psx_write_byte(C2_CHEAT_LIVES, 99u);
+ 
+-    /* Never lower 3 (the game's temporary invincible-mask state). The global
+-     * value is copied to the level's own shadow on transition. */
+-    if (c2_cheat_aku && psx_read_byte(C2_CHEAT_AKU) < 2u)
+-        psx_write_byte(C2_CHEAT_AKU, 2u);
++    /* Only "keep masks" touches the mask count. "No damage" refuses the damage
++     * transitions outright in c2_god_tick, so it has no reason to write a
++     * progression byte, and not writing one is the safer of the two. */
++    if (c2_cheat_aku == C2_AKU_KEEP_MASKS) {
++        /* Never lower 3: that is the game's own temporary invincibility, and
++         * a player who earned it should keep it for its normal duration. */
++        if (psx_read_byte(C2_CHEAT_AKU) < 2u)
++            psx_write_byte(C2_CHEAT_AKU, 2u);
++    }
+ }
+ 
+ #endif /* CRASH2_CHEATS_H */
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -90,7 +90,10 @@
+  * 2D screen legitimately updates ~8 times a second and is not a failure. */
+ #define C2_60_MIN_LOOPS   20u
+ #define C2_60_RETRY_MS    8000u    /* doubles per consecutive failure */
+-#define C2_60_RETRY_MAX   64000u
++#define C2_60_RETRY_MAX   64000u   /* the ceiling that cap produces: the shift
++                                    * stops at 3 and 8000 << 3 is exactly this,
++                                    * so it documents the result rather than
++                                    * clamping anything. */
+ #define C2_60_CLEAR_MS    10000u   /* sustained 60 that forgives past failures */
+ 
+ /* Verdicts from one window. */
+@@ -107,6 +110,7 @@
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
++static int c2_60_verdict = C2_60_PENDING;  /* last completed window */
+ static int c2_60_hold_pct = C2_60_MIN_HOLD;
+ static unsigned long long c2_60_opened, c2_60_backoffs;
+ 
+@@ -181,6 +185,11 @@
+  * This is the number the hold decision is made on, so report it: a scene that
+  * keeps falling back is answering with it. */
+ unsigned crash2_60fps_hold_pct(void) { return c2_60_hold_seen; }
++/* The last completed window's verdict, as a C2_60_* value. "Your machine is
++ * behind the wall clock" and "this scene sits on the one-field boundary" need
++ * completely different answers, and until this was exported a report could not
++ * tell which one had closed the gate. */
++int crash2_60fps_last_verdict(void) { return c2_60_verdict; }
+ /* Non-zero while the gate is held closed because the game is recording or
+  * replaying a demo, rather than because the scene could not hold 60. The two
+  * are not the same thing and a report that conflated them would send someone
+@@ -251,11 +260,11 @@
+     c2_60_win_loops = c2_60_win_one_field = 0;
+ 
+     if (vblanks * 1000u < (unsigned long long)C2_60_MIN_VBLANK * span)
+-        return C2_60_FAIL_HOST;
++        return (c2_60_verdict = C2_60_FAIL_HOST);
+     if (c2_60_hold_pct > 0 && loops >= C2_60_MIN_LOOPS
+         && one_field * 100u < (unsigned)c2_60_hold_pct * loops)
+-        return C2_60_FAIL_HOLD;
+-    return C2_60_OK;
++        return (c2_60_verdict = C2_60_FAIL_HOLD);
++    return (c2_60_verdict = C2_60_OK);
+ }
+ 
+ /* Called at the outer game loop, so at most once per simulated frame: the six
+@@ -307,12 +316,19 @@
+      * with the scene, so this earns no penalty and no retry delay - the gate
+      * comes straight back when live play resumes. */
+     if (c2_60_timing_mode != 0u) {
++        /* Set unconditionally, not only on the closing edge: enable the mode
++         * while an attract loop is already running and the gate is simply
++         * never open, and a flag set only there would leave the report saying
++         * "not suspended" for a gate that is refusing to open for a reason. */
++        c2_60_suspended = 1;
+         if (c2_60_gate_open) {
+             c2_60_close_gate();
+-            c2_60_suspended = 1;
+             c2_60_good_ms = 0;
+-            c2_60_win_ms = 0;
+         }
++        /* Always, for the same reason: loop_hz and one_field_pct are updated
++         * on every completed window, so demo frames left in a half-finished
++         * window would surface in the numbers a report shows afterwards. */
++        c2_60_win_ms = 0;
+         return;
+     }
+     c2_60_suspended = 0;
+@@ -325,17 +341,21 @@
+              * before the next verdict. Close immediately and retry later. */
+             c2_60_close_gate();
+             c2_60_backoffs++;
+-            unsigned long long wait = C2_60_RETRY_MS << (c2_60_fails < 3 ? c2_60_fails : 3);
+-            if (wait > C2_60_RETRY_MAX) wait = C2_60_RETRY_MAX;
+-            c2_60_retry_at = now + wait;
++            /* 8s, 16s, 32s, 64s. The shift is capped at 3 and
++             * 8000 << 3 == C2_60_RETRY_MAX exactly, so the cap is in the shift
++             * rather than in a comparison that could never fire. */
++            c2_60_retry_at = now
++                + (C2_60_RETRY_MS << (c2_60_fails < 3 ? c2_60_fails : 3));
+             if (c2_60_fails < 16) c2_60_fails++;
+             c2_60_good_ms = 0;
+         } else if (verdict == C2_60_OK) {
+             c2_60_good_ms += C2_60_WINDOW_MS;
+             if (c2_60_good_ms >= C2_60_CLEAR_MS) {
++                /* Only the penalty is cleared. Restoring the CPU clock here
++                 * would be dead: every failure now closes the gate, and every
++                 * reopen sets the clock, so by the time a run is this healthy
++                 * the clock is already what the setting asked for. */
+                 c2_60_fails = 0;
+-                /* Earned the headroom back, if the setting asked for it. */
+-                c2_60_set_cpu(c2_60_cpu_pct);
+                 c2_60_good_ms = 0;
+             }
+         }
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7891,6 +7891,7 @@
+     extern unsigned long long crash2_60fps_backoff_count(void);
+     extern unsigned crash2_60fps_hold_pct(void);
+     extern unsigned crash2_60fps_suspended(void);
++    extern int crash2_60fps_last_verdict(void);
+     const double budget = (double)json_get_int(json, "budget_ms", 0);
+     if (json_get_int(json, "reset", 0) || s_fr_base_ms == 0) {
+         frame_rates_baseline();
+@@ -7948,6 +7949,7 @@
+              "\"native_60fps\":%d,\"native_60fps_verified\":%d,"
+              "\"native_60fps_gate_open\":%d,\"native_60fps_backoffs\":%llu,"
+              "\"native_60fps_one_field_pct\":%u,\"native_60fps_demo_mode\":%u,"
++             "\"native_60fps_verdict\":%d,"
+              "\"speed\":%.3f,\"perf_samples\":%d,"
+              "\"frame_ms_p50\":%.3f,\"frame_ms_p95\":%.3f,"
+              "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
+@@ -7957,6 +7959,7 @@
+              crash2_60fps_gate_open(),
+              (unsigned long long)crash2_60fps_backoff_count(),
+              crash2_60fps_hold_pct(), crash2_60fps_suspended(),
++             crash2_60fps_last_verdict(),
+              raise_s / 59.94, psamples, p[0], p[1], p[2], (int)p[3]);
+ }
+ 
+@@ -7982,6 +7985,7 @@
+     extern unsigned crash2_60fps_loop_hz(void);
+     extern unsigned crash2_60fps_hold_pct(void);
+     extern unsigned crash2_60fps_suspended(void);
++    extern int crash2_60fps_last_verdict(void);
+     extern int crash2_60fps_gate_open(void);
+     extern unsigned crash2_60fps_frame_ticks(void);
+     int enabled = json_get_int(json, "enabled", -1);
+@@ -7994,7 +7998,7 @@
+     if (enabled >= 0) crash2_60fps_set_mode(enabled);
+     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"verified\":%d,"
+              "\"gate_open\":%s,\"cpu_percent\":%d,\"loop_hz\":%u,"
+-             "\"one_field_pct\":%u,\"demo_mode\":%u,"
++             "\"one_field_pct\":%u,\"demo_mode\":%u,\"verdict\":%d,"
+              "\"gate_opened\":%llu,\"backoffs\":%llu,"
+              "\"gate_instruction\":\"0x%08X\",\"game_frame_ticks\":%u}",
+              id, crash2_60fps_mode() ? "true" : "false",
+@@ -8002,6 +8006,7 @@
+              crash2_60fps_gate_open() ? "true" : "false",
+              crash2_60fps_cpu_percent(), crash2_60fps_loop_hz(),
+              crash2_60fps_hold_pct(), crash2_60fps_suspended(),
++             crash2_60fps_last_verdict(),
+              (unsigned long long)crash2_60fps_open_count(),
+              (unsigned long long)crash2_60fps_backoff_count(),
+              psx_read_word(0x8001685Cu), crash2_60fps_frame_ticks());
+@@ -8099,6 +8104,11 @@
+  * This may suppress pickups/other collisions too; it is not a shipped cheat. */
+ static void handle_crash2_damage_probe(int id, const char *json)
+ {
++    /* No interlock needed: the shipped no-damage assist holds the player's
++     * invincibility MODE rather than patching this word. Note that enabling
++     * this probe still marks the containing page dirty, which routes the very
++     * hot func_8001CC10 through the interpreter - fine for a measurement,
++     * unusable as a feature. That is why the assist does not do it. */
+     const uint32_t addr = 0x8001CE34u;
+     const uint32_t original = 0x14400005u; /* bne v0,zero,CE4C */
+     const uint32_t bypass = 0x10000005u;   /* beq zero,zero,CE4C */
+@@ -8128,17 +8138,26 @@
+ static void handle_crash2_cheats(int id, const char *json)
+ {
+     extern int crash2_cheat_lives_enabled(void);
+-    extern int crash2_cheat_aku_enabled(void);
++    extern int crash2_cheat_aku_level(void);
++    extern int crash2_cheat_suspended(void);
++    extern int crash2_cheat_god_active(void);
+     extern void crash2_cheat_set_lives(int on);
+-    extern void crash2_cheat_set_aku(int on);
++    extern void crash2_cheat_set_aku(int level);
+     int lives = json_get_int(json, "lives", -1);
++    /* 0 off, 1 keep masks, 2 no damage - the C2_AKU_* levels. */
+     int aku = json_get_int(json, "aku", -1);
++    if (aku > 2) { send_err(id, "aku must be 0 (off), 1 (keep masks) or 2 (no damage)"); return; }
+     if (lives >= 0) crash2_cheat_set_lives(lives);
+     if (aku >= 0) crash2_cheat_set_aku(aku);
+-    send_fmt("{\"id\":%d,\"ok\":true,\"lives\":%s,\"aku\":%s,"
++    send_fmt("{\"id\":%d,\"ok\":true,\"lives\":%s,\"aku\":%d,"
++             "\"suspended\":%s,\"god_active\":%s,"
++             "\"god_word\":\"0x%08X\","
+              "\"lives_value\":%u,\"aku_value\":%u}",
+              id, crash2_cheat_lives_enabled() ? "true" : "false",
+-             crash2_cheat_aku_enabled() ? "true" : "false",
++             crash2_cheat_aku_level(),
++             crash2_cheat_suspended() ? "true" : "false",
++             crash2_cheat_god_active() ? "true" : "false",
++             psx_read_word(0x8001CE34u),
+              (unsigned)psx_read_byte(0x8006CBD1u),
+              (unsigned)psx_read_byte(0x8006CBD5u));
+ }
+--- a/runtime/src/psx_pause_menu.c
++++ b/runtime/src/psx_pause_menu.c
+@@ -66,7 +66,7 @@
+ static int s_window;
+ static int s_fps_on;
+ static int s_lives_on;
+-static int s_aku_on;
++static int s_aku_level;
+ static int s_restart_armed;
+ static int s_dirty = 1;
+ static uint32_t s_panel[PM_W * PM_H];
+@@ -74,10 +74,10 @@
+ static const char *const ROW_LABEL[PSX_PAUSE_ROW_COUNT] = {
+     "RESUME", "QUICK SAVE", "QUICK LOAD",
+     "GAME ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS DISPLAY",
+-    "99 LIVES", "AKU AKU X2", "RESTART GAME",
++    "99 LIVES", "AKU AKU", "RESTART GAME",
+ };
+ static const char *const ASPECT_LABEL[PSX_PAUSE_ASPECT_COUNT] = {
+-    "4:3", "16:9", "21:9",
++    "4:3", "14:9", "16:9", "21:9",
+ };
+ static const char *const FIT_LABEL[PSX_PAUSE_FIT_COUNT] = {
+     "LETTERBOX", "STRETCH", "FILL", "FIT WIDTH",
+@@ -85,6 +85,12 @@
+ static const char *const WINDOW_LABEL[PSX_PAUSE_WINDOW_COUNT] = {
+     "WINDOWED", "BORDERLESS", "EXCLUSIVE",
+ };
++/* Index is the C2_AKU_* level. "KEEP 2" always leaves a mask to absorb a hit;
++ * "NO DAMAGE" holds the game's own temporary invincibility so it never lapses.
++ * Neither stops pits, crushing or drowning. */
++static const char *const AKU_LABEL[PSX_PAUSE_AKU_COUNT] = {
++    "OFF", "KEEP 2", "NO DAMAGE",
++};
+ 
+ int psx_pause_menu_row_is_option(int row)
+ {
+@@ -96,6 +102,20 @@
+         || row == PSX_PAUSE_ROW_AKU;
+ }
+ 
++int psx_pause_menu_row_at(int px, int py)
++{
++    if (px < PM_ROWS_X || px >= PM_ROWS_X + PM_ROWS_W) return -1;
++    int rel = py - PM_ROWS_Y;
++    if (rel < 0) return -1;
++    int pitch = PM_ROW_H + PM_ROW_GAP;
++    int row = rel / pitch;
++    /* Reject the gap between rows, so dragging down the list cannot land the
++     * cursor on a row the pointer is not actually over. */
++    if (rel - row * pitch >= PM_ROW_H) return -1;
++    if (row < 0 || row >= PSX_PAUSE_ROW_COUNT) return -1;
++    return row;
++}
++
+ static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
+ {
+     int x, y;
+@@ -208,7 +228,8 @@
+     case PSX_PAUSE_ROW_LIVES:
+         return s_lives_on ? "ON" : "OFF";
+     case PSX_PAUSE_ROW_AKU:
+-        return s_aku_on ? "ON" : "OFF";
++        return AKU_LABEL[(unsigned)s_aku_level < PSX_PAUSE_AKU_COUNT
++                         ? s_aku_level : 0];
+     case PSX_PAUSE_ROW_RESTART:
+         if (s_restart_armed) {
+             snprintf(buf, cap, "PRESS AGAIN");
+@@ -286,7 +307,7 @@
+ 
+ void psx_pause_menu_set_state(int open, int selected,
+                               int aspect, int fit, int window, int fps_on,
+-                              int lives_on, int aku_on,
++                              int lives_on, int aku_level,
+                               int restart_armed)
+ {
+     if (selected < 0) selected = 0;
+@@ -294,11 +315,12 @@
+     open = open ? 1 : 0;
+     fps_on = fps_on ? 1 : 0;
+     lives_on = lives_on ? 1 : 0;
+-    aku_on = aku_on ? 1 : 0;
++    if (aku_level < 0) aku_level = 0;
++    if (aku_level >= PSX_PAUSE_AKU_COUNT) aku_level = PSX_PAUSE_AKU_COUNT - 1;
+     restart_armed = restart_armed ? 1 : 0;
+     if (s_open != open || s_selected != selected || s_aspect != aspect
+         || s_fit != fit || s_window != window || s_fps_on != fps_on
+-        || s_lives_on != lives_on || s_aku_on != aku_on
++        || s_lives_on != lives_on || s_aku_level != aku_level
+         || s_restart_armed != restart_armed)
+         s_dirty = 1;
+     s_open = open;
+@@ -308,7 +330,7 @@
+     s_window = window;
+     s_fps_on = fps_on;
+     s_lives_on = lives_on;
+-    s_aku_on = aku_on;
++    s_aku_level = aku_level;
+     s_restart_armed = restart_armed;
+ }
+ 
+--- a/runtime/include/psx_pause_menu.h
++++ b/runtime/include/psx_pause_menu.h
+@@ -32,21 +32,34 @@
+ 
+ /* Value counts for the option rows, so main.cpp can wrap the cursor without
+  * hardcoding them. */
+-#define PSX_PAUSE_ASPECT_COUNT 3   /* 4:3, 16:9, 21:9 */
++/* 4:3, 14:9, 16:9, 21:9 - ascending width, matching the launcher's own list.
++ * 14:9 is the one the launcher defaults to for this title, so leaving it out
++ * meant the overlay could not return to the aspect the game had launched in. */
++#define PSX_PAUSE_ASPECT_COUNT 4
+ #define PSX_PAUSE_FIT_COUNT    4   /* letterbox, stretch, fill, fit width */
+ #define PSX_PAUSE_WINDOW_COUNT 3   /* windowed, borderless, exclusive - the
+                                     * order psx_fullscreen_flag_for_mode()
+                                     * uses, so the index IS the mode value. */
++#define PSX_PAUSE_AKU_COUNT    3   /* off, keep masks, no damage - the index IS
++                                    * the C2_AKU_* level in crash2_cheats.h. */
+ 
+ /* Non-zero when the row responds to Left/Right rather than Enter. */
+ int psx_pause_menu_row_is_option(int row);
+ 
++/* Which row covers a point in PANEL coordinates, or -1 for none. The overlay
++ * is drawn stretched across the whole window (gpu_gl_renderer.c passes
++ * 0,0,ww,wh), so a caller maps a mouse position by simple proportion:
++ *   px = mouse_x * panel_w / window_w, py = mouse_y * panel_h / window_h
++ * with the panel size from psx_pause_menu_overlay_image(). */
++int psx_pause_menu_row_at(int px, int py);
++
+ /* Push the whole visible state in one call. `aspect` and `fit` are indices,
+- * `fps_on` and `restart_armed` are booleans. Only marks dirty on real change,
++ * `fps_on` and `restart_armed` are booleans, `aku_level` is a
++ * PSX_PAUSE_AKU_COUNT index. Only marks dirty on real change,
+  * so calling it every frame is free. */
+ void psx_pause_menu_set_state(int open, int selected,
+                               int aspect, int fit, int window, int fps_on,
+-                              int lives_on, int aku_on,
++                              int lives_on, int aku_level,
+                               int restart_armed);
+ 
+ int psx_pause_menu_needs_present(void);
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6118,13 +6118,13 @@
+ static int pause_menu_restart_armed = 0;   /* Restart needs a second press */
+ static SDL_Keycode pause_menu_open_key = 0;
+ extern "C" int crash2_cheat_lives_enabled(void);
+-extern "C" int crash2_cheat_aku_enabled(void);
++extern "C" int crash2_cheat_aku_level(void);
+ extern "C" void crash2_cheat_set_lives(int on);
+-extern "C" void crash2_cheat_set_aku(int on);
++extern "C" void crash2_cheat_set_aku(int level);
+ 
+ /* Index order must match ASPECT_LABEL in psx_pause_menu.c. */
+ static const int kPauseAspect[PSX_PAUSE_ASPECT_COUNT][2] = {
+-    { 4, 3 }, { 16, 9 }, { 21, 9 }
++    { 4, 3 }, { 14, 9 }, { 16, 9 }, { 21, 9 }
+ };
+ 
+ /* Staged display changes.
+@@ -6171,7 +6171,7 @@
+                              pause_menu_aspect_index(), g_present_fit_mode,
+                              pause_menu_window_index(), fps_osd_enabled(),
+                              crash2_cheat_lives_enabled(),
+-                             crash2_cheat_aku_enabled(),
++                             crash2_cheat_aku_level(),
+                              pause_menu_restart_armed);
+ }
+ 
+@@ -6348,9 +6348,15 @@
+     case PSX_PAUSE_ROW_LIVES:
+         crash2_cheat_set_lives(!crash2_cheat_lives_enabled());
+         break;
+-    case PSX_PAUSE_ROW_AKU:
+-        crash2_cheat_set_aku(!crash2_cheat_aku_enabled());
++    case PSX_PAUSE_ROW_AKU: {
++        /* Three values, so it wraps like the aspect and fit rows rather than
++         * flipping: OFF -> KEEP 2 -> NO DAMAGE. */
++        int i = crash2_cheat_aku_level() + delta;
++        while (i < 0) i += PSX_PAUSE_AKU_COUNT;
++        while (i >= PSX_PAUSE_AKU_COUNT) i -= PSX_PAUSE_AKU_COUNT;
++        crash2_cheat_set_aku(i);
+         break;
++    }
+     default:
+         return;
+     }
+@@ -6480,6 +6486,51 @@
+     prev = now;
+ }
+ 
++/* Mouse support for the overlay.
++ *
++ * The panel is drawn stretched over the entire window (gpu_gl_renderer.c calls
++ * gl_draw_osd_image with 0,0,ww,wh), so window -> panel is a plain proportion
++ * and needs no letterbox arithmetic. Returns -1 when the pointer is not over a
++ * row, including the gaps between rows. */
++static int pause_menu_row_under_mouse(int mx, int my) {
++    const uint32_t *px = nullptr;
++    int pw = 0, ph = 0;
++    if (!psx_pause_menu_overlay_image(&px, &pw, &ph) || pw <= 0 || ph <= 0)
++        return -1;
++    int ww = 0, wh = 0;
++    SDL_GetWindowSize(sdl_window, &ww, &wh);
++    if (ww <= 0 || wh <= 0) return -1;
++    return psx_pause_menu_row_at((int)((long long)mx * pw / ww),
++                                 (int)((long long)my * ph / wh));
++}
++
++/* Hover moves the cursor but never changes a value: pointing at a row is not
++ * the same as asking for it, and a menu that alters settings as the pointer
++ * crosses them is a trap. */
++static void pause_menu_mouse_hover(int mx, int my) {
++    int row = pause_menu_row_under_mouse(mx, my);
++    if (row < 0 || row == pause_menu_sel) return;
++    pause_menu_sel = row;
++    pause_menu_restart_armed = 0;   /* moving away disarms, as the keys do */
++    pause_menu_sync_overlay();
++}
++
++static void pause_menu_mouse_click(int mx, int my, int button) {
++    int row = pause_menu_row_under_mouse(mx, my);
++    if (row < 0) return;
++    if (row != pause_menu_sel) {
++        pause_menu_sel = row;
++        pause_menu_restart_armed = 0;
++    }
++    /* Right-click steps an option backwards, which is the only way to go left
++     * without a keyboard. On an action row it does nothing. */
++    if (button == SDL_BUTTON_RIGHT) {
++        if (psx_pause_menu_row_is_option(row)) pause_menu_adjust(-1);
++        return;
++    }
++    pause_menu_activate();
++}
++
+ static void pause_menu_host_pause_loop(void) {
+     while (pause_menu_open) {
+         SDL_Event ev;
+@@ -6514,6 +6565,19 @@
+ #endif
+                 if (pause_menu_open_key == key)
+                     pause_menu_open_key = 0;
++            } else if (ev.type == SDL_MOUSEMOTION) {
++                /* SDL3 reports these as floats; the cast is the only
++                 * difference and it is exact at window resolutions. */
++                pause_menu_mouse_hover((int)ev.motion.x, (int)ev.motion.y);
++            } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
++                pause_menu_mouse_click((int)ev.button.x, (int)ev.button.y,
++                                       ev.button.button);
++            } else if (ev.type == SDL_MOUSEWHEEL) {
++                /* The wheel adjusts the row already under the cursor, so it
++                 * reads like every other settings list. */
++                int dy = (int)ev.wheel.y;
++                if (dy && psx_pause_menu_row_is_option(pause_menu_sel))
++                    pause_menu_adjust(dy > 0 ? 1 : -1);
+             }
+         }
+         pause_menu_poll_nav((uint32_t)SDL_GetTicks());
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -26,6 +26,11 @@
+                                    guard has fallen back to 30 Hz */
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
++/* Assists, so a bug report shows whether they were on. They can change
++ * saved progression, which is exactly the thing a report needs to say. */
++extern int      crash2_cheat_lives_enabled(void);
++extern int      crash2_cheat_aku_level(void);
++extern int      crash2_cheat_god_active(void);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+ extern uint32_t i_stat;                        /* memory.c */
+@@ -875,6 +880,9 @@
+         "  \"native_60fps\":%d,\n"
+         "  \"native_60fps_gate_open\":%d,\n"
+         "  \"game_frame_ticks\":%u,\n"
++        "  \"cheat_lives\":%d,\n"
++        "  \"cheat_aku_level\":%d,\n"
++        "  \"cheat_god_active\":%d,\n"
+         "  \"psx_cycle_count\":%llu,\n"
+         "  \"current_func\":\"0x%08X\",\n"
+         "  \"last_store_pc\":\"0x%08X\",\n"
+@@ -941,6 +949,9 @@
+         crash2_60fps_mode(),
+         crash2_60fps_gate_open(),
+         crash2_60fps_frame_ticks(),
++        crash2_cheat_lives_enabled(),
++        crash2_cheat_aku_level(),
++        crash2_cheat_god_active(),
+         (unsigned long long)cyc,
+         cur_fn,
+         last_store,

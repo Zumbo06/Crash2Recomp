@@ -2075,3 +2075,129 @@ until then. Demanding a shared starting world was therefore never satisfiable.
 It now measures each leg against its own baseline with the same settle on both
 sides, and compares travel, not positions. A few frames of drift against a
 four-second route is noise once the ratio is taken over many words.
+
+## Assists, part 2: the collision branch is narrower than it looked
+
+The "candidate collision bypass" at `0x8001CE34` had been carried as unshippable
+since it was first found, on the grounds that it might also suppress pickups and
+crate breaks. Reading the whole basic block shows why that fear was misplaced,
+and it is a good lesson in how far a partial disassembly can mislead.
+
+`func_8001CC10` is the GOOL conditional state-change entry: event -> state, read
+that state's entry-block mask, refuse the transition if the object's status word
+already carries any of those bits. Looking only at `0x8001CE24-50` - which is
+what the first pass did - it reads as a generic collision-mask test, and forcing
+the branch looks like it would change every collision the function handles.
+
+The line that changes the picture is four instructions earlier. `0x8001CE0C`
+loads the object pointer at `0x8005F38C` and `0x8001CE1C` is `bne s0, a0`:
+**everything below it runs for that one object only.** For it, the game reads
+`obj+0x108`, a timed invincibility mode, and ORs `0x1002` into the status word
+when the mode is 2, 3 or 4. The mode is demonstrably timed - `0x8001C0A8` is
+`sltiu v0, v0, 61`, the mercy frames after a hit, and `0x8001C0BC` times mode 3,
+the gold Aku Aku mask.
+
+So the branch asks one question: *is Crash invincible right now.* Forcing it
+makes that predicate permanently true for the player alone. Anything the gold
+mask permits, this permits; the only difference is that it does not lapse after
+fifteen seconds. That is a far smaller claim than "bypass collisions", and it is
+checkable - which is why it now ships as the Damage -> *No damage* level.
+
+The residual risk is the honest one and it is in the launcher text: an event the
+gold mask blocks harmlessly for fifteen seconds is blocked indefinitely here, so
+a scripted mount or vehicle sequence that needs one could stall. Only play
+settles that.
+
+**A data-side alternative was designed, approved, and then withdrawn.** Holding
+the global Aku byte at 3 reaches the *same* predicate - but it drags the gold
+mask's audio, HUD and contact-kill behaviour with it, and writes a field the
+engine's own mode machine owns. One word of code, reverted on demand, turned out
+to be the *less* invasive of the two. Worth remembering: "data-side" is not a
+synonym for "safer".
+
+### `0x8003ED04` was never progression code
+
+`CHEAT-MAPPING.md` justified the level-shadow mappings with a write trace that
+named `0x8003ED04` as game code restoring the Aku shadow. It is inside the
+polygon/display-list builder: `swc2` GTE stores into a primitive at `s7`, packet
+headers built with `lui 0x3400` / `0x3600` / `0x0900`, and `0x8003ED04` itself is
+`sw a1, 24(v0)` with `a1` freshly masked to 24 bits by `sll a1,s7,8` /
+`srl a1,a1,8` - the ordering-table tag link. The renderer was writing through the
+address.
+
+Both level shadows are marked unconfirmed now, and the shipped assists write only
+the globals. A write trace that reports a PC is reporting *a* writer, not the
+writer you were looking for.
+
+### The assists now suspend like the 60 FPS gate
+
+Writes are gated on the timing mode at `0x8006CD14`, the same word the frame gate
+uses. Writing 99 lives into an attract-mode demo - a recorded input stream
+replayed against the simulation - was possible before and is not now. The
+no-damage patch is restored on entering a demo rather than merely left alone, for
+the same reason: an invincible Crash desyncs a recorded run.
+
+### Two dead branches in the 60 FPS guard, and a verdict worth exporting
+
+Patch `0028` made every failed window close the gate, which quietly orphaned two
+things. The CPU restore on the sustained-good path could no longer fire, because
+every reopen already sets the clock. The `wait > RETRY_MAX` clamp could never
+fire either: the shift is capped at 3 and `8000 << 3` is exactly `RETRY_MAX`.
+Both are gone; the ceiling now lives in the shift, with the constant kept as
+documentation of the result.
+
+More useful: `FAIL_HOST` and `FAIL_HOLD` were handled identically and never
+exported, so a report could not distinguish "your machine is behind the wall
+clock" from "this scene alternates between one field and two". They want
+different answers - more host headroom versus accepting a clean 30 - so the last
+verdict is now reported by both `frame_rates` and `crash2_60fps`.
+
+## Assists, part 3: patching hot guest code is not free
+
+The no-damage assist shipped as an instruction patch on `0x8001CE34` and was
+measured broken within minutes: **8.4 seconds without a heartbeat, starvation
+watchdog abort**, with the ring dump containing nothing but the BIOS pad driver
+spinning at `0xBFC21xxx`.
+
+The mechanism is not in the cheat at all. `psx_mod_write_code_word` calls
+`dirty_ram_mark_executable_range` (`memory.c:590`), which sets the dirty bit for
+the **whole page** containing the address - and this runtime deliberately
+dispatches dirty pages through the MIPS interpreter instead of the compiled
+image. `0x8001CE34` lives inside `func_8001CC10`, the GOOL conditional
+state-change entry, which runs for every event on every object. Dropping it to
+the interpreter collapses the frame rate; everything else, the pad driver
+included, then times out.
+
+The 60 FPS gate does exactly the same thing at `0x8001685C` and has never shown
+a problem, because that page holds `func_8001658C` - the frame finalizer, once
+per frame. **Patching cold guest code is cheap here. Patching hot guest code
+costs the whole page's native execution.** That distinction was not in any of
+the reasoning that led to the patch, and it is the one that mattered.
+
+The assist now holds `player+0x108` - the same invincibility mode the branch
+reads - as a data write, restamping `player+0x10C` from the tick at
+`0x8006CB64` so the 452-frame expiry never arrives. Modes 1, 2, 5, 6 and 7 are
+left alone because the engine's own mode machine owns them. No code is
+modified, so no page is marked dirty and nothing leaves the compiled image.
+
+Worth keeping: a code patch and a data write look equally "small" in a diff, and
+here they differ by an order of magnitude in cost. `crash2_damage_probe` still
+exists and still patches the word - that is fine for a measurement, and its
+comment now says why it is not a feature.
+
+### The release tree is not a release build
+
+Chasing the above turned up something else. `PSX_NO_DEBUG_TOOLS` appears **zero
+times** in `build-clang/build.ninja` - and zero times in `build-debugtools` too.
+`runtime.cmake:1341` defines it under `if(NOT PSX_DEBUG_TOOLS)`, and
+`build_clang.ps1` passes `-DPSX_DEBUG_TOOLS=OFF` for the release tree, but the
+definition is not reaching the target. Both trees compile with the debug tools
+in.
+
+That is why the run log says `debug server LISTENING on 127.0.0.1:4370` from
+`build-clang`, and why the starvation watchdog - itself a debug tool - was able
+to abort a player build at all. It also means earlier claims in this file about
+things being "compiled in but dead in release" were wrong: they are live.
+
+Not fixed here, because turning it on changes what every release measurement so
+far was measuring. It needs its own change and its own re-baseline.

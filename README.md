@@ -47,13 +47,40 @@ page tells you to relaunch.
 
 | Key | |
 |---|---|
-| **Home** | Pause menu: restart, aspect ratio, image fit, quick save and load. On a controller, Guide or Start+Select. |
+| **Home** | Pause menu: restart, display options, quick save/load, and live lives/Aku Aku assists. On a controller, Guide or Start+Select. |
 | F5 / F9 | Quick save / quick load |
 | F7 | Save state slots |
 | F8 | Rewind |
 | F | Toggle the performance readout |
 
 Saves live in `userdata/`, next to the launcher.
+
+Settings -> Performance has an opt-in native 60 FPS mode. It can sustain about
+60 game updates per second in tested scenes and falls back to 30 when the
+machine or scene cannot hold that cadence. It is still experimental: world
+movement, scripts, FMVs and audio have not been validated across the whole
+game. The 125% clock setting affects the *emulated PS1 CPU*, not your PC CPU.
+
+The same page offers **Keep 99 lives** and a **Damage** setting with three
+positions, all off by default:
+
+| Damage | |
+|---|---|
+| Off | normal rules |
+| Keep 2 masks | Aku Aku is held at two, so a hit is always absorbed |
+| No damage | Crash is held in the invincible state the gold Aku Aku mask uses |
+
+**No damage** permits everything that mask permits - it simply does not lapse
+after fifteen seconds. It does not stop falls, crushing or drowning, does not
+make enemies die on contact, and switches itself off during the attract-mode
+demos. Because it holds an invincible state permanently, a scripted sequence
+that expects Crash to be interruptible could in principle stall; if you meet
+one, drop to *Keep 2 masks*.
+
+These change saved progression: lives and masks are written to the memory card
+as you play, so switching an assist off stops further writes but cannot undo
+values already saved. The Home-menu rows apply immediately for that session,
+while launcher choices apply on the next launch.
 
 ## If something goes wrong
 

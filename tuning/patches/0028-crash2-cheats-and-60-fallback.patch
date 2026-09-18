@@ -1,0 +1,268 @@
+diff --git a/runtime/src/crash2_cheats.h b/runtime/src/crash2_cheats.h
+new file mode 100644
+index 0000000..dc7cce3
+--- /dev/null
++++ b/runtime/src/crash2_cheats.h
+@@ -0,0 +1,58 @@
++/* SCUS-94154-only, deliberately narrow gameplay assists.
++ * Called at the outer game-loop boundary, never from the rendering thread.
++ * No writes are made unless the exact game's loop signature is present.
++ */
++#ifndef CRASH2_CHEATS_H
++#define CRASH2_CHEATS_H
++
++#include <stdint.h>
++#include <stdlib.h>
++
++#define C2_CHEAT_LOOP_PC 0x80011848u
++#define C2_CHEAT_LIVES   0x8006CBD1u
++#define C2_CHEAT_AKU     0x8006CBD5u
++
++static int c2_cheats_initialized;
++static int c2_cheat_lives;
++static int c2_cheat_aku;
++
++static void c2_cheats_init(void)
++{
++    if (c2_cheats_initialized) return;
++    const char *lives = getenv("PSX_CRASH2_CHEAT_LIVES");
++    const char *aku = getenv("PSX_CRASH2_CHEAT_AKU");
++    c2_cheat_lives = lives && lives[0] == '1' && lives[1] == '\0';
++    c2_cheat_aku = aku && aku[0] == '1' && aku[1] == '\0';
++    c2_cheats_initialized = 1;
++}
++
++int crash2_cheat_lives_enabled(void) { c2_cheats_init(); return c2_cheat_lives; }
++int crash2_cheat_aku_enabled(void) { c2_cheats_init(); return c2_cheat_aku; }
++void crash2_cheat_set_lives(int on) { c2_cheats_init(); c2_cheat_lives = on != 0; }
++void crash2_cheat_set_aku(int on) { c2_cheats_init(); c2_cheat_aku = on != 0; }
++
++static void crash2_cheats_tick(CPUState *cpu, uint32_t pc)
++{
++    extern uint8_t psx_read_byte(uint32_t addr);
++    extern void psx_write_byte(uint32_t addr, uint8_t value);
++    if (pc != C2_CHEAT_LOOP_PC ||
++        cpu->read_word(C2_CHEAT_LOOP_PC) != 0x3C028007u ||
++        cpu->read_word(C2_CHEAT_LOOP_PC + 4u) != 0x8C429944u)
++        return;
++
++    c2_cheats_init();
++
++    /* 99 rather than an out-of-range sentinel keeps the game's UI and
++     * save-card format inside their normal two-digit range. Turning the cheat
++     * off leaves the current value; it does not erase lives legitimately
++     * earned while the cheat was active. */
++    if (c2_cheat_lives && psx_read_byte(C2_CHEAT_LIVES) < 99u)
++        psx_write_byte(C2_CHEAT_LIVES, 99u);
++
++    /* Never lower 3 (the game's temporary invincible-mask state). The global
++     * value is copied to the level's own shadow on transition. */
++    if (c2_cheat_aku && psx_read_byte(C2_CHEAT_AKU) < 2u)
++        psx_write_byte(C2_CHEAT_AKU, 2u);
++}
++
++#endif /* CRASH2_CHEATS_H */
+diff --git a/runtime/src/crash2_60fps.h b/runtime/src/crash2_60fps.h
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -40,5 +40,4 @@
+ * So the gate is not a one-way switch. Every second c2_60_window_verdict looks
+- * at both, and on a failure this steps back down - for a host failure by
+- * dropping the CPU headroom first, since that is the cheaper half, otherwise
+- * by closing the gate and handing the game back its own lock. It retries later
+- * with a growing delay, and a sustained good run clears the penalty. The point
++ * at both, and on a failure closes the gate and returns the CPU clock to 100%
++ * immediately. It retries later with a growing delay, and a sustained good
++ * run clears the penalty. The point
+@@ -53,1 +52,1 @@
+- * throughput, which is why the guard drops it first.
++ * throughput, which is why the guard restores it on any back-off.
+@@ -321,11 +321,7 @@
+     if (c2_60_gate_open) {
+-        if (verdict == C2_60_FAIL_HOST && c2_60_cpu_now > 100) {
+-            /* Cheapest step first: the headroom is what costs the host the
+-             * extra guest instructions. Heavy scenes then fall back to 30
+-             * through the game's own first VSync wait, which is fine. Hold
+-             * failures are not treated this way - more headroom is what got
+-             * the scene to the boundary it is now oscillating around. */
+-            c2_60_set_cpu(100);
+-            c2_60_good_ms = 0;
+-        } else if (verdict == C2_60_FAIL_HOST || verdict == C2_60_FAIL_HOLD) {
++        if (verdict == C2_60_FAIL_HOST || verdict == C2_60_FAIL_HOLD) {
++            /* A host failure means the entire machine is already running
++             * slow, including audio. Dropping only the CPU clock while
++             * leaving the gate open allowed another second of uneven frames
++             * before the next verdict. Close immediately and retry later. */
+             c2_60_close_gate();
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -2054,3 +2054,4 @@
+ #include "crash2_sim_tick.h"
+ #include "crash2_60fps.h"
++#include "crash2_cheats.h"
+ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+@@ -2062,3 +2062,4 @@
+     crash2_sim_tick(cpu, resume_pc);
+     crash2_60fps(cpu, resume_pc);
++    crash2_cheats_tick(cpu, resume_pc);
+     s_compiled_interrupt_resume_pc = prev;
+diff --git a/runtime/include/psx_pause_menu.h b/runtime/include/psx_pause_menu.h
+--- a/runtime/include/psx_pause_menu.h
++++ b/runtime/include/psx_pause_menu.h
+@@ -24,3 +24,5 @@
+     PSX_PAUSE_ROW_WINDOW,
+     PSX_PAUSE_ROW_FPS,
++    PSX_PAUSE_ROW_LIVES,
++    PSX_PAUSE_ROW_AKU,
+     PSX_PAUSE_ROW_RESTART,
+@@ -45,3 +45,4 @@
+ void psx_pause_menu_set_state(int open, int selected,
+                               int aspect, int fit, int window, int fps_on,
++                              int lives_on, int aku_on,
+                               int restart_armed);
+diff --git a/runtime/src/psx_pause_menu.c b/runtime/src/psx_pause_menu.c
+--- a/runtime/src/psx_pause_menu.c
++++ b/runtime/src/psx_pause_menu.c
+@@ -18,4 +18,4 @@
+ #define PM_ROWS_Y 60
+-#define PM_ROW_H 36
+-#define PM_ROW_GAP 5
++#define PM_ROW_H 30
++#define PM_ROW_GAP 3
+ #define PM_ROWS_X 40
+@@ -65,3 +65,5 @@
+ static int s_window;
+ static int s_fps_on;
++static int s_lives_on;
++static int s_aku_on;
+ static int s_restart_armed;
+@@ -72,4 +72,5 @@
+ static const char *const ROW_LABEL[PSX_PAUSE_ROW_COUNT] = {
+     "RESUME", "QUICK SAVE", "QUICK LOAD",
+-    "GAME ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS DISPLAY", "RESTART GAME",
++    "GAME ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS DISPLAY",
++    "99 LIVES", "AKU AKU X2", "RESTART GAME",
+ };
+@@ -89,5 +89,7 @@
+     return row == PSX_PAUSE_ROW_ASPECT
+         || row == PSX_PAUSE_ROW_FIT
+         || row == PSX_PAUSE_ROW_WINDOW
+-        || row == PSX_PAUSE_ROW_FPS;
++        || row == PSX_PAUSE_ROW_FPS
++        || row == PSX_PAUSE_ROW_LIVES
++        || row == PSX_PAUSE_ROW_AKU;
+ }
+@@ -204,3 +204,7 @@
+     case PSX_PAUSE_ROW_FPS:
+         return s_fps_on ? "ON" : "OFF";
++    case PSX_PAUSE_ROW_LIVES:
++        return s_lives_on ? "ON" : "OFF";
++    case PSX_PAUSE_ROW_AKU:
++        return s_aku_on ? "ON" : "OFF";
+     case PSX_PAUSE_ROW_RESTART:
+@@ -252,5 +252,5 @@
+         stroke_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H,
+                     sel ? 0xFFFFD24Du : 0xFF303746u);
+-        draw_text(s_panel, PM_ROWS_X + 18, y + 14, ROW_LABEL[i], fg, 1);
++        draw_text(s_panel, PM_ROWS_X + 18, y + 11, ROW_LABEL[i], fg, 1);
+ 
+         buf[0] = 0;
+@@ -260,7 +260,7 @@
+             if (opt && sel) {
+-                draw_text(s_panel, PM_VALUE_X - 4, y + 14, "<", 0xFFFFD24Du, 1);
+-                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 14, ">",
++                draw_text(s_panel, PM_VALUE_X - 4, y + 11, "<", 0xFFFFD24Du, 1);
++                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 11, ">",
+                           0xFFFFD24Du, 1);
+             }
+-            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 14, val,
++            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 11, val,
+                         sub, 1);
+@@ -276,3 +276,3 @@
+     draw_text(s_panel, 32, 458,
+-              "DISPLAY CHANGES APPLY NOW BUT RESET ON NEXT LAUNCH",
++              "MENU CHANGES APPLY NOW BUT RESET ON NEXT LAUNCH",
+               0xFF7F8796u, 1);
+@@ -287,3 +287,4 @@
+ void psx_pause_menu_set_state(int open, int selected,
+                               int aspect, int fit, int window, int fps_on,
++                              int lives_on, int aku_on,
+                               int restart_armed)
+@@ -292,6 +292,9 @@
+     open = open ? 1 : 0;
+     fps_on = fps_on ? 1 : 0;
++    lives_on = lives_on ? 1 : 0;
++    aku_on = aku_on ? 1 : 0;
+     restart_armed = restart_armed ? 1 : 0;
+     if (s_open != open || s_selected != selected || s_aspect != aspect
+         || s_fit != fit || s_window != window || s_fps_on != fps_on
++        || s_lives_on != lives_on || s_aku_on != aku_on
+         || s_restart_armed != restart_armed)
+@@ -306,3 +306,5 @@
+     s_window = window;
+     s_fps_on = fps_on;
++    s_lives_on = lives_on;
++    s_aku_on = aku_on;
+     s_restart_armed = restart_armed;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6117,4 +6117,8 @@
+ static int pause_menu_restart_armed = 0;   /* Restart needs a second press */
+ static SDL_Keycode pause_menu_open_key = 0;
++extern "C" int crash2_cheat_lives_enabled(void);
++extern "C" int crash2_cheat_aku_enabled(void);
++extern "C" void crash2_cheat_set_lives(int on);
++extern "C" void crash2_cheat_set_aku(int on);
+ 
+ /* Index order must match ASPECT_LABEL in psx_pause_menu.c. */
+@@ -6168,4 +6168,6 @@
+     psx_pause_menu_set_state(pause_menu_open, pause_menu_sel,
+                              pause_menu_aspect_index(), g_present_fit_mode,
+                              pause_menu_window_index(), fps_osd_enabled(),
++                             crash2_cheat_lives_enabled(),
++                             crash2_cheat_aku_enabled(),
+                              pause_menu_restart_armed);
+@@ -6337,4 +6337,10 @@
+     case PSX_PAUSE_ROW_FPS:
+         fps_osd_set(!fps_osd_enabled());
+         break;
++    case PSX_PAUSE_ROW_LIVES:
++        crash2_cheat_set_lives(!crash2_cheat_lives_enabled());
++        break;
++    case PSX_PAUSE_ROW_AKU:
++        crash2_cheat_set_aku(!crash2_cheat_aku_enabled());
++        break;
+     default:
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8122,2 +8122,23 @@
+              id, current == bypass ? "true" : "false", current);
+ }
++
++/* Query or toggle the same assists the launcher and Home menu use. The
++ * response includes the actual global bytes so automation can distinguish an
++ * enabled flag from an effective write. Debugtools only. */
++static void handle_crash2_cheats(int id, const char *json)
++{
++    extern int crash2_cheat_lives_enabled(void);
++    extern int crash2_cheat_aku_enabled(void);
++    extern void crash2_cheat_set_lives(int on);
++    extern void crash2_cheat_set_aku(int on);
++    int lives = json_get_int(json, "lives", -1);
++    int aku = json_get_int(json, "aku", -1);
++    if (lives >= 0) crash2_cheat_set_lives(lives);
++    if (aku >= 0) crash2_cheat_set_aku(aku);
++    send_fmt("{\"id\":%d,\"ok\":true,\"lives\":%s,\"aku\":%s,"
++             "\"lives_value\":%u,\"aku_value\":%u}",
++             id, crash2_cheat_lives_enabled() ? "true" : "false",
++             crash2_cheat_aku_enabled() ? "true" : "false",
++             (unsigned)psx_read_byte(0x8006CBD1u),
++             (unsigned)psx_read_byte(0x8006CBD5u));
++}
+@@ -13825,2 +13846,3 @@
+     { "crash2_damage_probe", handle_crash2_damage_probe },
++    { "crash2_cheats", handle_crash2_cheats },
+     { "gl_ws_ablate",      handle_gl_ws_ablate },

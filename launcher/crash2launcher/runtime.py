@@ -128,6 +128,13 @@ def _build_env(settings: Settings) -> dict[str, str]:
         env["PSX_CRASH2_60FPS"] = "1"
         env["PSX_CRASH2_60FPS_CPU_PCT"] = str(settings.native_60fps_cpu_percent)
 
+    if settings.cheat_infinite_lives:
+        env["PSX_CRASH2_CHEAT_LIVES"] = "1"
+    # The level by name, not a flag. The runtime still accepts the old "1" so a
+    # settings file or launcher from the checkbox build keeps working.
+    if settings.cheat_aku_aku != "off":
+        env["PSX_CRASH2_CHEAT_AKU"] = settings.cheat_aku_aku
+
     if settings.merge_all_input:
         env["PSX_DEV_INPUT"] = "1"
 

@@ -14,6 +14,11 @@ segments are consumed per guest VBlank. Assert the mode with
 "expected_game_frame_ticks" (17 = the engine simulated 60 Hz steps, 34 = 30 Hz),
 "min_speed" (guest time keeping up with the wall clock) and "max_backoffs" (how
 many times the runtime's sustain guard gave up and fell back to 30).
+
+A scenario can also drive the assists with "cheat_lives" (bool) and "cheat_aku"
+(0 off, 1 keep masks, 2 no damage). Both are set before the route and cleared
+afterwards whatever the outcome, so a scenario can never inherit the previous
+run's state - the same rule the 60 FPS mode follows, and for the same reason.
 """
 
 from __future__ import annotations
@@ -92,6 +97,9 @@ def validate_scenario(scenario: dict) -> list[tuple[int, int]]:
     share = scenario.get("min_one_field_pct")
     if share is not None and not 0 <= share <= 100:
         raise ValueError("min_one_field_pct must be 0..100")
+    aku = scenario.get("cheat_aku")
+    if aku is not None and aku not in (0, 1, 2):
+        raise ValueError("cheat_aku must be 0 (off), 1 (keep masks) or 2 (no damage)")
     return route
 
 
@@ -117,20 +125,31 @@ def run(client: DebugClient, scenario: dict, timeout: float) -> dict:
     # it was built from - which has already cost one test run.
     probe = client.call("frame_rates")
     for field in ("game_frame_ticks", "native_60fps_gate_open",
-                  "native_60fps_one_field_pct"):
+                  "native_60fps_one_field_pct", "native_60fps_verdict"):
         if field not in probe:
             raise RuntimeError(
                 f"the running game does not report {field!r}: it predates the "
                 "60 FPS sustain guard. Rebuild with _build/build_clang.ps1 "
+                "(close the game first - it holds its own .exe) and relaunch.")
+    cheat_probe = client.call("crash2_cheats")
+    for field in ("aku", "god_word", "suspended"):
+        if field not in cheat_probe:
+            raise RuntimeError(
+                f"the running game does not report {field!r}: its assists "
+                "predate the Aku levels. Rebuild with _build/build_clang.ps1 "
                 "(close the game first - it holds its own .exe) and relaunch.")
     # Always set the mode explicitly, both ways. A scenario that expects stock
     # 30 Hz has to say so to the runtime, or it inherits whatever the previous
     # run left behind and measures the wrong thing.
     client.call("crash2_60fps", enabled=1 if scenario.get("native_60fps") else 0,
                 cpu_percent=scenario.get("cpu_percent", 125))
+    client.call("crash2_cheats",
+                lives=1 if scenario.get("cheat_lives") else 0,
+                aku=scenario.get("cheat_aku", 0))
     try:
         return _run_route(client, scenario, route, timeout)
     finally:
+        client.call("crash2_cheats", lives=0, aku=0)
         client.call("crash2_60fps", enabled=0)
 
 

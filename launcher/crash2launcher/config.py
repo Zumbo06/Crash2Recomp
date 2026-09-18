@@ -51,6 +51,9 @@ OUTPUT_RESOLUTIONS = (
 
 # How the image fills the output canvas.
 SCALING_MODES = ("letterbox", "stretch", "fill", "fit_width")
+# Aku Aku assist strengths. The index into this tuple is the C2_AKU_* level the
+# runtime uses, so the order is part of the contract with crash2_cheats.h.
+CHEAT_AKU_LEVELS = ("off", "keep_masks", "no_damage")
 
 # The runtime's own cap was raised 4 -> 8 (tuning/patches/0003). The UI stops
 # at 6: on the hardware this was developed against, 8x allocated and reported
@@ -212,6 +215,20 @@ class Settings:
     # 564,480-cycle field, which is where 125 comes from.
     native_60fps_cpu_percent: int = 125
 
+    # SCUS-94154 assists. Opt-in, and they can change saved progression.
+    cheat_infinite_lives: bool = False
+    # "off", "keep_masks" or "no_damage". Two levels rather than two separate
+    # toggles, because they are two strengths of the same protection and a
+    # player should not have to work out how they interact.
+    #
+    # keep_masks holds the mask count at 2, so a hit is always absorbed. It is
+    # a pure data write, indistinguishable to the engine from having collected
+    # them. no_damage instead flips the one instruction (0x8001CE34) that asks
+    # "is Crash invincible right now" - which the game already answers yes to
+    # while the gold Aku Aku mask is up, so it permits everything that mask
+    # permits, without lapsing after 15 seconds.
+    cheat_aku_aku: str = "off"
+
     # --- performance ------------------------------------------------------
     fast_loading: bool = False
     cd_speed_boost: bool = False
@@ -317,6 +334,8 @@ class Settings:
         self.audio_latency_ms = max(30, min(500, int(self.audio_latency_ms or 90)))
         if self.vsync not in (-1, 0, 1):
             self.vsync = 0
+        if self.cheat_aku_aku not in CHEAT_AKU_LEVELS:
+            self.cheat_aku_aku = "off"
         # The runtime rejects anything outside this range and would silently
         # fall back to its own default, so clamp where the value is visible.
         self.native_60fps_cpu_percent = max(
@@ -380,7 +399,14 @@ def load(path: Path) -> Settings:
         return Settings()
 
     known = {f.name for f in fields(Settings)}
-    return Settings(**{k: v for k, v in raw.items() if k in known}).clamp()
+    values = {k: v for k, v in raw.items() if k in known}
+    # cheat_aku_aku shipped as a checkbox first. A settings file written by that
+    # build carries a bool, and load() filters by field NAME only, so without
+    # this the bool would land in the field and clamp() would quietly reset a
+    # player's choice to off.
+    if isinstance(values.get("cheat_aku_aku"), bool):
+        values["cheat_aku_aku"] = "keep_masks" if values["cheat_aku_aku"] else "off"
+    return Settings(**values).clamp()
 
 
 # --------------------------------------------------------------------------

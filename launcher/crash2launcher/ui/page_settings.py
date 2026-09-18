@@ -84,6 +84,12 @@ WIDESCREEN_MODES = [
     ("Native-wide - needs per-game data", True),
 ]
 
+# Values are config.CHEAT_AKU_LEVELS; the runtime takes the name verbatim.
+CHEAT_AKU_UI = [
+    ("Off", "off"),
+    ("Keep 2 masks", "keep_masks"),
+    ("No damage", "no_damage"),
+]
 SCALING_MODES_UI = [
     ("Letterbox - keep shape, bars", "letterbox"),
     ("Fill - keep shape, crop edges", "fill"),
@@ -166,12 +172,13 @@ INTERP_TARGETS = [
 # 150px wide, sharing the NavButton style with the real sidebar. They are now
 # driven from the main window via show_section(), so there is one rail.
 # "Video" is the old Display + Image sections merged - neither filled a page.
-SECTIONS = ["Video", "Audio", "Input", "Performance"]
+SECTIONS = ["Video", "Audio", "Input", "Performance", "Cheats"]
 SECTION_HINTS = {
     "Video": "Resolution, aspect and image quality. Applies on next launch.",
     "Audio": "Output level and mixing.",
     "Input": "Controllers, save states and the keys used while playing.",
     "Performance": "Frame pacing and how streamed level code is executed.",
+    "Cheats": "Optional assists. They change saved progression.",
 }
 
 
@@ -219,7 +226,8 @@ class SettingsPage(QWidget):
         for builders in ((self._display_page, self._image_page),
                          (self._audio_page,),
                          (self._input_page,),
-                         (self._performance_page,)):
+                         (self._performance_page,),
+                         (self._cheats_page,)):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -527,6 +535,37 @@ class SettingsPage(QWidget):
             ),
         )
 
+    def _cheats_page(self) -> QWidget:
+        """Their own section: they are not performance settings, and putting
+        something that rewrites a save two cards below "Frame pacing" made it
+        easy to switch on without reading why that matters."""
+        return self._wrap(
+            card(
+                section("Assists"),
+                self.cheat_infinite_lives,
+                row("Damage", self.cheat_aku_aku),
+                dim("Off by default. \"Keep 2 masks\" holds Aku Aku at two so "
+                    "a hit is always absorbed; temporary invincibility you "
+                    "already have is never reduced. \"No damage\" holds Crash "
+                    "in the invincible state the gold Aku Aku mask uses, so it "
+                    "permits everything that mask permits."),
+                dim("Neither stops falls, crushing or drowning, and both switch "
+                    "themselves off during the attract-mode demos so a recorded "
+                    "run cannot desync."),
+            ),
+            card(
+                section("Before you turn these on"),
+                dim("They change saved progression. Lives and masks are written "
+                    "to your memory card as you play, so switching an assist "
+                    "off stops further writes but cannot undo values already "
+                    "saved. Copy the userdata folder first if you care "
+                    "about the file."),
+                dim("The Home menu has the same two rows and applies them "
+                    "immediately for that session; a choice made here applies "
+                    "on the next launch."),
+            ),
+        )
+
     def _performance_page(self) -> QWidget:
         self.vsync = self._combo(VSYNC_MODES, self.settings.vsync, self._on_vsync)
 
@@ -541,6 +580,12 @@ class SettingsPage(QWidget):
         self.native_60fps = QCheckBox("60 FPS game updates")
         self.native_60fps.setChecked(self.settings.native_60fps)
         self.native_60fps.toggled.connect(self._on_native_60fps)
+
+        self.cheat_infinite_lives = QCheckBox("Keep 99 lives")
+        self.cheat_infinite_lives.setChecked(self.settings.cheat_infinite_lives)
+        self.cheat_infinite_lives.toggled.connect(self._on_cheat_infinite_lives)
+        self.cheat_aku_aku = self._combo(CHEAT_AKU_UI, self.settings.cheat_aku_aku,
+                                         self._on_cheat_aku_aku)
 
         self.native_overlays = QCheckBox("Compile level code natively")
         self.native_overlays.setChecked(self.settings.native_overlays)
@@ -568,14 +613,13 @@ class SettingsPage(QWidget):
             card(
                 section("Game update rate"),
                 self.native_60fps,
-                dim("Runs Crash 2's own game loop at 60 instead of 30. This is "
-                    "the simulation, not a smoothing filter: the game removes "
-                    "the second VSync wait it uses to round every frame up to "
-                    "two fields, and its own frame-time compensation keeps "
-                    "world speed the same. The emulated PS1 CPU runs at 125% "
-                    "so a frame's work fits; scenes that still do not fit fall "
-                    "back to 30 the way they do on hardware. Takes effect on "
-                    "the next launch."),
+                dim("Experimental native game updates, not interpolation. "
+                    "Some scenes hold 60; others fall back to 30. World-speed, "
+                    "script and audio timing across the whole game are not yet "
+                    "validated. The emulated PS1 CPU can run at 125%; your "
+                    "physical CPU is not overclocked. Keep native level-code "
+                    "compilation on for the best chance of holding 60. "
+                    "Relaunch to apply."),
             ),
             card(
                 section("Execution"),
@@ -664,6 +708,7 @@ class SettingsPage(QWidget):
             (self.overscan, self.settings.overscan_top),
             (self.vsync, self.settings.vsync),
             (self.interp_fps, self.settings.frame_interpolation_fps),
+            (self.cheat_aku_aku, self.settings.cheat_aku_aku),
         ):
             idx = box.findData(value)
             if idx >= 0:
@@ -673,6 +718,7 @@ class SettingsPage(QWidget):
         self.persp.setChecked(self.settings.perspective_texturing)
         self.interp.setChecked(self.settings.frame_interpolation)
         self.native_60fps.setChecked(self.settings.native_60fps)
+        self.cheat_infinite_lives.setChecked(self.settings.cheat_infinite_lives)
         self._loading = False
         self._sync_dependent_controls()
         self._refresh_preset_label()
@@ -797,6 +843,14 @@ class SettingsPage(QWidget):
 
     def _on_native_60fps(self, on: bool) -> None:
         self.settings.native_60fps = on
+        self._touch()
+
+    def _on_cheat_infinite_lives(self, on: bool) -> None:
+        self.settings.cheat_infinite_lives = on
+        self._touch()
+
+    def _on_cheat_aku_aku(self, index: int) -> None:
+        self.settings.cheat_aku_aku = self.cheat_aku_aku.itemData(index)
         self._touch()
 
     def _on_merge(self, on: bool) -> None:
