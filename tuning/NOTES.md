@@ -2201,3 +2201,83 @@ things being "compiled in but dead in release" were wrong: they are live.
 
 Not fixed here, because turning it on changes what every release measurement so
 far was measuring. It needs its own change and its own re-baseline.
+
+## 60 FPS, part 4: the guard was most of the instability
+
+Reported as "native 60fps is not stable". It was, and the biggest single cause
+was the sustain guard closing the gate on **one** bad window.
+
+A crate cascade, an explosion or a room transition is one bad second. Under the
+old rule that cost the whole level 8-64 seconds of 30 Hz, then a retry, then
+often the same thing again - so a scene that could mostly hold 60 flapped
+between 60 and 30 instead. The guard was built to stop the ragged 45-50 regime
+and it did, but it was tuned as though every bad second were evidence about the
+scene rather than about that second.
+
+What changed:
+
+- **Two consecutive windows before a hold failure closes anything.** Host
+  failures still act immediately - they mean the machine is already running
+  slow, audio included, and a second opinion costs another second of it.
+- **A hold failure now buys guest headroom first.** "Host fine, hold failing"
+  is exactly "the guest cannot fit its frame in one field", and guest clock is
+  the one lever that addresses it. It jumps straight to 150% rather than
+  laddering 135/145/150: the question is whether more clock fixes this scene,
+  and three extra ragged seconds discovering it does not is the wrong trade.
+  Any close restores 100% immediately, so a host overrun caused by the extra
+  clock self-corrects within one window.
+- **A penalty is only forgiven by a comfortable window** (92% against an 85%
+  line). Without the gap a scene sitting on the threshold alternates fail/pass,
+  banks credit between failures, and retries forever - flapping by
+  construction.
+- **Loads and 2D screens became their own verdict, C2_60_QUIET.** They were
+  silently counted as OK, which let a long load bank credit a scene had never
+  earned. They now bank nothing, and since whatever follows a load is a
+  different scene, they clear the penalty and release the latch.
+- **After four back-offs the retry timer stops.** A level that has failed four
+  times is not going to start holding 60 because a clock expired, and each
+  retry costs a second of the ragged regime. The next load releases it.
+
+The shape of the lesson: a stability guard that reacts to single samples is not
+a stability guard. Every one of these is hysteresis of some kind - a streak
+before acting, a margin before forgiving, a latch before retrying - and the
+first version had none of them.
+
+## 60 FPS, part 5: retuned for smoothness, and one change reverted
+
+Reported as "runs terrible, fps drops, lots of stutters" - after part 4, so the
+first question was what part 4 broke.
+
+**The CPU escalation was a mistake and is gone.** Part 4 added an automatic
+jump to 150% guest clock on a hold failure, reasoning that "host fine, hold
+failing" is a guest-budget shortfall and guest clock is the lever for it. The
+logic holds; the premise did not. A measured sweep on this machine had already
+found no trustworthy improvement from a higher clock, and that result was in
+hand before the escalation was written. Worse, the escalation fires in exactly
+the scenes where the host is closest to its limit, so it adds 50% more emulated
+work per wall-clock second at the moment there is least room for it. It
+generated the stutter it was meant to cure.
+
+`native_60fps_cpu_percent` now defaults to **100**. The cycle measurement that
+justified 125 (p95 672,072 against a 564,480-cycle field) is still true and the
+knob is still there, but a number derived from guest cycles says nothing about
+whether the host can afford them.
+
+**The acceptance threshold was far too lenient.** `C2_60_MIN_HOLD` was 85,
+which accepts one frame in seven being doubled - several visible hitches every
+second - and then reports the scene as holding 60. That single constant is
+probably most of what "lots of stutters" was. It is 95 now, with the forgive
+margin at 99. Scenes that cannot keep nearly every frame on one field get a
+clean 30 instead, which is steadier than a ragged 56 because a rate no display
+period divides never looks smooth however high its average.
+
+**Closing is fast again, retrying is slow.** Part 4's two-window streak made
+each bad episode last twice as long. The flapping it was aimed at is better
+solved at the other end: close on the first bad window, then wait 20 s (then
+40 s) and latch after two failures. Total visible ragged time per level drops
+from repeated multi-second cycles to about one second.
+
+The general shape, worth keeping: **for a smoothness guard, the cost of being
+wrong is asymmetric.** Being slow to close is paid in visible judder every
+time; being slow to re-open is paid in a frame rate that is merely lower. Tune
+the two ends differently.

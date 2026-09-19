@@ -2,11 +2,20 @@
   "name": "native60-never-runs-slow",
   "require_game_loop": true,
   "native_60fps": true,
-  "cpu_percent": 125,
+  "cpu_percent": 100,
   "min_speed": 0.95,
   "steps": [
-    {"frames": 360, "buttons": "0xFFFF"},
-    {"frames": 240, "buttons": "0xFFEF"},
-    {"frames": 120, "buttons": "0xFFFF"}
+    {
+      "frames": 360,
+      "buttons": "0xFFFF"
+    },
+    {
+      "frames": 240,
+      "buttons": "0xFFEF"
+    },
+    {
+      "frames": 120,
+      "buttons": "0xFFFF"
+    }
   ]
 }

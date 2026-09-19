@@ -59,7 +59,9 @@ Settings -> Performance has an opt-in native 60 FPS mode. It can sustain about
 60 game updates per second in tested scenes and falls back to 30 when the
 machine or scene cannot hold that cadence. It is still experimental: world
 movement, scripts, FMVs and audio have not been validated across the whole
-game. The 125% clock setting affects the *emulated PS1 CPU*, not your PC CPU.
+game. It runs the game loop at 60 where a scene can hold it smoothly and
+falls back to a clean 30 where it cannot, which is steadier than a rate no
+display period divides.
 
 The same page offers **Keep 99 lives** and a **Damage** setting with three
 positions, all off by default:

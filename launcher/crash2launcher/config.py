@@ -210,10 +210,17 @@ class Settings:
     # Guest CPU-only headroom used while the mode is on, as a percentage of
     # the real PS1 clock. VBlank, CD, SPU and the timers - including the root
     # counter the engine measures frame time with - stay at their original
-    # rate, so this buys work per field without moving game time. At the
-    # Turtle Woods crates the loop needed p95 672,072 cycles against a
-    # 564,480-cycle field, which is where 125 comes from.
-    native_60fps_cpu_percent: int = 125
+    # rate, so this buys guest work per field without moving game time.
+    #
+    # Defaults to 100 - off. The cycle measurement at the Turtle Woods crates
+    # (p95 672,072 against a 564,480-cycle field) says 125 should let that
+    # scene fit, and it is kept available for that reason, but a measured
+    # sweep produced no trustworthy improvement in play: every extra percent
+    # is more emulated work per wall-clock second, and the scenes that need it
+    # are the ones where the host is already closest to its limit. Raising it
+    # made stutter worse, not better. Raise it only if a measurement on your
+    # machine says otherwise.
+    native_60fps_cpu_percent: int = 100
 
     # SCUS-94154 assists. Opt-in, and they can change saved progression.
     cheat_infinite_lives: bool = False

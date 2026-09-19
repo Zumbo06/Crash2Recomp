@@ -28,6 +28,21 @@ The overlay's GAME ASPECT row also gains 14:9, which the launcher has always
 offered and defaults to for this title - without it the Home menu could not
 return to the aspect the game had launched in.
 
+60 FPS stability, retuned for smoothness. The acceptance threshold was 85%,
+which accepts one frame in seven being doubled - visible judder several times a
+second - while reporting the scene as holding 60; it is 95% now, with the
+forgive margin at 99%, so a scene that cannot keep nearly every frame on one
+field gets a clean 30 instead of a ragged 56. The gate closes on the first bad
+window (deciding slowly is paid in visible judder), then waits 20s, then 40s,
+and latches after two back-offs; loads and 2D screens are their own verdict
+rather than a silent pass, bank no credit, and release the latch because
+whatever follows one is a different scene.
+
+An automatic jump to 150% guest clock on a hold failure was added and then
+removed: a measured sweep found no trustworthy improvement, and it fires in
+exactly the scenes where the host is nearest its limit, so it produced the
+stutter it was meant to cure. native_60fps_cpu_percent now defaults to 100.
+
 60 FPS guard: drop two branches patch 0028 made unreachable - the CPU restore
 on the sustained-good path (every reopen already sets the clock) and the
 RETRY_MAX comparison (the shift is capped at 3 and 8000 << 3 is exactly that) -
@@ -247,27 +262,91 @@ tell a host overrun from a scene on the one-field boundary.
  #endif /* CRASH2_CHEATS_H */
 --- a/runtime/src/crash2_60fps.h
 +++ b/runtime/src/crash2_60fps.h
-@@ -90,7 +90,10 @@
+@@ -85,12 +85,35 @@
+  * image is ~76%. 85 sits between the two and puts the line near 52 loops/s.
+  * Anything below it is the alternating regime this exists to reject - see the
+  * comment on c2_60_window_verdict. */
+-#define C2_60_MIN_HOLD    85u
++/* 85 was far too lenient: it accepts one frame in seven being doubled, which
++ * on a 60 Hz display is visible judder several times a second, and the guard
++ * then reported the scene as "holding 60". The complaint this threshold
++ * exists to answer is stutter, so it is set where the result is actually
++ * smooth. A scene below it gets a clean 30, which is steadier than a ragged
++ * 56. PSX_CRASH2_60FPS_HOLD_PCT overrides it either way. */
++#define C2_60_MIN_HOLD    95u
++/* A window only counts towards forgiving past failures if it clears the line
++ * comfortably. Without the gap, a scene dithering either side of MIN_HOLD
++ * banks "good" seconds between its failures and never stops retrying. */
++#define C2_60_HOLD_GOOD   99u
++/* Every second spent deciding is a second of the ragged regime the player can
++ * see, so the gate closes on the FIRST bad window. Waiting for a second
++ * opinion was tried and made the stutter last longer, not less often; what
++ * stops the flapping is the long retry and the latch below, not a slow close. */
++#define C2_60_HOLD_STREAK 1u
++/* Consecutive back-offs before the retry timer stops entirely. Two, because
++ * every retry costs another visible second and a level that has failed twice
++ * is not about to start holding 60 because a clock expired. Released by the
++ * next quiet window - see C2_60_QUIET. */
++#define C2_60_GIVE_UP     2
+ /* Windows with fewer loops than this are not judged on hold at all: a load or
   * 2D screen legitimately updates ~8 times a second and is not a failure. */
  #define C2_60_MIN_LOOPS   20u
- #define C2_60_RETRY_MS    8000u    /* doubles per consecutive failure */
+-#define C2_60_RETRY_MS    8000u    /* doubles per consecutive failure */
 -#define C2_60_RETRY_MAX   64000u
-+#define C2_60_RETRY_MAX   64000u   /* the ceiling that cap produces: the shift
-+                                    * stops at 3 and 8000 << 3 is exactly this,
-+                                    * so it documents the result rather than
-+                                    * clamping anything. */
++/* 20s, then 40s. Long on purpose: a retry that fails costs a visible second,
++ * so probing often is the expensive choice. The shift is capped at 1 and
++ * 20000 << 1 is exactly C2_60_RETRY_MAX, so the ceiling is in the shift. */
++#define C2_60_RETRY_MS    20000u
++#define C2_60_RETRY_MAX   40000u
  #define C2_60_CLEAR_MS    10000u   /* sustained 60 that forgives past failures */
  
  /* Verdicts from one window. */
-@@ -107,6 +110,7 @@
+@@ -98,6 +121,7 @@
+ #define C2_60_OK          0
+ #define C2_60_FAIL_HOST   1        /* emulator behind the wall clock */
+ #define C2_60_FAIL_HOLD   2        /* scene cannot stay on one field */
++#define C2_60_QUIET       3        /* too few loops to judge: load, 2D, pause */
+ 
+ static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
+ static int c2_60_cpu_pct = 125;        /* what the setting asked for */
+@@ -107,6 +131,9 @@
  static int c2_60_suspended;            /* held closed by the timing mode */
  static unsigned c2_60_timing_mode;
  static int c2_60_fails;                /* consecutive back-offs */
++static unsigned c2_60_hold_bad;        /* consecutive hold-failure windows */
++static int c2_60_latched;              /* gave up until the scene changes */
 +static int c2_60_verdict = C2_60_PENDING;  /* last completed window */
  static int c2_60_hold_pct = C2_60_MIN_HOLD;
  static unsigned long long c2_60_opened, c2_60_backoffs;
  
-@@ -181,6 +185,11 @@
+@@ -161,6 +188,26 @@
+     c2_60_set_cpu(100);
+ }
+ 
++/* Close the gate, hand the guest clock back, and set when to try again.
++ *
++ * 20s, then 40s. The shift is capped at 1 and 20000 << 1 is exactly
++ * C2_60_RETRY_MAX, so the ceiling is in the shift rather than in a comparison
++ * that could never fire. After C2_60_GIVE_UP of these the timer stops
++ * altogether: a level that has failed twice will not start holding 60 because
++ * a clock expired, and every retry costs a visible second of ragged frames.
++ * The next quiet window - a load, a 2D screen - releases the latch. */
++static void c2_60_back_off(unsigned long long now)
++{
++    c2_60_close_gate();
++    c2_60_backoffs++;
++    c2_60_hold_bad = 0;
++    c2_60_good_ms = 0;
++    c2_60_retry_at = now
++        + (C2_60_RETRY_MS << (c2_60_fails < 1 ? c2_60_fails : 1));
++    if (c2_60_fails < 16) c2_60_fails++;
++    if (c2_60_fails >= C2_60_GIVE_UP) c2_60_latched = 1;
++}
++
+ /* The engine's own opinion of how long the last frame took, in 1/1033.6 s
+  * ticks snapped to whole NTSC fields. 17 means it simulated a 60 Hz step, 34 a
+  * 30 Hz one. This is the number motion is multiplied by, so it - not the host
+@@ -181,6 +228,11 @@
   * This is the number the hold decision is made on, so report it: a scene that
   * keeps falling back is answering with it. */
  unsigned crash2_60fps_hold_pct(void) { return c2_60_hold_seen; }
@@ -279,22 +358,28 @@ tell a host overrun from a scene on the one-field boundary.
  /* Non-zero while the gate is held closed because the game is recording or
   * replaying a demo, rather than because the scene could not hold 60. The two
   * are not the same thing and a report that conflated them would send someone
-@@ -251,11 +260,11 @@
+@@ -251,11 +303,15 @@
      c2_60_win_loops = c2_60_win_one_field = 0;
  
      if (vblanks * 1000u < (unsigned long long)C2_60_MIN_VBLANK * span)
 -        return C2_60_FAIL_HOST;
-+        return (c2_60_verdict = C2_60_FAIL_HOST);
-     if (c2_60_hold_pct > 0 && loops >= C2_60_MIN_LOOPS
-         && one_field * 100u < (unsigned)c2_60_hold_pct * loops)
+-    if (c2_60_hold_pct > 0 && loops >= C2_60_MIN_LOOPS
+-        && one_field * 100u < (unsigned)c2_60_hold_pct * loops)
 -        return C2_60_FAIL_HOLD;
 -    return C2_60_OK;
++        return (c2_60_verdict = C2_60_FAIL_HOST);
++    /* Loads, 2D screens and the pause menu update a handful of times a second
++     * by design. Judging them on hold would be wrong, and counting them as
++     * good would let a long load bank credit a scene never earned. */
++    if (loops < C2_60_MIN_LOOPS)
++        return (c2_60_verdict = C2_60_QUIET);
++    if (c2_60_hold_pct > 0 && one_field * 100u < (unsigned)c2_60_hold_pct * loops)
 +        return (c2_60_verdict = C2_60_FAIL_HOLD);
 +    return (c2_60_verdict = C2_60_OK);
  }
  
  /* Called at the outer game loop, so at most once per simulated frame: the six
-@@ -307,12 +316,19 @@
+@@ -307,41 +363,75 @@
       * with the scene, so this earns no penalty and no retry delay - the gate
       * comes straight back when live play resumes. */
      if (c2_60_timing_mode != 0u) {
@@ -316,33 +401,80 @@ tell a host overrun from a scene on the one-field boundary.
          return;
      }
      c2_60_suspended = 0;
-@@ -325,17 +341,21 @@
-              * before the next verdict. Close immediately and retry later. */
-             c2_60_close_gate();
-             c2_60_backoffs++;
+ 
+     if (c2_60_gate_open) {
+-        if (verdict == C2_60_FAIL_HOST || verdict == C2_60_FAIL_HOLD) {
+-            /* A host failure means the entire machine is already running
+-             * slow, including audio. Dropping only the CPU clock while
+-             * leaving the gate open allowed another second of uneven frames
+-             * before the next verdict. Close immediately and retry later. */
+-            c2_60_close_gate();
+-            c2_60_backoffs++;
 -            unsigned long long wait = C2_60_RETRY_MS << (c2_60_fails < 3 ? c2_60_fails : 3);
 -            if (wait > C2_60_RETRY_MAX) wait = C2_60_RETRY_MAX;
 -            c2_60_retry_at = now + wait;
-+            /* 8s, 16s, 32s, 64s. The shift is capped at 3 and
-+             * 8000 << 3 == C2_60_RETRY_MAX exactly, so the cap is in the shift
-+             * rather than in a comparison that could never fire. */
-+            c2_60_retry_at = now
-+                + (C2_60_RETRY_MS << (c2_60_fails < 3 ? c2_60_fails : 3));
-             if (c2_60_fails < 16) c2_60_fails++;
-             c2_60_good_ms = 0;
+-            if (c2_60_fails < 16) c2_60_fails++;
+-            c2_60_good_ms = 0;
++        if (verdict == C2_60_FAIL_HOST) {
++            /* The machine is already running slow, audio included. Nothing is
++             * gained by waiting for a second opinion, and more guest clock
++             * would make it worse - close now and give the clock back. */
++            c2_60_back_off(now);
++        } else if (verdict == C2_60_FAIL_HOLD) {
++            /* The host is fine; the GUEST cannot fit its frame in one field.
++             *
++             * Raising the guest clock here was tried and removed. It is the
++             * one lever that addresses a guest-budget shortfall in theory, but
++             * a measured sweep on this machine produced no trustworthy
++             * improvement, and every extra percent is more emulated work per
++             * wall-clock second for a host that is already close to its limit
++             * in exactly the scenes that trip this check. It made the stutter
++             * worse. The clock stays where the setting put it. */
++            if (++c2_60_hold_bad >= C2_60_HOLD_STREAK)
++                c2_60_back_off(now);
          } else if (verdict == C2_60_OK) {
-             c2_60_good_ms += C2_60_WINDOW_MS;
-             if (c2_60_good_ms >= C2_60_CLEAR_MS) {
-+                /* Only the penalty is cleared. Restoring the CPU clock here
-+                 * would be dead: every failure now closes the gate, and every
-+                 * reopen sets the clock, so by the time a run is this healthy
-+                 * the clock is already what the setting asked for. */
-                 c2_60_fails = 0;
+-            c2_60_good_ms += C2_60_WINDOW_MS;
+-            if (c2_60_good_ms >= C2_60_CLEAR_MS) {
+-                c2_60_fails = 0;
 -                /* Earned the headroom back, if the setting asked for it. */
 -                c2_60_set_cpu(c2_60_cpu_pct);
-                 c2_60_good_ms = 0;
+-                c2_60_good_ms = 0;
++            c2_60_hold_bad = 0;
++            /* Only a comfortable window counts. A scene sitting on the line
++             * would otherwise alternate fail/pass and keep its penalty
++             * permanently forgiven, which is what made the mode flap. */
++            if (c2_60_hold_seen >= C2_60_HOLD_GOOD) {
++                c2_60_good_ms += C2_60_WINDOW_MS;
++                if (c2_60_good_ms >= C2_60_CLEAR_MS) {
++                    c2_60_fails = 0;
++                    c2_60_latched = 0;
++                    c2_60_good_ms = 0;
++                }
              }
++        } else if (verdict == C2_60_QUIET) {
++            /* A load or a 2D screen: whatever comes next is a different scene,
++             * so it starts with a clean record rather than inheriting the last
++             * level's penalty. */
++            c2_60_hold_bad = 0;
++            c2_60_good_ms = 0;
++            c2_60_fails = 0;
++            c2_60_latched = 0;
          }
+         return;
+     }
+ 
++    /* A quiet window means a new scene is coming even with the gate shut, so
++     * a level that gave up gets another chance at the next load rather than
++     * staying at 30 for the rest of the session. */
++    if (verdict == C2_60_QUIET) {
++        c2_60_fails = 0;
++        c2_60_latched = 0;
++        c2_60_retry_at = 0;
++    }
++    if (c2_60_latched) return;
+     if (now < c2_60_retry_at) return;
+ 
+     uint32_t gate = cpu->read_word(C2_60_GATE_PC);
 --- a/runtime/src/debug_server.c
 +++ b/runtime/src/debug_server.c
 @@ -7891,6 +7891,7 @@
