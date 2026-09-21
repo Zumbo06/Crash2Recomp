@@ -1,0 +1,107 @@
+Make the CPU-only overclock actually cover the CPU.
+
+!! psx_cycles.h is in codegen_hash_sources.cmake. Applying this patch CHANGES
+!! THE CODEGEN TAG (649c6245 -> 3d2b5a19) and makes the prebuilt recompiler
+!! stale, after which compile_overlays.py refuses to emit shards and every
+!! overlay silently falls back to the MIPS interpreter. Run
+!! _build/build_recompiler.ps1 after applying, and clear the shard cache.
+!! Nothing in the ordinary build fails if you forget; it just gets slow and
+!! eventually trips the starvation watchdog.
+
+The knob scaled instruction charges only. Two CPU-side costs reach
+psx_advance_cycles directly and were never scaled:
+
+  psx_icache.c:87,103   instruction-cache refill, 4-7 cycles per miss
+  memory.c              load completion + fudge in psx_cyc_readmem
+
+Both are large in MIPS code, so "125%" charged full price for a big share of
+the frame and delivered far less than 25% more guest work per field - never
+reaching the ~119% the Turtle Woods crates measurement (p95 672,072 against a
+564,480-cycle field) says that scene needs. The earlier sweep that found "no
+trustworthy improvement" from a higher clock was measuring a control that was
+mostly disconnected.
+
+Both now route through psx_cyc_cpu_side, added to psx_cycles.h because that is
+the one header memory.c and psx_icache.c both already include. Device-region
+waits (SPU, CDC, MMIO) are deliberately NOT routed through it: that timing
+belongs to the devices, and root counter 2 - the clock the game measures frame
+time with - must not move.
+
+The load path scales the completion ONCE and reuses the value for both the
+advance and cpu->ld_absorb, because the give-back has to match what was
+charged or cycles leak. At 100% the helper is the identity, so stock timing is
+unchanged bit-for-bit and only the 60 FPS mode sees any difference.
+
+--- a/runtime/include/psx_cycles.h
++++ b/runtime/include/psx_cycles.h
+@@ -184,6 +184,31 @@
+ extern uint64_t g_plp_adv_sum;
+ extern uint64_t g_plp_svc_calls;
+ 
++/* CPU-side stall cycles that reach psx_advance_cycles DIRECTLY rather than
++ * through psx_cyc_charge: instruction-cache refills (psx_icache.c) and the
++ * completion half of a load (memory.c psx_cyc_readmem).
++ *
++ * These have to scale with the crash2 clock too, or the knob does not mean
++ * what it says. It was applied only to instruction charges, so "125%" left
++ * every icache miss and every load completion at 100% and delivered far less
++ * than 25% more guest work per field - which is exactly why raising it never
++ * produced the headroom the cycle measurement said the Turtle Woods crates
++ * needed, and why it read as "no trustworthy improvement".
++ *
++ * Device-region waits (SPU, CDC, MMIO) are deliberately NOT routed here: those
++ * are the devices' own timing and stay on the original clock, which is the
++ * whole point of a CPU-ONLY overclock. */
++static inline uint32_t psx_cyc_cpu_side(uint32_t cycles) {
++#if !defined(PSX_OVERLAY_DLL_BUILD)
++    extern uint32_t g_crash2_cpu_clock_pct;
++    extern uint32_t psx_crash2_cpu_clock_charge(uint32_t cycles);
++    if (g_crash2_cpu_clock_pct != 100u)
++        return psx_crash2_cpu_clock_charge(cycles);
++#endif
++    return cycles;
++}
++
++
+ /* Save-state restore: re-anchor the deadline device model after psx_cycle_count
+  * is overwritten from a snapshot. Pass the live CPU so GTE/muldiv completion
+  * stamps and load-absorb give-back are rewound with the guest clock. */
+--- a/runtime/src/psx_icache.c
++++ b/runtime/src/psx_icache.c
+@@ -84,7 +84,7 @@
+     cpu->read_absorb_which = 0u;
+ 
+     if (addr >= 0xA0000000u) { /* KSEG1 / uncached (BIOS ROM) */
+-        psx_advance_cycles(4u);
++        psx_advance_cycles(psx_cyc_cpu_side(4u));
+         return;
+     }
+ 
+@@ -100,7 +100,7 @@
+         g_psx_icache_tv[bidx + i] &= ~0x2u;
+         cost++;
+     }
+-    psx_advance_cycles(cost);
++    psx_advance_cycles(psx_cyc_cpu_side(cost));
+ #else
+     (void)cpu;
+     (void)addr;
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -1978,8 +1978,14 @@
+      * Combined with region+completion into one advance — deadline catch-up
+      * replays exact event boundaries, so splitting the charge is only host cost. */
+     uint32_t region = psx_mmio_read_wait(phys, size);  /* device-region wait */
+-    uint32_t cost = region + compl_cost;               /* LDAbsorb = region + completion */
+-    uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
++    /* The completion half is the CPU's, so it scales with the crash2 clock;
++     * the region wait is the device's and does not. Scaled ONCE and reused for
++     * both the advance and ld_absorb - the give-back has to match what was
++     * charged or cycles leak. At 100% psx_cyc_cpu_side is the identity, so
++     * stock timing is bit-for-bit what it was. */
++    uint32_t compl_scaled = psx_cyc_cpu_side(compl_cost);
++    uint32_t cost = region + compl_scaled;             /* LDAbsorb = region + completion */
++    uint32_t fudge = psx_cyc_cpu_side((uint32_t)((cpu->read_fudge >> 4) & 2u));
+     cpu->ld_absorb = cost;
+     psx_advance_cycles(fudge + cost);
+     cpu->ld_which_t = (uint8_t)arm_rt;

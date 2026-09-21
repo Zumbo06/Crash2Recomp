@@ -1,0 +1,257 @@
+Default native 60 to 200% virtual CPU and add confirmed overlay Quit.
+
+Fresh launcher profiles already expose the full 100-200% virtual-CPU ladder.
+Start at its supported maximum when native 60 is enabled, and use the same
+default for direct runtime launches that omit PSX_CRASH2_60FPS_CPU_PCT.
+
+Add QUIT GAME after Restart in the Home overlay. Both process-level actions
+share a two-press confirmation state which is cancelled by moving away. Quit
+uses shutdown_runtime before exit, so memory cards/captures flush and the audio,
+controller, debug, netplay and background compiler resources shut down in the
+same order as a normal window close.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -143,7 +143,7 @@
+ #define C2_60_QUIET       3        /* too few loops to judge: load, 2D, pause */
+ 
+ static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
+-static int c2_60_cpu_pct = 125;        /* what the setting asked for */
++static int c2_60_cpu_pct = 200;        /* what the setting asked for */
+ static int c2_60_cpu_now = 100;        /* what the guard is currently using */
+ static int c2_60_verified = -1;        /* -1 unknown, 0 mismatch, 1 confirmed */
+ static int c2_60_gate_open;
+--- a/runtime/include/psx_pause_menu.h
++++ b/runtime/include/psx_pause_menu.h
+@@ -27,6 +27,7 @@ enum {
+     PSX_PAUSE_ROW_LIVES,
+     PSX_PAUSE_ROW_AKU,
+     PSX_PAUSE_ROW_RESTART,
++    PSX_PAUSE_ROW_QUIT,
+     PSX_PAUSE_ROW_COUNT
+ };
+ 
+@@ -54,13 +55,13 @@ int psx_pause_menu_row_is_option(int row);
+ int psx_pause_menu_row_at(int px, int py);
+ 
+ /* Push the whole visible state in one call. `aspect` and `fit` are indices,
+- * `fps_on` and `restart_armed` are booleans, `aku_level` is a
++ * `fps_on` and `confirm_armed` are booleans, `aku_level` is a
+  * PSX_PAUSE_AKU_COUNT index. Only marks dirty on real change,
+  * so calling it every frame is free. */
+ void psx_pause_menu_set_state(int open, int selected,
+                               int aspect, int fit, int window, int fps_on,
+                               int lives_on, int aku_level,
+-                              int restart_armed);
++                              int confirm_armed);
+ 
+ int psx_pause_menu_needs_present(void);
+ 
+--- a/runtime/src/psx_pause_menu.c
++++ b/runtime/src/psx_pause_menu.c
+@@ -17,7 +17,7 @@
+ #define PM_W 640
+ #define PM_H 480
+ #define PM_ROWS_Y 60
+-#define PM_ROW_H 30
++#define PM_ROW_H 27
+ #define PM_ROW_GAP 3
+ #define PM_ROWS_X 40
+ #define PM_ROWS_W 560
+@@ -67,14 +67,14 @@ static int s_window;
+ static int s_fps_on;
+ static int s_lives_on;
+ static int s_aku_level;
+-static int s_restart_armed;
++static int s_confirm_armed;
+ static int s_dirty = 1;
+ static uint32_t s_panel[PM_W * PM_H];
+ 
+ static const char *const ROW_LABEL[PSX_PAUSE_ROW_COUNT] = {
+     "RESUME", "QUICK SAVE", "QUICK LOAD",
+     "GAME ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS DISPLAY",
+-    "99 LIVES", "AKU AKU", "RESTART GAME",
++    "99 LIVES", "AKU AKU", "RESTART GAME", "QUIT GAME",
+ };
+ static const char *const ASPECT_LABEL[PSX_PAUSE_ASPECT_COUNT] = {
+     "4:3", "14:9", "16:9", "21:9",
+@@ -231,7 +231,8 @@ static const char *value_for_row(int row, char *buf, size_t cap)
+         return AKU_LABEL[(unsigned)s_aku_level < PSX_PAUSE_AKU_COUNT
+                          ? s_aku_level : 0];
+     case PSX_PAUSE_ROW_RESTART:
+-        if (s_restart_armed) {
++    case PSX_PAUSE_ROW_QUIT:
++        if (s_confirm_armed) {
+             snprintf(buf, cap, "PRESS AGAIN");
+             return buf;
+         }
+@@ -265,26 +266,27 @@ static void rasterize_panel(void)
+         uint32_t sub = sel ? 0xFFFFFFFFu : 0xFFB2B8C2u;
+         const char *val;
+ 
+-        /* Restart stays red while armed so a second Enter is never a
+-         * surprise. */
+-        if (i == PSX_PAUSE_ROW_RESTART && s_restart_armed) {
++        /* Destructive actions stay red while armed so a second Enter is never
++         * a surprise. */
++        if ((i == PSX_PAUSE_ROW_RESTART || i == PSX_PAUSE_ROW_QUIT)
++            && s_confirm_armed) {
+             bg = sel ? 0xFF3A2028u : 0xFF2A1820u;
+             fg = 0xFFFF8080u;
+         }
+         fill_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H, bg);
+         stroke_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H,
+                     sel ? 0xFFFFD24Du : 0xFF303746u);
+-        draw_text(s_panel, PM_ROWS_X + 18, y + 11, ROW_LABEL[i], fg, 1);
++        draw_text(s_panel, PM_ROWS_X + 18, y + 10, ROW_LABEL[i], fg, 1);
+ 
+         buf[0] = 0;
+         val = value_for_row(i, buf, sizeof(buf));
+         if (val) {
+             if (opt && sel) {
+-                draw_text(s_panel, PM_VALUE_X - 4, y + 11, "<", 0xFFFFD24Du, 1);
+-                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 11, ">",
++                draw_text(s_panel, PM_VALUE_X - 4, y + 10, "<", 0xFFFFD24Du, 1);
++                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 10, ">",
+                           0xFFFFD24Du, 1);
+             }
+-            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 11, val,
++            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 10, val,
+                         sub, 1);
+         }
+     }
+@@ -308,7 +310,7 @@ static void rasterize_panel(void)
+ void psx_pause_menu_set_state(int open, int selected,
+                               int aspect, int fit, int window, int fps_on,
+                               int lives_on, int aku_level,
+-                              int restart_armed)
++                              int confirm_armed)
+ {
+     if (selected < 0) selected = 0;
+     if (selected >= PSX_PAUSE_ROW_COUNT) selected = PSX_PAUSE_ROW_COUNT - 1;
+@@ -317,11 +319,11 @@ void psx_pause_menu_set_state(int open, int selected,
+     lives_on = lives_on ? 1 : 0;
+     if (aku_level < 0) aku_level = 0;
+     if (aku_level >= PSX_PAUSE_AKU_COUNT) aku_level = PSX_PAUSE_AKU_COUNT - 1;
+-    restart_armed = restart_armed ? 1 : 0;
++    confirm_armed = confirm_armed ? 1 : 0;
+     if (s_open != open || s_selected != selected || s_aspect != aspect
+         || s_fit != fit || s_window != window || s_fps_on != fps_on
+         || s_lives_on != lives_on || s_aku_level != aku_level
+-        || s_restart_armed != restart_armed)
++        || s_confirm_armed != confirm_armed)
+         s_dirty = 1;
+     s_open = open;
+     s_selected = selected;
+@@ -331,7 +333,7 @@ void psx_pause_menu_set_state(int open, int selected,
+     s_fps_on = fps_on;
+     s_lives_on = lives_on;
+     s_aku_level = aku_level;
+-    s_restart_armed = restart_armed;
++    s_confirm_armed = confirm_armed;
+ }
+ 
+ int psx_pause_menu_needs_present(void)
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6115,7 +6115,7 @@ static void savestate_menu_host_pause_loop(void) {
+ 
+ static int pause_menu_open = 0;
+ static int pause_menu_sel = 0;
+-static int pause_menu_restart_armed = 0;   /* Restart needs a second press */
++static int pause_menu_confirm_armed = 0; /* Restart/Quit need a second press */
+ static SDL_Keycode pause_menu_open_key = 0;
+ extern "C" int crash2_cheat_lives_enabled(void);
+ extern "C" int crash2_cheat_aku_level(void);
+@@ -6172,7 +6172,7 @@ static void pause_menu_sync_overlay(void) {
+                              pause_menu_window_index(), fps_osd_enabled(),
+                              crash2_cheat_lives_enabled(),
+                              crash2_cheat_aku_level(),
+-                             pause_menu_restart_armed);
++                             pause_menu_confirm_armed);
+ }
+ 
+ /* Request only - see g_pending_aspect. Safe to call from the pause loop. */
+@@ -6287,9 +6287,19 @@ static void pause_menu_restart_game(void) {
+ #endif
+ }
+ 
++/* Use the same orderly teardown as closing the SDL window: flush cards, stop
++ * and join overlay compilation, close audio/controllers and notify netplay. */
++static void pause_menu_quit_game(void) {
++    std::fprintf(stdout, "psxrecomp: quit requested from pause menu\n");
++    std::fflush(stdout);
++    psx_crash_trace_set_exit_origin("pause_menu_quit");
++    shutdown_runtime();
++    std::exit(0);
++}
++
+ static void pause_menu_close(void) {
+     pause_menu_open = 0;
+-    pause_menu_restart_armed = 0;
++    pause_menu_confirm_armed = 0;
+     pause_menu_sync_overlay();
+ }
+ 
+@@ -6298,7 +6308,7 @@ static void pause_menu_toggle(SDL_Keycode opened_by_key) {
+     if (!pause_menu_open && (psx_rewind_is_open() || savestate_menu_open))
+         return;
+     pause_menu_open = !pause_menu_open;
+-    pause_menu_restart_armed = 0;
++    pause_menu_confirm_armed = 0;
+     if (pause_menu_open) {
+         pause_menu_sel = 0;
+         pause_menu_open_key = opened_by_key;
+@@ -6313,8 +6323,8 @@ static void pause_menu_move(int delta) {
+     while (pause_menu_sel < 0) pause_menu_sel += PSX_PAUSE_ROW_COUNT;
+     while (pause_menu_sel >= PSX_PAUSE_ROW_COUNT)
+         pause_menu_sel -= PSX_PAUSE_ROW_COUNT;
+-    /* Moving off Restart disarms it. */
+-    pause_menu_restart_armed = 0;
++    /* Moving off a destructive action disarms it. */
++    pause_menu_confirm_armed = 0;
+     pause_menu_sync_overlay();
+ }
+ 
+@@ -6387,13 +6397,21 @@ static void pause_menu_activate(void) {
+         pause_menu_close();
+         break;
+     case PSX_PAUSE_ROW_RESTART:
+-        if (!pause_menu_restart_armed) {
+-            pause_menu_restart_armed = 1;   /* confirm on the next press */
++        if (!pause_menu_confirm_armed) {
++            pause_menu_confirm_armed = 1;   /* confirm on the next press */
+             pause_menu_sync_overlay();
+         } else {
+             pause_menu_restart_game();      /* does not return */
+         }
+         break;
++    case PSX_PAUSE_ROW_QUIT:
++        if (!pause_menu_confirm_armed) {
++            pause_menu_confirm_armed = 1;   /* confirm on the next press */
++            pause_menu_sync_overlay();
++        } else {
++            pause_menu_quit_game();         /* does not return */
++        }
++        break;
+     default:
+         break;
+     }
+@@ -6511,7 +6529,7 @@ static void pause_menu_mouse_hover(int mx, int my) {
+     int row = pause_menu_row_under_mouse(mx, my);
+     if (row < 0 || row == pause_menu_sel) return;
+     pause_menu_sel = row;
+-    pause_menu_restart_armed = 0;   /* moving away disarms, as the keys do */
++    pause_menu_confirm_armed = 0;   /* moving away disarms, as the keys do */
+     pause_menu_sync_overlay();
+ }
+ 
+@@ -6520,7 +6538,7 @@ static void pause_menu_mouse_click(int mx, int my, int button) {
+     if (row < 0) return;
+     if (row != pause_menu_sel) {
+         pause_menu_sel = row;
+-        pause_menu_restart_armed = 0;
++        pause_menu_confirm_armed = 0;
+     }
+     /* Right-click steps an option backwards, which is the only way to go left
+      * without a keyboard. On an action row it does nothing. */

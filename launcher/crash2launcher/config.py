@@ -204,24 +204,9 @@ class Settings:
     # it removes the second VSync wait the game uses to round every frame up
     # to two fields, so the game loop itself runs at 60. World speed is
     # unchanged because the engine already multiplies motion by the measured
-    # frame time (17 ticks instead of 34); scenes whose work does not fit in
-    # one field fall back to 30 exactly as they do on hardware.
+    # frame time (17 ticks instead of 34). The launcher always pairs this with
+    # 200% virtual PS1 CPU and Prefer 60; there are no separate tuning controls.
     native_60fps: bool = False
-    # Guest CPU-only headroom used while the mode is on, as a percentage of
-    # the real PS1 clock. VBlank, CD, SPU and the timers - including the root
-    # counter the engine measures frame time with - stay at their original
-    # rate, so this buys guest work per field without moving game time.
-    #
-    # Defaults to 100 - off. The cycle measurement at the Turtle Woods crates
-    # (p95 672,072 against a 564,480-cycle field) says 125 should let that
-    # scene fit, and it is kept available for that reason, but a measured
-    # sweep produced no trustworthy improvement in play: every extra percent
-    # is more emulated work per wall-clock second, and the scenes that need it
-    # are the ones where the host is already closest to its limit. Raising it
-    # made stutter worse, not better. Raise it only if a measurement on your
-    # machine says otherwise.
-    native_60fps_cpu_percent: int = 100
-
     # SCUS-94154 assists. Opt-in, and they can change saved progression.
     cheat_infinite_lives: bool = False
     # "off", "keep_masks" or "no_damage". Two levels rather than two separate
@@ -343,10 +328,6 @@ class Settings:
             self.vsync = 0
         if self.cheat_aku_aku not in CHEAT_AKU_LEVELS:
             self.cheat_aku_aku = "off"
-        # The runtime rejects anything outside this range and would silently
-        # fall back to its own default, so clamp where the value is visible.
-        self.native_60fps_cpu_percent = max(
-            100, min(150, int(self.native_60fps_cpu_percent or 125)))
         if self.fullscreen_mode not in (0, 1, 2):
             self.fullscreen_mode = 0
         if self.texture_filter not in ("nearest", "bilinear"):

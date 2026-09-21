@@ -126,7 +126,13 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # Both builds honour it - see tuning/60FPS-FINDINGS.md.
     if settings.native_60fps:
         env["PSX_CRASH2_60FPS"] = "1"
-        env["PSX_CRASH2_60FPS_CPU_PCT"] = str(settings.native_60fps_cpu_percent)
+        # The launcher intentionally exposes one simple choice: enabled means
+        # the full experimental mode, fixed at 200% virtual PS1 CPU and with
+        # the original 30 Hz gate kept open. These affect emulation only; they
+        # never overclock the physical CPU.
+        env["PSX_CRASH2_60FPS_CPU_PCT"] = "200"
+        env["PSX_CRASH2_60FPS_HOLD_PCT"] = "0"
+        env["PSX_CRASH2_60FPS_FORCE_GATE"] = "1"
 
     if settings.cheat_infinite_lives:
         env["PSX_CRASH2_CHEAT_LIVES"] = "1"

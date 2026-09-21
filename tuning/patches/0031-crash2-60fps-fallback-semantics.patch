@@ -1,0 +1,115 @@
+Make native-60 fallback match the launcher setting.
+
+The "Prefer 60 - never drop" launcher choice disabled only the guest cadence
+test. The independent host-speed guard could still restore the original 30 Hz
+gate after one slow one-second window. This produced the exact visible pattern
+the option promised to prevent: 60 on entry, then a sudden permanent-looking
+drop to 30.
+
+Add PSX_CRASH2_60FPS_FORCE_GATE for that explicit choice. Diagnostics continue
+to report FAIL_HOST/FAIL_HOLD, but neither verdict closes the gate. Automatic
+"Prefer smooth" mode retains both safeguards. It now requires two consecutive
+host-failure windows so a one-off shader/overlay compilation stall cannot buy a
+20-second fallback; cadence failures still close immediately.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -106,6 +106,12 @@
+  * opinion was tried and made the stutter last longer, not less often; what
+  * stops the flapping is the long retry and the latch below, not a slow close. */
+ #define C2_60_HOLD_STREAK 1u
++/* A one-second host window is intentionally sensitive enough to catch audible
++ * slowdown, but shader/overlay compilation and scene transitions can stall one
++ * isolated window. Require two consecutive slow windows before giving up in
++ * automatic mode. This preserves the safety net without turning one startup
++ * hitch into a 20-second return to 30 FPS. */
++#define C2_60_HOST_STREAK 2u
+ /* Consecutive back-offs before the retry timer stops entirely. Two was too
+  * eager: combined with a threshold no scene could meet it latched the gate
+  * shut for whole levels, which is how the mode came to report itself enabled
+@@ -144,10 +150,12 @@ static int c2_60_gate_open;
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
++static unsigned c2_60_host_bad;        /* consecutive host-failure windows */
+ static unsigned c2_60_hold_bad;        /* consecutive hold-failure windows */
+ static int c2_60_latched;              /* gave up until the scene changes */
+ static int c2_60_verdict = C2_60_PENDING;  /* last completed window */
+ static int c2_60_hold_pct = C2_60_MIN_HOLD;
++static int c2_60_force_gate;           /* player chose never to fall back */
+ static unsigned long long c2_60_opened, c2_60_backoffs;
+ 
+ /* Sustain window. Host milliseconds and the VBlank total are both read on the
+@@ -221,6 +229,7 @@ static void c2_60_back_off(unsigned long long now)
+     c2_60_fail_loop_hz = c2_60_loop_hz;
+     c2_60_close_gate();
+     c2_60_backoffs++;
++    c2_60_host_bad = 0;
+     c2_60_hold_bad = 0;
+     c2_60_good_ms = 0;
+     c2_60_retry_at = now
+@@ -282,6 +291,8 @@ void crash2_60fps_set_mode(int on)
+         c2_60_fails = 0;
+         c2_60_retry_at = 0;
+         c2_60_win_ms = 0;
++        c2_60_host_bad = 0;
++        c2_60_hold_bad = 0;
+     }
+ }
+ 
+@@ -362,7 +373,9 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+         const char *e = getenv("PSX_CRASH2_60FPS");
+         const char *p = getenv("PSX_CRASH2_60FPS_CPU_PCT");
+         const char *h = getenv("PSX_CRASH2_60FPS_HOLD_PCT");
++        const char *f = getenv("PSX_CRASH2_60FPS_FORCE_GATE");
+         c2_60_mode = (e && *e == '1') ? 1 : 0;
++        c2_60_force_gate = (f && *f == '1') ? 1 : 0;
+         if (p) {
+             int want = atoi(p);
+             if (want >= 100 && want <= C2_60_CPU_CAP) c2_60_cpu_pct = want;
+@@ -408,11 +421,21 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+     c2_60_suspended = 0;
+ 
+     if (c2_60_gate_open) {
++        /* "Prefer 60" is an explicit player choice. Keep reporting a host or
++         * cadence failure for diagnostics, but do not silently undo that
++         * choice by restoring the game's 30 Hz gate. */
++        if (c2_60_force_gate) {
++            c2_60_host_bad = 0;
++            c2_60_hold_bad = 0;
++            c2_60_good_ms = 0;
++            return;
++        }
+         if (verdict == C2_60_FAIL_HOST) {
+-            /* The machine is already running slow, audio included. Nothing is
+-             * gained by waiting for a second opinion, and more guest clock
+-             * would make it worse - close now and give the clock back. */
+-            c2_60_back_off(now);
++            /* One window can contain native-overlay or shader compilation.
++             * Only sustained wall-clock slowdown should force a fallback. */
++            c2_60_hold_bad = 0;
++            if (++c2_60_host_bad >= C2_60_HOST_STREAK)
++                c2_60_back_off(now);
+         } else if (verdict == C2_60_FAIL_HOLD) {
+             /* The host is fine; the GUEST cannot fit its frame in one field.
+              *
+@@ -423,9 +446,11 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+              * wall-clock second for a host that is already close to its limit
+              * in exactly the scenes that trip this check. It made the stutter
+              * worse. The clock stays where the setting put it. */
++            c2_60_host_bad = 0;
+             if (++c2_60_hold_bad >= C2_60_HOLD_STREAK)
+                 c2_60_back_off(now);
+         } else if (verdict == C2_60_OK) {
++            c2_60_host_bad = 0;
+             c2_60_hold_bad = 0;
+             /* Only a comfortable window counts. A scene sitting on the line
+              * would otherwise alternate fail/pass and keep its penalty
+@@ -442,6 +467,7 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+             /* A load or a 2D screen: whatever comes next is a different scene,
+              * so it starts with a clean record rather than inheriting the last
+              * level's penalty. */
++            c2_60_host_bad = 0;
+             c2_60_hold_bad = 0;
+             c2_60_good_ms = 0;
+             c2_60_fails = 0;

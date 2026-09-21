@@ -11,7 +11,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 
 APP_NAME = "Crash 2 Recompiled"
 ORG_NAME = "Crash2Recomp"

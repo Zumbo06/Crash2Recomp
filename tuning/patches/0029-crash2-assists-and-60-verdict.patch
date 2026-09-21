@@ -262,32 +262,38 @@ tell a host overrun from a scene on the one-field boundary.
  #endif /* CRASH2_CHEATS_H */
 --- a/runtime/src/crash2_60fps.h
 +++ b/runtime/src/crash2_60fps.h
-@@ -85,12 +85,35 @@
+@@ -85,12 +85,41 @@
   * image is ~76%. 85 sits between the two and puts the line near 52 loops/s.
   * Anything below it is the alternating regime this exists to reject - see the
   * comment on c2_60_window_verdict. */
 -#define C2_60_MIN_HOLD    85u
-+/* 85 was far too lenient: it accepts one frame in seven being doubled, which
-+ * on a 60 Hz display is visible judder several times a second, and the guard
-+ * then reported the scene as "holding 60". The complaint this threshold
-+ * exists to answer is stutter, so it is set where the result is actually
-+ * smooth. A scene below it gets a clean 30, which is steadier than a ragged
-+ * 56. PSX_CRASH2_60FPS_HOLD_PCT overrides it either way. */
-+#define C2_60_MIN_HOLD    95u
++/* Where the line belongs, from the only two measurements there are rather
++ * than from a guess about what "smooth" needs:
++ *
++ *   Turtle Woods, the regime that felt bad   ~76% of frames on one field
++ *   Snow Go, reported as stable 55-56 fps    ~93%
++ *
++ * 80 sits just above the bad case and well below the good one. It was briefly
++ * set to 95 to chase smoothness, which rejected BOTH - the gate simply never
++ * opened and the mode looked broken. A partly-doubled 56 is better than a
++ * clean 30; only the genuinely ragged regime is not.
++ * PSX_CRASH2_60FPS_HOLD_PCT overrides it either way. */
++#define C2_60_MIN_HOLD    80u
 +/* A window only counts towards forgiving past failures if it clears the line
 + * comfortably. Without the gap, a scene dithering either side of MIN_HOLD
 + * banks "good" seconds between its failures and never stops retrying. */
-+#define C2_60_HOLD_GOOD   99u
++#define C2_60_HOLD_GOOD   90u
 +/* Every second spent deciding is a second of the ragged regime the player can
 + * see, so the gate closes on the FIRST bad window. Waiting for a second
 + * opinion was tried and made the stutter last longer, not less often; what
 + * stops the flapping is the long retry and the latch below, not a slow close. */
 +#define C2_60_HOLD_STREAK 1u
-+/* Consecutive back-offs before the retry timer stops entirely. Two, because
-+ * every retry costs another visible second and a level that has failed twice
-+ * is not about to start holding 60 because a clock expired. Released by the
-+ * next quiet window - see C2_60_QUIET. */
-+#define C2_60_GIVE_UP     2
++/* Consecutive back-offs before the retry timer stops entirely. Two was too
++ * eager: combined with a threshold no scene could meet it latched the gate
++ * shut for whole levels, which is how the mode came to report itself enabled
++ * while running at 30. With a reachable threshold a failure is rare, so this
++ * can afford to keep trying. Released by the next quiet window - C2_60_QUIET. */
++#define C2_60_GIVE_UP     4
  /* Windows with fewer loops than this are not judged on hold at all: a load or
   * 2D screen legitimately updates ~8 times a second and is not a failure. */
  #define C2_60_MIN_LOOPS   20u
@@ -301,7 +307,7 @@ tell a host overrun from a scene on the one-field boundary.
  #define C2_60_CLEAR_MS    10000u   /* sustained 60 that forgives past failures */
  
  /* Verdicts from one window. */
-@@ -98,6 +121,7 @@
+@@ -98,6 +127,7 @@
  #define C2_60_OK          0
  #define C2_60_FAIL_HOST   1        /* emulator behind the wall clock */
  #define C2_60_FAIL_HOLD   2        /* scene cannot stay on one field */
@@ -309,7 +315,7 @@ tell a host overrun from a scene on the one-field boundary.
  
  static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
  static int c2_60_cpu_pct = 125;        /* what the setting asked for */
-@@ -107,6 +131,9 @@
+@@ -107,6 +137,9 @@
  static int c2_60_suspended;            /* held closed by the timing mode */
  static unsigned c2_60_timing_mode;
  static int c2_60_fails;                /* consecutive back-offs */
@@ -319,7 +325,20 @@ tell a host overrun from a scene on the one-field boundary.
  static int c2_60_hold_pct = C2_60_MIN_HOLD;
  static unsigned long long c2_60_opened, c2_60_backoffs;
  
-@@ -161,6 +188,26 @@
+@@ -116,6 +149,12 @@
+ static unsigned long long c2_60_retry_at;
+ static unsigned c2_60_win_loops, c2_60_win_one_field;
+ static unsigned c2_60_loop_hz, c2_60_hold_seen;
++/* Latched at the moment of the back-off. c2_60_hold_seen is the CURRENT
++ * window, and once the gate has closed every frame is two fields, so it reads
++ * 0 and says nothing about why. These say what the failing window actually
++ * looked like, which is the number any threshold decision needs. */
++static unsigned c2_60_fail_pct = 101u;   /* 101 = no failure recorded yet */
++static unsigned c2_60_fail_loop_hz;
+ 
+ /* Sampled once per outer loop so the release heartbeat thread can report them
+  * without dereferencing a guest pointer the game may be rewriting underneath
+@@ -161,6 +200,28 @@
      c2_60_set_cpu(100);
  }
  
@@ -333,6 +352,8 @@ tell a host overrun from a scene on the one-field boundary.
 + * The next quiet window - a load, a 2D screen - releases the latch. */
 +static void c2_60_back_off(unsigned long long now)
 +{
++    c2_60_fail_pct = c2_60_hold_seen;
++    c2_60_fail_loop_hz = c2_60_loop_hz;
 +    c2_60_close_gate();
 +    c2_60_backoffs++;
 +    c2_60_hold_bad = 0;
@@ -346,10 +367,16 @@ tell a host overrun from a scene on the one-field boundary.
  /* The engine's own opinion of how long the last frame took, in 1/1033.6 s
   * ticks snapped to whole NTSC fields. 17 means it simulated a 60 Hz step, 34 a
   * 30 Hz one. This is the number motion is multiplied by, so it - not the host
-@@ -181,6 +228,11 @@
+@@ -181,6 +242,17 @@
   * This is the number the hold decision is made on, so report it: a scene that
   * keeps falling back is answering with it. */
  unsigned crash2_60fps_hold_pct(void) { return c2_60_hold_seen; }
++unsigned crash2_60fps_fail_pct(void) { return c2_60_fail_pct; }
++unsigned crash2_60fps_fail_loop_hz(void) { return c2_60_fail_loop_hz; }
++/* The clock actually in force, not the one the setting asked for: it is only
++ * applied while the gate is open, so a report showing 100 here with the mode
++ * enabled means the headroom never got a chance to do anything. */
++int crash2_60fps_cpu_now(void) { return c2_60_cpu_now; }
 +/* The last completed window's verdict, as a C2_60_* value. "Your machine is
 + * behind the wall clock" and "this scene sits on the one-field boundary" need
 + * completely different answers, and until this was exported a report could not
@@ -358,7 +385,7 @@ tell a host overrun from a scene on the one-field boundary.
  /* Non-zero while the gate is held closed because the game is recording or
   * replaying a demo, rather than because the scene could not hold 60. The two
   * are not the same thing and a report that conflated them would send someone
-@@ -251,11 +303,15 @@
+@@ -251,11 +323,15 @@
      c2_60_win_loops = c2_60_win_one_field = 0;
  
      if (vblanks * 1000u < (unsigned long long)C2_60_MIN_VBLANK * span)
@@ -379,7 +406,7 @@ tell a host overrun from a scene on the one-field boundary.
  }
  
  /* Called at the outer game loop, so at most once per simulated frame: the six
-@@ -307,41 +363,75 @@
+@@ -307,41 +383,75 @@
       * with the scene, so this earns no penalty and no retry delay - the gate
       * comes straight back when live play resumes. */
      if (c2_60_timing_mode != 0u) {
@@ -830,8 +857,21 @@ tell a host overrun from a scene on the one-field boundary.
          pause_menu_poll_nav((uint32_t)SDL_GetTicks());
 --- a/runtime/src/freeze_heartbeat.c
 +++ b/runtime/src/freeze_heartbeat.c
-@@ -26,6 +26,11 @@
+@@ -24,8 +24,24 @@
+ extern int      crash2_60fps_mode(void);       /* crash2_60fps.h */
+ extern int      crash2_60fps_gate_open(void);  /* 0 while the sustain
                                     guard has fallen back to 30 Hz */
++/* WHY it fell back, and by how much it missed. Without these a closed gate in
++ * a report is just "not 60" and the next diagnosis is a guess - which has
++ * already cost one wrong threshold change. verdict: 0 ok, 1 host behind the
++ * wall clock, 2 scene could not hold a steady cadence, 3 too few loops to
++ * judge (load or 2D screen). */
++extern int      crash2_60fps_last_verdict(void);
++extern unsigned crash2_60fps_hold_pct(void);
++extern unsigned long long crash2_60fps_backoff_count(void);
++extern unsigned crash2_60fps_fail_pct(void);
++extern unsigned crash2_60fps_fail_loop_hz(void);
++extern int      crash2_60fps_cpu_now(void);
  extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
                                     sampled on the emulation thread */
 +/* Assists, so a bug report shows whether they were on. They can change
@@ -842,9 +882,16 @@ tell a host overrun from a scene on the one-field boundary.
  extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
  extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
  extern uint32_t i_stat;                        /* memory.c */
-@@ -875,6 +880,9 @@
+@@ -874,7 +890,16 @@
+         "  \"host_swap_count\":%llu,\n"
          "  \"native_60fps\":%d,\n"
          "  \"native_60fps_gate_open\":%d,\n"
++        "  \"native_60fps_verdict\":%d,\n"
++        "  \"native_60fps_one_field_pct\":%u,\n"
++        "  \"native_60fps_backoffs\":%llu,\n"
++        "  \"native_60fps_fail_pct\":%u,\n"
++        "  \"native_60fps_fail_loop_hz\":%u,\n"
++        "  \"native_60fps_cpu_now\":%d,\n"
          "  \"game_frame_ticks\":%u,\n"
 +        "  \"cheat_lives\":%d,\n"
 +        "  \"cheat_aku_level\":%d,\n"
@@ -852,9 +899,16 @@ tell a host overrun from a scene on the one-field boundary.
          "  \"psx_cycle_count\":%llu,\n"
          "  \"current_func\":\"0x%08X\",\n"
          "  \"last_store_pc\":\"0x%08X\",\n"
-@@ -941,6 +949,9 @@
+@@ -940,7 +965,16 @@
+         (unsigned long long)g_gl_swap_total,
          crash2_60fps_mode(),
          crash2_60fps_gate_open(),
++        crash2_60fps_last_verdict(),
++        crash2_60fps_hold_pct(),
++        (unsigned long long)crash2_60fps_backoff_count(),
++        crash2_60fps_fail_pct(),
++        crash2_60fps_fail_loop_hz(),
++        crash2_60fps_cpu_now(),
          crash2_60fps_frame_ticks(),
 +        crash2_cheat_lives_enabled(),
 +        crash2_cheat_aku_level(),

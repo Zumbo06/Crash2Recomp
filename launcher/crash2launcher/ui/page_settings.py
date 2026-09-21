@@ -613,13 +613,22 @@ class SettingsPage(QWidget):
             card(
                 section("Game update rate"),
                 self.native_60fps,
-                dim("Experimental native game updates, not interpolation. "
-                    "Some scenes hold 60; others fall back to 30. World-speed, "
-                    "script and audio timing across the whole game are not yet "
-                    "validated. The emulated PS1 CPU can run at 125%; your "
-                    "physical CPU is not overclocked. Keep native level-code "
-                    "compilation on for the best chance of holding 60. "
-                    "Relaunch to apply."),
+                dim("Experimental native game updates, not interpolation. Some "
+                    "scenes hold 60; others cannot. World-speed, script and "
+                    "audio timing across the whole game are not yet validated. "
+                    "When enabled it always uses Prefer 60 and 200% virtual "
+                    "PS1 CPU. Your physical CPU is not overclocked. Relaunch "
+                    "to apply."),
+                dim("Keep native level-code compilation on, below. With it off "
+                    "every level function runs interpreted and almost nothing "
+                    "will hold 60."),
+                dim("If 60 is unsteady, the first thing to lower is Internal "
+                    "resolution on the Video page - not this. At 5x the "
+                    "renderer draws twenty-five times the pixels of native, "
+                    "and running the game at 60 instead of 30 doubles that "
+                    "again. That is usually what runs out first: the game "
+                    "itself keeps its 60 Hz cadence while the machine falls "
+                    "behind drawing it."),
             ),
             card(
                 section("Execution"),

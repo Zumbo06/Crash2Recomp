@@ -2281,3 +2281,294 @@ The general shape, worth keeping: **for a smoothness guard, the cost of being
 wrong is asymmetric.** Being slow to close is paid in visible judder every
 time; being slow to re-open is paid in a frame rate that is merely lower. Tune
 the two ends differently.
+
+## 60 FPS, part 6: the CPU clock was only half connected
+
+Asked for 60 "stable, constant, almost the entire game". The binding
+constraint was never the guard - it is the guest cycle budget. The crates
+measurement (p95 672,072 against a 564,480-cycle field, 1.19x over) says the
+game needs roughly 20% more guest work per field in busy scenes, and the
+CPU-only clock is the only lever that provides it.
+
+That lever was mostly disconnected. `psx_cyc_charge` scaled instruction
+charges, but two CPU-side costs call `psx_advance_cycles` directly and were
+never scaled:
+
+- `psx_icache.c:87,103` - instruction-cache refill, 4-7 cycles per miss,
+  active by default (`PSX_ENABLE_BLOCK_CYCLES=1`, `PSX_ICACHE` defaults on).
+- `memory.c` `psx_cyc_readmem` - the load completion cost and the fudge.
+
+In MIPS code, icache misses and loads are a large fraction of a frame. So
+"125%" was charging full price for a big share of the budget and delivering
+far less than 25%. **The sweep that concluded "higher clock does not help" was
+measuring a knob that was mostly disconnected** - a reminder that a negative
+result about a control is only as good as the control.
+
+Both now go through `psx_cyc_cpu_side` in `psx_cycles.h` (chosen because it is
+the one header both `memory.c` and `psx_icache.c` already include).
+Device-region waits are deliberately excluded: SPU/CDC/MMIO timing is the
+devices' own, and root counter 2 - the clock the engine measures frame time
+with - must not move, or every conclusion in 60FPS-FINDINGS.md is void.
+
+The load path needed care. `cost = region + compl_cost` is also stored in
+`cpu->ld_absorb` and given back later, so the completion is scaled **once** and
+the same value used for both the advance and the absorb; scaling one and not
+the other would leak cycles. At 100% the helper is the identity, so stock
+timing is bit-for-bit what it was and only the 60 FPS mode is affected.
+
+`native_60fps_cpu_percent` goes back to 125, which is what the original cycle
+analysis asked for and what should now actually be delivered.
+
+### What this does not promise
+
+It does not make 60 unconditional. The guard still measures each second and
+still hands a scene back its 30 Hz lock when it cannot hold a steady cadence,
+and that is deliberate - a rate no display period divides looks worse than a
+clean 30 whatever its average. What changed is that scenes previously failing
+by a margin the clock should have covered now have the headroom the
+measurement always said they needed.
+
+## 60 FPS, part 7: the guard reported itself enabled while running at 30
+
+Reported as "60 fps does not work, it still runs at 30". The heartbeat from
+that run settled it in one read:
+
+```
+native_60fps            1     mode on, env reaching the runtime
+native_60fps_gate_open  0     gate CLOSED
+game_frame_ticks        34    engine simulating 30 Hz steps
+```
+
+So nothing was broken in the plumbing. The guard was refusing to open, and the
+reason was the previous round's threshold change.
+
+`C2_60_MIN_HOLD` had been raised 85 -> 95 to chase smoothness. That number was
+a guess about what "smooth" needs, and the only two measurements this project
+has say it is in the wrong place:
+
+| Scene | one-field share | how it was described |
+| --- | ---: | --- |
+| Turtle Woods, ragged | ~76% | "lots of stutters" |
+| Snow Go | ~93% | "stable 56 fps" |
+
+95 rejects both. Combined with a latch that gave up permanently after two
+back-offs, the gate shut for whole levels and the mode advertised itself as
+enabled while delivering 30. It is 80 now - just above the bad case, well
+below the good one - with the forgive margin at 90 and the latch at four
+failures rather than two.
+
+Two lessons, both about method rather than about this game:
+
+- **A tightened acceptance threshold can present as a total feature failure.**
+  "60 FPS does not work" and "the guard is working exactly as configured" were
+  the same state. Nothing in the symptom pointed at a constant.
+- **Tune to the measurements you have.** 85 was derived from measured scenes;
+  95 was derived from reasoning about frame doubling. The reasoning was sound
+  and the number was still wrong, because it ignored that a partly-doubled 56
+  beats a clean 30 for this game.
+
+### The heartbeat now says why
+
+A closed gate in a report used to be indistinguishable from a mode that never
+engaged. `freeze_heartbeat.c` now also emits `native_60fps_verdict` (0 ok,
+1 host behind, 2 cadence, 3 too few loops to judge),
+`native_60fps_one_field_pct` and `native_60fps_backoffs`, all allow-listed in
+`diagnostics.py`. That is the difference between reading the next diagnosis
+and guessing it.
+
+## 60 FPS, part 8: editing a runtime header silently disabled native overlays
+
+Reported as "runs 60 then drops to 30" plus a crash. The runtime's own counter
+disagreed with the player: `[FPS] game: 59.9 fps (1.00x)` for hundreds of
+consecutive lines, right up to `starvation_watchdog: 5119701 us without
+heartbeat - aborting`. The guest loop was at 60 the whole time. What collapsed
+was the host.
+
+The cause was in the same log:
+
+```
+WARNING: overlay autocompile has failed 3 consecutive runs (last exit 1).
+  Nothing is being compiled to native code, so overlay execution stays in the
+  interpreter and frame times will be far worse than this build is capable of.
+FATAL: STALE RECOMPILER BINARY.
+  built from emitter sources hashing 649c6245, but the runtime
+  tree stamps cache tag hash 3d2b5a19.
+```
+
+Patch `0030` edited `psx_cycles.h`. That file is listed in
+`codegen_hash_sources.cmake`, so touching it moved the runtime tree's codegen
+tag from `649c6245` to `3d2b5a19` and left `_build/build-recompiler/
+psxrecomp-game.exe` stale. `compile_overlays.py` then refused to emit shards -
+correctly, that guard exists to prevent the silent stale-shard class - so every
+streamed level function fell back to the MIPS interpreter. Performance decays
+as more overlay code is touched, and eventually the host misses the heartbeat
+for five seconds and the watchdog kills the process.
+
+`_build/build_recompiler.ps1` exists precisely for this and its header says so:
+"patch 0002 edits cpu_state.h and psx_cycles.h, both of which are in
+codegen_hash_sources.cmake". Running it puts both sides on `3d2b5a19`. The
+shard cache from the old tag was cleared too, since those entries would be
+rejected and re-emitted anyway.
+
+**The rule this produces: any edit to a file in `codegen_hash_sources.cmake` -
+`psx_cycles.h` and `cpu_state.h` among them - must be followed by
+`_build/build_recompiler.ps1`, not just `build_clang.ps1`.** Nothing in the
+normal build fails when you skip it. The runtime builds, links and runs; it
+just quietly stops using native overlays, and the only symptom is that it gets
+slower than it should be. That is the same failure class the packaging script
+guards against for release bundles, reached from the development side instead.
+
+### Why the player's counter and the runtime's disagreed
+
+Worth keeping straight, because it sent the first diagnosis in the wrong
+direction. `[FPS] game:` counts guest frames and reported a steady 59.9 at
+1.00x speed. The NVIDIA overlay counts host presents. With overlays
+interpreted, the guest kept its cadence while the host fell further behind
+until it stalled outright - so the two numbers describing "the frame rate"
+genuinely disagreed, and only one of them was about the thing that was broken.
+
+## 60 FPS, part 9: stop guessing the threshold, expose the choice
+
+Three rounds were spent moving `C2_60_MIN_HOLD` (85 -> 95 -> 80) on reasoning
+rather than data, and each time the player's answer was "still 30". The
+telemetry could not settle it because of a defect in the telemetry itself:
+`native_60fps_one_field_pct` reports the CURRENT window, and once the gate has
+closed every frame is two fields, so it always reads 0. Every report said
+"verdict 2, 0%" regardless of whether the scene missed by 5% or by 50%.
+
+Fixed: `c2_60_back_off` now latches `native_60fps_fail_pct` and
+`native_60fps_fail_loop_hz` - the failing window's numbers - alongside
+`native_60fps_cpu_now`, the clock actually in force. That last one matters
+because the clock is only applied while the gate is open, so a report showing
+100 with the mode enabled means the headroom never got a chance to act.
+
+**And the threshold stopped being mine to guess.** `native_60fps_fallback` is
+a launcher setting with two values:
+
+- `smooth` (default) - an unsteady scene is handed back its 30 Hz lock.
+- `always60` - exports `PSX_CRASH2_60FPS_HOLD_PCT=0` and
+  `PSX_CRASH2_60FPS_FORCE_GATE=1`, so diagnostics still identify cadence or
+  host failures but neither silently restores the 30 Hz gate.
+
+That second variable fixes a contradiction in the first launcher version: the
+label said "never drop", while the host-overrun guard could still close the
+gate after one slow second. `smooth` retains host protection, with a two-window
+streak so one startup compilation hitch is not treated as sustained overload.
+
+This is the right shape for the problem. Whether a partly-doubled 56 beats a
+clean 30 is a matter of taste about a specific display and a specific scene,
+and three rounds of evidence say it cannot be settled from here. What can be
+settled from here is making both available and saying plainly what each does.
+
+### A self-inflicted false alarm worth recording
+
+Between two of those rounds the shard cache was cleared (correctly - the
+entries carried the pre-0030 codegen tag and would have been rejected) but not
+rebuilt. The next play session therefore started with an empty cache, ran
+every overlay interpreted, and produced exactly the symptom the clear was
+meant to fix. Clearing a cache and repopulating it are one operation, not two;
+`compile_overlays.py` rebuilds from the surviving captures in seconds and
+should have been run in the same breath.
+
+## 60 FPS, part 10: it was the internal resolution all along
+
+The first run with working failure telemetry ended the search:
+
+```
+native_60fps_gate_open      1     gate open
+game_frame_ticks           17     engine simulating 60 Hz steps
+native_60fps_one_field_pct 87
+native_60fps_fail_pct      98     <- the window that backed off
+native_60fps_cpu_now      125
+host_swap_count          2580  vs  frame_count 3823
+```
+
+**A window with 98% of its frames on one field triggered a back-off.** No
+cadence threshold rejects 98%, so those back-offs were `FAIL_HOST` - the
+emulator falling behind the wall clock - not `FAIL_HOLD`. The guest was never
+the problem. It was holding a near-perfect 60 Hz cadence while the host failed
+to keep up, which the swap count confirms: 2580 presents against 3823 emulated
+VBlanks.
+
+The cause is in the player's settings, not in this code: `supersampling: 5`.
+The renderer draws at five times native in each dimension - twenty-five times
+the pixels - and every VRAM copy, upload and readback scales with it. Running
+the game at 60 instead of 30 then doubles the rate of all of it. The log said
+so from the very first report (`GL GPU pipeline ready (internal scale 5x`) and
+it took ten rounds to read it, because every round was spent looking at the
+guest.
+
+Three rounds of threshold tuning, a CPU-clock rework and a fallback setting
+were all aimed at a guest that was already doing its job. The CPU-clock fix
+(0030) was a real defect and stands on its own; the threshold churn was not.
+
+### The lesson
+
+`FAIL_HOST` and `FAIL_HOLD` were separated and exported precisely so this
+distinction could be read, and then the first several diagnoses still assumed
+cadence. The reporting has to say which one fired **in the window that
+failed** - `native_60fps_fail_pct` is what finally made it obvious, and it
+only exists because the earlier field reported the current window and was
+therefore always 0 once the gate closed.
+
+When a performance guard fires, the first question is which of its conditions
+tripped, not which threshold to move.
+
+## 60 FPS, part 11: host fixed, guest budget is what is left
+
+After the player dropped internal resolution 5x -> 2x:
+
+```
+native_60fps_backoffs   0     the guard never fired
+native_60fps_verdict    0     no host failure - the host keeps up now
+game_loop_count/frame_count = 0.767
+```
+
+That ratio is the whole diagnosis. With `always60` the gate never closes, so
+the loop runs at whatever cadence the guest manages, and
+`loops/VBlank = 1/(2 - f)` where `f` is the fraction of frames fitting in one
+field. 0.767 gives **f = 0.70**: seven frames in ten fit, three take two
+fields. Alternating like that is exactly "average looks like 46, 1% lows are
+30, feels stuttery".
+
+So the host is no longer the constraint and the guard is not intervening. What
+remains is the original, measured fact: this game's busy frames need more
+cycles than one NTSC field provides, and the only lever is the emulated CPU
+clock.
+
+It was capped at 150 and had **no UI control** - it was on the
+`test_settings_coverage.py` NOT_IN_UI allow-list as "follows native_60fps",
+which was true when it was a fixed tuning constant and wrong once it became
+the deciding knob. The cap is 200 now (`C2_60_CPU_CAP`) and there is a combo
+on the Performance page.
+
+Rough arithmetic for anyone tuning it: if a fraction `f` of frames fit at
+clock `c`, the frames that miss need somewhere above `c / f` to fit. At
+f = 0.70 and c = 125 that points at roughly 175, which is why the ladder goes
+to 200 rather than stopping at 150.
+
+**If 200 is not enough, constant 60 is not reachable this way for that scene**
+- the guest would need more than twice the PS1's cycles per field, and at that
+point the honest answer is `smooth` mode and a clean 30.
+
+## 60 FPS, part 12: 200% default and overlay quit
+
+Project policy now starts native 60 at the runtime's existing 200% virtual-CPU
+ceiling. This changes only the emulated PS1 CPU budget; it does not overclock
+the physical CPU, and CD/SPU/timers keep their original clock. The launcher
+still exposes lower values for machines where extra guest work makes the host
+fall behind.
+
+The Home overlay gains `QUIT GAME` after Restart. Both destructive actions use
+the same two-press confirmation state, moving away disarms it, and Quit calls
+the established orderly shutdown path so memory cards and capture data are
+flushed and background compilation is joined before process exit.
+
+## 60 FPS, part 13: one launcher switch
+
+The fallback and virtual-CPU selectors were removed from the launcher. The
+single `60 FPS game updates` checkbox now has one unambiguous meaning: 200%
+virtual PS1 CPU, hold threshold disabled, and the 30 Hz gate forced open.
+`native_60fps_cpu_percent` and `native_60fps_fallback` were removed from the
+settings model, so stale values in an older JSON file are filtered out rather
+than silently changing the checkbox's behavior.
