@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -127,6 +128,24 @@ class AdvancedPage(QWidget):
         self.voice_alloc_trace.setChecked(self.settings.voice_alloc_trace)
         self.voice_alloc_trace.toggled.connect(self._on_voice_alloc_trace)
 
+        self.perf_diag = QCheckBox("Frame-time breakdown by subsystem")
+        self.perf_diag.setChecked(self.settings.perf_diag)
+        self.perf_diag.toggled.connect(self._on_perf_diag)
+
+        self.perf_diag_interval_ms = QSpinBox()
+        self.perf_diag_interval_ms.setRange(250, 600000)
+        self.perf_diag_interval_ms.setSingleStep(500)
+        self.perf_diag_interval_ms.setSuffix(" ms")
+        self.perf_diag_interval_ms.setValue(self.settings.perf_diag_interval_ms)
+        self.perf_diag_interval_ms.valueChanged.connect(
+            self._on_perf_diag_interval_ms)
+
+        self.perf_bench_window = QLineEdit()
+        self.perf_bench_window.setPlaceholderText("e.g. 600:1800")
+        self.perf_bench_window.setText(self.settings.perf_bench_window)
+        self.perf_bench_window.editingFinished.connect(
+            self._on_perf_bench_window)
+
         self.overlay_interpreter = QCheckBox("Run level code in the interpreter")
         self.overlay_interpreter.setChecked(self.settings.overlay_interpreter)
         self.overlay_interpreter.toggled.connect(self._on_overlay_interpreter)
@@ -148,6 +167,14 @@ class AdvancedPage(QWidget):
                 "have a reason not to."
             ),
             self.build_lbl,
+            self.perf_diag,
+            dim(DIAGNOSTIC_SETTINGS["perf_diag"]),
+            row("Report every", self.perf_diag_interval_ms),
+            row("Benchmark window", self.perf_bench_window),
+            dim("Frame range as start:end. Adds one [BENCH] summary line for "
+                "exactly that range - the same measurement either side of a "
+                "change is how you tell whether it helped. Leave empty for "
+                "continuous reporting only."),
             self.voice_alloc_trace,
             dim(DIAGNOSTIC_SETTINGS["voice_alloc_trace"]),
             self.overlay_interpreter,
@@ -197,6 +224,18 @@ class AdvancedPage(QWidget):
 
     def _on_audio_shadow(self, on: bool) -> None:
         self.settings.audio_shadow = on
+        self._touch()
+
+    def _on_perf_diag(self, on: bool) -> None:
+        self.settings.perf_diag = on
+        self._touch()
+
+    def _on_perf_diag_interval_ms(self, value: int) -> None:
+        self.settings.perf_diag_interval_ms = value
+        self._touch()
+
+    def _on_perf_bench_window(self) -> None:
+        self.settings.perf_bench_window = self.perf_bench_window.text().strip()
         self._touch()
 
     def _on_debug_port(self, value: int) -> None:

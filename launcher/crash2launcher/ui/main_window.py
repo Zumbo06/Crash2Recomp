@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import config, paths
+from .. import config, modcatalog, paths
 from ..paths import Layout
 from ..runtime import GameSession, apply_config_settings
 from ..version import full_version
@@ -128,6 +128,15 @@ class MainWindow(QWidget):
         self.advanced_page.changed.connect(self._on_settings_changed)
         self.session.output.connect(self.log_page.append)
         self.session.failed.connect(self.log_page.append)
+
+        # Stage the builtin mod catalog for an ALREADY-built game. _relayout
+        # covers the just-finished-a-build case, but it never fires on an
+        # ordinary start, so without this a player who built before this
+        # version shipped would keep seeing an empty Mods page. Idempotent:
+        # existing package directories are left alone.
+        count, detail = modcatalog.stage_builtin(layout_)
+        if count or "skipping" not in detail:
+            self.log_page.append(f"[launcher] {detail}")
 
         # Restore the page and geometry the user left on.
         start = settings.last_page if layout_.has_runtime else "setup"
@@ -260,6 +269,14 @@ class MainWindow(QWidget):
         """
         self.layout_ = paths.detect()
         self.layout_.ensure_writable_dirs()
+        # The runtime has a mod system compiled in but the generated framework
+        # tree ships no catalog for it, so PGXP/Fast Loading/CD Speed/Bezel are
+        # present in the binary and unreachable. Stage our copy now: this is
+        # the first moment the build output exists, and staging before it would
+        # make `psxrecomp.exe build --output` see a non-empty directory.
+        count, detail = modcatalog.stage_builtin(self.layout_)
+        if count or "skipping" not in detail:
+            self.log_page.append(f"[launcher] {detail}")
         for page in (self.setup_page, self.play_page):
             page.set_layout(self.layout_)
         # Push settings out NOW that the build directory finally exists.

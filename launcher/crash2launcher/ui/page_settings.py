@@ -33,12 +33,14 @@ from ..config import (
     OUTPUT_RESOLUTIONS,
     PRESET_NOTES,
     PRESETS,
-    RENDERERS,
+    RECOMMENDED_SUPERSAMPLING_60FPS,
+    SELECTABLE_RENDERERS,
+    SUPERSAMPLING_60FPS_WARN_ABOVE,
     Settings,
     apply_preset,
     matching_preset,
 )
-from .common import card, dim, heading, row, section
+from .common import card, dim, heading, row, section, warn
 from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
 from .widgets.key_bindings import KeyBindingsEditor
 
@@ -85,6 +87,14 @@ WIDESCREEN_MODES = [
 ]
 
 # Values are config.CHEAT_AKU_LEVELS; the runtime takes the name verbatim.
+# Rewind buffer length. "Short" is what the runtime has always done on its
+# own; "Off" stops it snapshotting every 15 frames, which is why this sits on
+# the Performance page rather than with the other conveniences.
+REWIND_UI = [
+    ("Off - no rewind, no snapshot cost", "off"),
+    ("Short - about 12 seconds", "short"),
+    ("Long - about 50 seconds", "long"),
+]
 CHEAT_AKU_UI = [
     ("Off", "off"),
     ("Keep 2 masks", "keep_masks"),
@@ -103,6 +113,11 @@ OUTPUT_ASPECTS_UI = [
     ("Match gameplay aspect", "auto"),
     ("4:3", "4:3"),
     ("16:9 widescreen", "16:9"),
+    # Screen shape only - there is deliberately no 21:9 GAMEPLAY aspect. See
+    # config.OUTPUT_ASPECTS. The game keeps rendering 14:9 and the zoom/pan/
+    # stretch dials place that picture in the wider window, so an ultrawide
+    # panel is filled edge to edge horizontally without widening the view.
+    ("21:9 ultrawide", "21:9"),
 ]
 
 # How far to zoom the picture toward filling the screen. The shape is exact at
@@ -292,7 +307,7 @@ class SettingsPage(QWidget):
     # -- sections ----------------------------------------------------------
     def _display_page(self) -> QWidget:
         self.renderer = QComboBox()
-        self.renderer.addItems(RENDERERS)
+        self.renderer.addItems(SELECTABLE_RENDERERS)
         self.renderer.setCurrentText(self.settings.renderer)
         self.renderer.currentTextChanged.connect(self._on_renderer)
 
@@ -309,6 +324,12 @@ class SettingsPage(QWidget):
             "below full speed, lower it - the Play page shows the live frame "
             "rate while you test.")
         self.scale.currentIndexChanged.connect(self._on_scale)
+
+        # Internal resolution and 60 FPS interact, and they live on different
+        # pages, so neither control could say so on its own. See
+        # config.RECOMMENDED_SUPERSAMPLING_60FPS for the measurement.
+        self.scale_warning = warn("")
+        self.scale_warning.setVisible(False)
 
         self.fullscreen = self._combo(FULLSCREEN_MODES,
                                       self.settings.fullscreen_mode,
@@ -353,6 +374,7 @@ class SettingsPage(QWidget):
             card(
                 section("Rendering"),
                 row("Internal resolution", self.scale),
+                self.scale_warning,
                 row("Gameplay aspect", self.aspect),
                 row("Widescreen mode", self.ws_mode),
                 dim("Gameplay aspect is what the GAME renders; Screen shape is "
@@ -587,6 +609,9 @@ class SettingsPage(QWidget):
         self.cheat_aku_aku = self._combo(CHEAT_AKU_UI, self.settings.cheat_aku_aku,
                                          self._on_cheat_aku_aku)
 
+        self.rewind = self._combo(REWIND_UI, self.settings.rewind,
+                                  self._on_rewind)
+
         self.native_overlays = QCheckBox("Compile level code natively")
         self.native_overlays.setChecked(self.settings.native_overlays)
         self.native_overlays.toggled.connect(self._on_native_overlays)
@@ -635,6 +660,10 @@ class SettingsPage(QWidget):
                 self.native_overlays,
                 dim("Crash 2 streams level code from disc. Without this it runs "
                     "on the MIPS interpreter - correct, but far slower."),
+                row("Rewind", self.rewind),
+                dim("F8 rewinds. The game saves a snapshot every few frames "
+                    "whether you use it or not, so turning this off gives that "
+                    "work back."),
             ),
             card(
                 section("Reporting"),
@@ -704,11 +733,13 @@ class SettingsPage(QWidget):
         """Push the dataclass back into the widgets after a bulk change."""
         self._loading = True
         self.bindings.refresh()
+        self._refresh_scale_warning()
         self.renderer.setCurrentText(self.settings.renderer)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
         self.aspect.setCurrentText(self.settings.aspect)
         for box, value in (
             (self.fullscreen, self.settings.fullscreen_mode),
+            (self.rewind, self.settings.rewind),
             (self.ws_mode, self.settings.widescreen_native_wide),
             (self.scaling, self.settings.scaling_mode),
             (self.tex_filter, self.settings.texture_filter),
@@ -750,8 +781,33 @@ class SettingsPage(QWidget):
         self.settings.renderer = value
         self._touch()
 
+    def _refresh_scale_warning(self) -> None:
+        """Warn when internal resolution is the thing that will cost 60 FPS.
+
+        Measured (tuning/NOTES.md part 10): at supersampling 5 with 60 FPS on,
+        the host managed 2580 presents against 3823 emulated VBlanks while 98%
+        of frames were still fitting in one field - the renderer was the
+        constraint, not the game. This is a warning and not a clamp because the
+        exact ceiling is GPU-dependent.
+        """
+        if not hasattr(self, "scale_warning"):
+            return
+        too_high = (self.settings.native_60fps
+                    and self.settings.supersampling
+                    > SUPERSAMPLING_60FPS_WARN_ABOVE)
+        if too_high:
+            self.scale_warning.setText(
+                "<b>At 60 FPS this is likely to cost you frames.</b> "
+                "%dx was measured missing about a third of its presents while "
+                "the game itself was still keeping up - the renderer runs out "
+                "first. Try %dx, and watch the readout on the Play page."
+                % (self.settings.supersampling,
+                   RECOMMENDED_SUPERSAMPLING_60FPS))
+        self.scale_warning.setVisible(too_high)
+
     def _on_scale(self, index: int) -> None:
         self.settings.supersampling = self.scale.itemData(index)
+        self._refresh_scale_warning()
         self._touch()
 
     def _on_fullscreen(self, index: int) -> None:
@@ -850,8 +906,13 @@ class SettingsPage(QWidget):
         self.settings.developer_mode = on
         self._touch()
 
+    def _on_rewind(self, index: int) -> None:
+        self.settings.rewind = self.rewind.itemData(index)
+        self._touch()
+
     def _on_native_60fps(self, on: bool) -> None:
         self.settings.native_60fps = on
+        self._refresh_scale_warning()
         self._touch()
 
     def _on_cheat_infinite_lives(self, on: bool) -> None:

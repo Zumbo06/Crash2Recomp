@@ -16,7 +16,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from . import gametoml, keybinds, usersettings
+from . import config, gametoml, keybinds, usersettings
 from .config import Settings
 from .paths import Layout, find_c_toolchain_bin, find_overlay_python
 
@@ -134,6 +134,21 @@ def _build_env(settings: Settings) -> dict[str, str]:
         env["PSX_CRASH2_60FPS_HOLD_PCT"] = "0"
         env["PSX_CRASH2_60FPS_FORCE_GATE"] = "1"
 
+    # Rewind. The runtime defaults this ON (psx_rewind.c rewind_wanted only
+    # disables on PSX_REWIND=0) and takes a snapshot every interval frames
+    # whether or not anyone rewinds, so "off" genuinely stops that work.
+    # Always write the vars rather than only on non-default values: the runtime
+    # caches its answer on first use, so leaving them unset means inheriting
+    # whatever a previous session's environment happened to hold.
+    rewind = config.REWIND_LEVELS.get(settings.rewind)
+    if rewind is None:
+        env["PSX_REWIND"] = "0"
+    else:
+        depth, interval = rewind
+        env["PSX_REWIND"] = "1"
+        env["PSX_REWIND_DEPTH"] = str(depth)
+        env["PSX_REWIND_INTERVAL"] = str(interval)
+
     if settings.cheat_infinite_lives:
         env["PSX_CRASH2_CHEAT_LIVES"] = "1"
     # The level by name, not a flag. The runtime still accepts the old "1" so a
@@ -206,6 +221,18 @@ def _build_env(settings: Settings) -> dict[str, str]:
             env["PSX_OVERLAY_NATIVE_OFF"] = "1"
         if settings.force_interpreter:
             env["PSX_FORCE_INTERP"] = "1"
+        # The runtime's own subsystem profiler. Three separate variables
+        # (main.cpp runtime_perf_init): PSX_RUNTIME_PERF_DIAG is a plain
+        # enable flag - any value that is non-empty and does not begin with
+        # '0' - while the report interval is PSX_RUNTIME_PERF_DIAG_MS, clamped
+        # runtime-side to 250..600000 ms. PSX_BENCH_WINDOW takes "start:end"
+        # frame numbers and emits one [BENCH] summary line for that range,
+        # which is the A/B harness for before/after comparisons.
+        if settings.perf_diag:
+            env["PSX_RUNTIME_PERF_DIAG"] = "1"
+            env["PSX_RUNTIME_PERF_DIAG_MS"] = str(settings.perf_diag_interval_ms)
+            if settings.perf_bench_window:
+                env["PSX_BENCH_WINDOW"] = settings.perf_bench_window
 
     # Presentation fit. Only "stretch"/"fill" change anything; letterbox is the
     # runtime default, so we still pass it explicitly to make a relaunch after

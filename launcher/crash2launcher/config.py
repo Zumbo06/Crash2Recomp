@@ -10,18 +10,53 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+# "<start>:<end>" frame numbers, as main.cpp runtime_perf_parse_window reads it.
+_BENCH_WINDOW_RE = re.compile(r"\d+:\d+")
+
+# Every backend name the runtime knows about. Reference only - clamp()
+# validates against SELECTABLE_RENDERERS, so a settings file naming "vulkan"
+# IS rewritten to "opengl" rather than passed through.
 RENDERERS = ("opengl", "vulkan", "software")
+
+# What the launcher actually lets a player pick.
+#
+# Vulkan is excluded because it cannot work on this title, in two independent
+# ways. gpu_vk_renderer.c says geometry pipelines, texturing/CLUT, mask-bit,
+# semi-transparency, SSAA and the native-wide compositor "currently abort via
+# psx_fatal_halt rather than silently no-op" - so a frame with any geometry in
+# it kills the process. And the runtime refuses the backend anyway unless
+# game.toml sets [video] offer_vulkan, which Crash 2's does not.
+#
+# It was selectable in the combo the whole time. Picking it was a crash.
+SELECTABLE_RENDERERS = ("opengl", "software")
 # 14:9 is the useful middle: it widens the field of view by ~1.17x instead of
 # 16:9's ~1.33x, so it reaches only about half as far past the edge Crash 2's
 # levels were actually authored to - which is where scenery pops in and out.
 # It also leaves only a 14% gap to a 16:9 panel, small enough that the stretch
 # dial can close it without a visible distortion.
 ASPECTS = ("4:3", "14:9", "16:9")
+
+# Shapes the OUTPUT CANVAS may take. Deliberately a superset of ASPECTS.
+#
+# 21:9 is here and NOT in ASPECTS, and that distinction is the whole feature.
+# Widening what the game RENDERS at walks the camera past the edge Crash 2's
+# levels were authored to, and the margin scales badly: 43 px per side at 14:9,
+# 85 at 16:9, 192 at 21:9 (psx_ws_x_margin, gpu.c). 14:9 was chosen precisely
+# because 43 px halves the exposure that makes scenery pop in and out, so 21:9
+# gameplay would be about 2.3x worse than the 16:9 mode already demoted for it.
+# The cull machinery cannot rescue it either - Crash 2 has zero screen-extent
+# cull immediates and no 2D backdrop layer (tuning/NOTES.md, Widescreen part 6).
+#
+# Offering it as a CANVAS costs none of that: the game keeps rendering 14:9 and
+# the existing zoom/pan/stretch dials fit that picture into a wider window. An
+# ultrawide owner gets a correct full-width image and no new pop-in.
+OUTPUT_ASPECTS = ASPECTS + ("21:9",)
 
 # Exact output canvases offered by the launcher.  Aspect ratio is deliberately
 # separate: a 4:3 BIOS/FMV can pillarbox inside (say) a 3840x2160 canvas, while
@@ -55,6 +90,21 @@ SCALING_MODES = ("letterbox", "stretch", "fill", "fit_width")
 # runtime uses, so the order is part of the contract with crash2_cheats.h.
 CHEAT_AKU_LEVELS = ("off", "keep_masks", "no_damage")
 
+# Rewind buffer sizes, as (depth, interval-in-frames) for PSX_REWIND_DEPTH and
+# PSX_REWIND_INTERVAL. The runtime accepts depth 4..200 and interval 1..60
+# (psx_rewind.c normalize_rewind_*), and defaults to 50/15 - roughly 12.5
+# seconds at 60 Hz. It has always been ON, and the launcher never wrote any of
+# these, so a player could neither lengthen it nor stop paying for it.
+#
+# Snapshots are not free: one is taken every `interval` frames regardless of
+# whether the player ever rewinds, which is why "off" is a real performance
+# choice and not just a feature toggle.
+REWIND_LEVELS = {
+    "off":   None,          # PSX_REWIND=0; no snapshots taken at all
+    "short": (50, 15),      # the runtime's own default, ~12.5 s at 60 Hz
+    "long":  (200, 15),     # the runtime's maximum depth, ~50 s at 60 Hz
+}
+
 # The runtime's own cap was raised 4 -> 8 (tuning/patches/0003). The UI stops
 # at 6: on the hardware this was developed against, 8x allocated and reported
 # "internal scale 8x" but then produced no frames at all, which looks like an
@@ -62,6 +112,29 @@ CHEAT_AKU_LEVELS = ("off", "keep_masks", "no_damage")
 # throws above the runtime cap, so this must never exceed it.
 MAX_SUPERSAMPLING = 6
 RECOMMENDED_SUPERSAMPLING = 5
+
+# ...but 5x is only "recommended" at the stock 30 Hz game cadence, which is
+# what the 5x/6x/8x ladder was measured at (tuning/NOTES.md "Internal
+# resolution"). At 60 FPS the same setting is the thing that breaks the mode.
+#
+# Measured, tuning/NOTES.md part 10: with native_60fps on and supersampling 5,
+# the host produced 2580 presents against 3823 emulated VBlanks and the 60 FPS
+# judge returned FAIL_HOST on a window that had 98% of its frames on one field
+# - i.e. the GAME was keeping up and the RENDERER was not. Dropping to 2x
+# removed the host failure entirely (backoffs 0, verdict 0).
+#
+# So the ceiling is cadence-dependent, and nothing in the UI used to say so.
+RECOMMENDED_SUPERSAMPLING_60FPS = 2
+# Above this, warn. 3x is the last value with headroom to spare at 60; it is a
+# warning rather than a clamp because it is GPU-dependent and a fast card may
+# well hold 4x - the player can see the live frame rate on the Play page.
+SUPERSAMPLING_60FPS_WARN_ABOVE = 3
+
+
+def recommended_supersampling(native_60fps: bool) -> int:
+    """The internal-resolution multiple to recommend for a given cadence."""
+    return (RECOMMENDED_SUPERSAMPLING_60FPS if native_60fps
+            else RECOMMENDED_SUPERSAMPLING)
 
 
 @dataclass
@@ -242,6 +315,10 @@ class Settings:
     audio_shadow: bool = False
 
     # --- performance ------------------------------------------------------
+    # Rewind buffer length: "off", "short" or "long". See REWIND_LEVELS.
+    # Defaults to "short", which reproduces what the runtime already did
+    # unprompted - this setting exposes it rather than changing it.
+    rewind: str = "short"
     # Compile streamed level code (overlays) to native instead of letting it
     # fall back to the MIPS interpreter. Needs a C compiler on PATH, which the
     # launcher supplies from psxrecomp's own clang pack.
@@ -271,6 +348,26 @@ class Settings:
     # index plus each voice's phase and envelope level. Reading it needs no
     # debug port - it prints straight to the Log page.
     voice_alloc_trace: bool = False
+    # Enables the runtime's own subsystem profiler (PSX_RUNTIME_PERF_DIAG).
+    #
+    # It prints one "runtime cadence:" line every few seconds attributing
+    # milliseconds-per-second to guest work, pacer wait, autocapture, provider
+    # poll, GL upload/texture/draw, plus native-vs-interp dispatch deltas and
+    # the hottest native overlay PC. main.cpp calls it "lightweight
+    # production-safe" - it adds no per-block or per-instruction recording, so
+    # unlike the other entries here it does NOT degrade playback.
+    #
+    # It is listed as a diagnostic anyway because it is a measurement tool and
+    # prints continuously. Nothing in this project had ever switched it on.
+    perf_diag: bool = False
+    # How often the profiler reports, in milliseconds. The runtime defaults to
+    # 5000; below ~1000 the lines arrive faster than they can be read.
+    perf_diag_interval_ms: int = 5000
+    # Optional "start:end" frame range. When set, the runtime also emits one
+    # [BENCH] line summarising just that window - wall time, guest work, pacer
+    # wait, autocapture, provider poll and native/interp dispatch counts. That
+    # is the before/after harness; leave empty for continuous reporting only.
+    perf_bench_window: str = ""
     # Runs streamed level code in the MIPS interpreter instead of the native
     # shards. Slow, but it is the reference: if something works here and not
     # natively, the recompiler's codegen is the bug.
@@ -293,9 +390,6 @@ class Settings:
     # with its thumbnail - the keys are a shortcut, not a separate store.
     quick_save_slot: int = 0
 
-    # --- mods -------------------------------------------------------------
-    enabled_mods: list[str] = field(default_factory=list)
-
     # --- launcher ---------------------------------------------------------
     last_page: str = "play"
     window_geometry: str = ""
@@ -315,7 +409,11 @@ class Settings:
         Hand-edited or older settings files should degrade to defaults rather
         than propagate a bad value into the runtime command line.
         """
-        if self.renderer not in RENDERERS:
+        # Fall back to OpenGL for anything unknown AND for vulkan, which is a
+        # valid name the runtime will not actually run (see
+        # SELECTABLE_RENDERERS). A settings file carrying it - written before
+        # the option was withdrawn - would otherwise crash on launch.
+        if self.renderer not in SELECTABLE_RENDERERS:
             self.renderer = "opengl"
         if self.aspect not in ASPECTS:
             self.aspect = "16:9"
@@ -328,6 +426,14 @@ class Settings:
             self.vsync = 0
         if self.cheat_aku_aku not in CHEAT_AKU_LEVELS:
             self.cheat_aku_aku = "off"
+        if self.rewind not in REWIND_LEVELS:
+            self.rewind = "short"
+        # Mirrors runtime_perf_init's own clamp (main.cpp).
+        self.perf_diag_interval_ms = max(
+            250, min(600000, int(self.perf_diag_interval_ms or 5000)))
+        window = (self.perf_bench_window or "").strip()
+        self.perf_bench_window = (
+            window if _BENCH_WINDOW_RE.fullmatch(window) else "")
         if self.fullscreen_mode not in (0, 1, 2):
             self.fullscreen_mode = 0
         if self.texture_filter not in ("nearest", "bilinear"):
@@ -345,7 +451,7 @@ class Settings:
         # The loader rejects an output size outside these bounds; 0/0 means
         # "auto". Migrate old width-only settings by deriving the missing height
         # once, then persist an exact pair on the next save.
-        if self.output_aspect not in ("auto",) + ASPECTS:
+        if self.output_aspect not in ("auto",) + OUTPUT_ASPECTS:
             self.output_aspect = "auto"
         self.present_zoom = (-1 if int(self.present_zoom) < 0
                              else min(100, int(self.present_zoom)))
@@ -427,6 +533,12 @@ DIAGNOSTIC_SETTINGS: dict[str, str] = {
         "Every ~5s, logs how the game is picking SPU voices. Does not change "
         "how the game sounds - it only counts and prints. For diagnosing the "
         "sound effect cut-outs."
+    ),
+    "perf_diag": (
+        "Prints a per-subsystem frame-time breakdown every few seconds: guest "
+        "work, pacer wait, GL upload/draw, native vs interpreted dispatch. "
+        "This is the tool for finding out WHERE the time goes. It adds no "
+        "per-instruction tracing, so it does not itself slow the game down."
     ),
     "overlay_interpreter": (
         "Runs level code in the MIPS interpreter instead of native shards. "
@@ -569,6 +681,38 @@ PRESETS: dict[str, dict[str, Any]] = {
     # present, which genuinely widens the field of view. Kept because a wider
     # view is a real benefit, but it walks past the authored edge of Crash 2's
     # levels, so geometry appears and disappears at the frame border.
+    # Ultrawide panels, WITHOUT widening the field of view.
+    #
+    # Identical to Enhanced except the canvas: the game still renders 14:9, so
+    # the margin stays 43 px per side and no new scenery pops in. The zoom and
+    # stretch dials then fit that picture into a 21:9 window.
+    #
+    # Deliberately NOT a full edge-to-edge fill. With the 12 blank scanlines
+    # trimmed the drawn band is about 1.73:1; reaching 2.33:1 would need ~35%
+    # horizontal distortion (Enhanced needs 2%) or throwing away another ~26%
+    # of the height. Stretch is left at 0 and zoom at 0, so the picture is
+    # correct and pillarboxed; a player who prefers to trade some of that for
+    # width can raise either dial themselves and see exactly what it costs.
+    "Ultrawide (21:9 screen)": {
+        "supersampling": RECOMMENDED_SUPERSAMPLING,
+        "aspect": "14:9",
+        "output_aspect": "21:9",
+        "widescreen_native_wide": False,
+        "scaling_mode": "letterbox",
+        "present_zoom": 0,
+        "present_pan": 0,
+        "present_stretch": 0,
+        "texture_filter": "bilinear",
+        "present_filter": "bicubic",
+        "crt_filter": "raw",
+        "antialiasing": True,
+        "frame_interpolation": True,
+        "frame_interpolation_fps": 0,
+        "overscan_top": 12,
+        "overscan_bottom": 12,
+        "geometry_correction": False,
+        "perspective_texturing": False,
+    },
     "Widescreen (wider view)": {
         "supersampling": RECOMMENDED_SUPERSAMPLING,
         "aspect": "16:9",
@@ -599,6 +743,11 @@ PRESET_NOTES: dict[str, str] = {
                  "reaches half as far past the level edges as full widescreen, "
                  "so far less scenery pops in. A good default."),
     "Performance": "Same fit as Enhanced, lower internal resolution for weaker GPUs.",
+    "Ultrawide (21:9 screen)": ("For a 21:9 monitor. The view stays as wide as "
+                               "Enhanced - only the window gets wider - so no "
+                               "extra scenery pops in. The picture is centred "
+                               "with bars at the sides; raise Zoom or Stretch "
+                               "on this page to trade some accuracy for width."),
     "Widescreen (wider view)": ("Genuinely wider field of view, but Crash 2's "
                                 "levels end at the 4:3 edge, so scenery can "
                                 "appear and vanish at the frame border."),

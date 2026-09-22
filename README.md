@@ -55,13 +55,26 @@ page tells you to relaunch.
 
 Saves live in `userdata/`, next to the launcher.
 
-Settings -> Performance has an opt-in native 60 FPS mode. It can sustain about
-60 game updates per second in tested scenes and falls back to 30 when the
-machine or scene cannot hold that cadence. It is still experimental: world
-movement, scripts, FMVs and audio have not been validated across the whole
-game. It runs the game loop at 60 where a scene can hold it smoothly and
-falls back to a clean 30 where it cannot, which is steadier than a rate no
-display period divides.
+**Settings -> Performance has an experimental, opt-in 60 FPS mode.** It runs
+Crash 2's own game loop at 60 instead of 30 - a real change to how the game
+executes, not a smoothing filter on the picture. Once enabled it stays at 60
+rather than dropping you back.
+
+It is off by default and is a preview. World movement keeps the correct speed
+(the engine already scales motion by measured frame time and this reuses
+that), but scripted sequences, cutscene pacing, music and sound timing, bosses,
+vehicle levels and FMV transitions have **not** been verified across the whole
+game. It also runs the emulated PlayStation processor at 200% so a busy frame
+can fit into one screen refresh, which is the furthest this gets from how the
+console behaved.
+
+Busy scenes will land between 30 and 60 rather than holding a clean 60. If that
+bothers you, lower **Internal resolution** on the Video page first - at 5x the
+renderer draws twenty-five times the pixels of native, and that is usually what
+runs out before the game does.
+
+If something behaves strangely, turn it off and see whether the problem goes
+away - that is a useful thing to report. It changes timing, not saved data.
 
 The same page offers **Keep 99 lives** and a **Damage** setting with three
 positions, all off by default:

@@ -16,9 +16,23 @@ a = Analysis(
     ["main.py"],
     pathex=["."],
     binaries=[],
-    datas=[(str(path), ".") for path in
-           (Path(SPECPATH) / "crash2launcher" / "ui" / "assets").glob("*")
-           if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".ico", ".svg"}],
+    datas=(
+        [(str(path), ".") for path in
+         (Path(SPECPATH) / "crash2launcher" / "ui" / "assets").glob("*")
+         if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".ico", ".svg"}]
+        # The builtin mod catalog. Unlike the flat image assets above these
+        # MUST keep their directory shape: the runtime's scan requires
+        # packages/<package_id>/<version>/manifest.toml and rejects any package
+        # whose path does not match the id and version inside the manifest.
+        # modcatalog.source_dir() resolves to the same relative path under
+        # sys._MEIPASS, so workspace and frozen layouts agree.
+        + [(str(path), str(Path("moddata") / "builtin" / "packages"
+                           / path.relative_to(
+                               Path(SPECPATH) / "crash2launcher" / "moddata"
+                               / "builtin" / "packages").parent))
+           for path in (Path(SPECPATH) / "crash2launcher" / "moddata"
+                        / "builtin" / "packages").rglob("manifest.toml")]
+    ),
     # Qt modules the launcher never touches. Excluding them takes the bundle
     # from ~400 MB to ~150 MB; each is a whole subsystem (a browser engine, a
     # 3D renderer, a charting library) that nothing here imports.

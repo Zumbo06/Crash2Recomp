@@ -117,7 +117,6 @@ class Layout:
     game_toml: Path
     disc_data: Path       # prepared disc image directory
     userdata: Path        # settings + saves, always writable
-    mods: Path
     build_dir: Path       # workspace only; where cmake writes
     cli_exe: Path         # workspace only; psxrecomp.exe
     src_cli: Path         # workspace only; psxrecomp_cli.py for `analyze`
@@ -176,6 +175,29 @@ class Layout:
     def runtime_include(self) -> Path:
         return self.project / "psxrecomp" / "runtime" / "include"
 
+    # --- mods -------------------------------------------------------------
+
+    @property
+    def mods(self) -> Path:
+        """The mods root, which MUST be the runtime executable's directory.
+
+        `mod_runtime_initialize()` is called with ``exe_dir/mods`` and scans
+        ``<that>/packages``. This used to be a separate launcher-owned field
+        (``project/mods`` in a workspace, ``root/mods`` in a bundle) that was
+        created by ensure_writable_dirs() and then never read again - so a
+        player dropping a .psxmod into the folder the launcher made got
+        silence, because the runtime was looking somewhere else entirely.
+        Deriving it from runtime_exe is what keeps the two in agreement.
+
+        Note runtime_exe is a *predicted* path before the first build; its
+        parent is still the right directory, so staging works pre-build too.
+        """
+        return self.runtime_exe.parent / "mods"
+
+    @property
+    def mod_packages(self) -> Path:
+        return self.mods / "packages"
+
     @property
     def overlay_cache(self) -> Path:
         return self.runtime_exe.parent / "cache"
@@ -210,8 +232,15 @@ class Layout:
         return self.mode is Mode.PLAYER
 
     def ensure_writable_dirs(self) -> None:
-        """Create the directories we own. Safe to call repeatedly."""
-        for d in (self.userdata, self.save_dir, self.mods):
+        """Create the directories we own. Safe to call repeatedly.
+
+        `mods` is deliberately NOT created here. It now lives inside the build
+        output directory (see the `mods` property), and `psxrecomp.exe build`
+        refuses a non-empty --output - so creating it up front would break the
+        very build that produces the runtime. modcatalog.stage_builtin()
+        creates it after a build instead.
+        """
+        for d in (self.userdata, self.save_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -311,7 +340,6 @@ def detect(root: Path | None = None) -> Layout:
             game_toml=project / "game.toml",
             disc_data=root / "data",
             userdata=root / "userdata",
-            mods=root / "mods",
             build_dir=project / "build",
             # The recompiler ships in its own folder so its framework/ tree
             # cannot be mistaken for the generated project.
@@ -331,7 +359,6 @@ def detect(root: Path | None = None) -> Layout:
         game_toml=project / "game.toml",
         disc_data=project / "input",
         userdata=root / "launcher" / "userdata",
-        mods=project / "mods",
         build_dir=project / "build-clang",
         cli_exe=build / "psxrecomp-cli" / "psxrecomp.exe",
         src_cli=build / "psxrecomp-src" / "psxrecomp_cli.py",
