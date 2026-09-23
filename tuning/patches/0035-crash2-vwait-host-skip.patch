@@ -1,0 +1,275 @@
+Skip v_wait's idle passes on the host while native 60 has the clock raised.
+
+Measured in play with 0033 and 0034 in: every frame fitted one field (100%),
+but in busy scenes (1,200-2,100 prims) the emulation thread spent 980-990 ms of
+each second emulating and 0 ms idle, VBlank fell to 42-59/s and speed to
+0.87-0.94. The guest had finished its frame; the host was spending the rest of
+the field executing PsyQ's v_wait - 14 instructions, three RAM loads and a
+store per pass - one pass at a time, twice as many per field at 200%.
+
+The runtime's generic wait-loop skip does not apply: it is opt-in, and its
+first gate is "no guest stores", while v_wait stores its timeout counter to
+the stack every pass. This adds a skip specific to that loop, in
+crash2_60fps.h, on the same rule as the generic one:
+
+  - At the loop head (0x8004A5F4, the back-edge's check PC) measure passes:
+    same sp, same target, counter down by exactly one, gap under 512 cycles.
+  - After four clean passes, skip whole passes up to two short of the next
+    DELIVERABLE interrupt (psx_cycles_to_next_idle_event - the generic skip's
+    own bound, now exported from psx_cycles.c), costed at the measured
+    average; decrement the stack counter by the passes skipped. Real passes
+    then cross the event, so the interrupt is taken where it would have been,
+    give or take one pass.
+  - Never when an unmasked interrupt is already pending: the generic skip
+    runs inside the interrupt check before deliverability is evaluated, this
+    runs just after it, so it tests that itself.
+  - Never leaves the counter below 2, so the game's own timeout path stays
+    reachable.
+  - Only with the mode on, the gate open, the clock above 100 and the
+    revision verified; the loop's words are added to c2_60_signature_ok.
+    Excluded under netplay, self-check, replay and exception handling, like
+    the generic skip. PSX_CRASH2_VWAIT_SKIP=0 disables it for A/B.
+
+Heartbeat gains native_60fps_vwait_skipped (cumulative guest cycles). Its rate
+over the guest clock is the spin the host no longer runs.
+
+No file here is in codegen_hash_sources.cmake.
+
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -222,6 +222,13 @@
+     return best;
+ }
+ 
++/* Exported for the SCUS-94154 v_wait skip (crash2_60fps.h): the same bound the
++ * generic wait-loop skip uses, so the two can never disagree about where it is
++ * safe to stop. */
++uint32_t psx_cycles_to_next_idle_event(void) {
++    return devices_cycles_to_next_idle_event();
++}
++
+ static void psx_devices_recompute_deadline(void) {
+     uint32_t next = devices_cycles_to_next_internal_event();
+     if (next > PSX_DEADLINE_HARD_CAP) next = PSX_DEADLINE_HARD_CAP;
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -109,6 +109,37 @@
+ #define C2_60_VS_ARG1_PC   0x8004A534u
+ #define C2_60_VS_ARG1_ORIG 0x24050001u   /* addiu a1,zero,1 */
+ #define C2_60_VS_ARG1_WIDE 0x24050002u   /* addiu a1,zero,2 */
++
++/* v_wait's idle half, skipped on the host.
++ *
++ * With every frame now fitting one field at 200%, the rest of each field is
++ * spent in v_wait's loop - 14 instructions a pass, three RAM loads and a store
++ * - executed one pass at a time. Measured in play: in busy scenes the
++ * emulation thread spent 980-990 ms of every second emulating and 0 ms idle,
++ * VBlank fell to 42-59/s and the whole machine ran at 0.87-0.94 speed, while
++ * 100% of frames still fitted a field. The guest was done; the host was busy
++ * spinning on its behalf.
++ *
++ * The runtime has a generic wait-loop skip, but its first gate is "no guest
++ * stores", and v_wait stores its timeout counter to the stack every pass. So
++ * this one is specific to this loop, verified word for word by
++ * c2_60_signature_ok, and follows the same rule as the generic one: skip whole
++ * passes, and stop short of the next DELIVERABLE interrupt
++ * (psx_cycles_to_next_idle_event, the bound the generic skip uses). A loop
++ * that only reads RAM cannot see anything change until an interrupt is taken,
++ * so every pass skipped is one it would have spent reading the same values.
++ *
++ * It stops C2_60_VW_MARGIN passes short, so real passes cross the event and
++ * the interrupt is taken where it would have been, give or take one pass. The
++ * stack counter is decremented by the passes skipped and never allowed near
++ * -1, so the game's own timeout path stays reachable. Active only while this
++ * mode has the clock raised; PSX_CRASH2_VWAIT_SKIP=0 turns it off for A/B. */
++#define C2_60_VW_HEAD       0x8004A5F4u  /* loop head, the back-edge's check PC */
++#define C2_60_VCOUNT        0x8005DC98u  /* libetc Vcount, bumped by VBlank */
++#define C2_60_VW_MIN_STREAK 4u           /* clean passes measured before a skip */
++#define C2_60_VW_MARGIN     2u           /* passes left for real execution */
++#define C2_60_VW_MAX_Q      512u         /* a pass longer than this was interrupted */
++#define C2_60_VW_MAX_SKIP   1200000u     /* > one field; VBlank bounds it anyway */
+ #define C2_60_TICKS      0x8003BEA4u   /* root-counter-2 tick accumulator */
+ /* The engine's timing mode. 0 is live play; the game writes 2 when it starts
+  * demo PLAYBACK (0x8002FD10, which sets up the recorded stream right after),
+@@ -197,6 +228,14 @@
+  * quick load, rewind, netplay rollback and the self-check. See
+  * crash2_60fps_note_restore(). */
+ static int c2_60_restored;
++/* v_wait skip: the last head visit, and the passes measured since. */
++static int c2_60_vw_enabled = -1;      /* -1 unread; PSX_CRASH2_VWAIT_SKIP */
++static uint64_t c2_60_vw_cycle;
++static uint32_t c2_60_vw_sp, c2_60_vw_a0, c2_60_vw_t;
++static uint64_t c2_60_vw_qsum;
++static uint32_t c2_60_vw_qmax;
++static unsigned c2_60_vw_n;
++static unsigned long long c2_60_vw_skips, c2_60_vw_skipped;
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
+@@ -242,6 +281,14 @@
+            cpu->read_word(0x8004A5D0u) == 0x00052BC0u &&  /* sll a1,a1,15 */
+            cpu->read_word(0x8004A5F0u) == 0x2403FFFFu &&  /* addiu v1,zero,-1 */
+            cpu->read_word(0x8004A60Cu) == 0x1443000Cu &&  /* bne v0,v1 (-1?) */
++           /* ...and the pass the v_wait skip models, word for word. */
++           cpu->read_word(0x8004A5F4u) == 0x8FA20010u &&  /* lw v0,16(sp) */
++           cpu->read_word(0x8004A5FCu) == 0x2442FFFFu &&  /* addiu v0,v0,-1 */
++           cpu->read_word(0x8004A600u) == 0xAFA20010u &&  /* sw v0,16(sp) */
++           cpu->read_word(0x8004A640u) == 0x3C028006u &&  /* lui v0,0x8006 */
++           cpu->read_word(0x8004A644u) == 0x8C42DC98u &&  /* lw v0,Vcount */
++           cpu->read_word(0x8004A64Cu) == 0x0044102Au &&  /* slt v0,v0,a0 */
++           cpu->read_word(0x8004A650u) == 0x1440FFE8u &&  /* bne v0,zero,head */
+            /* VSync's two calls into it, and the words that set its timeout. */
+            cpu->read_word(0x8004A514u) == 0x0C012973u &&  /* jal v_wait */
+            cpu->read_word(0x8004A538u) == 0x0C012973u &&  /* jal v_wait */
+@@ -353,6 +400,11 @@
+  * This only raises a flag; the next outer loop reconciles, on the emulation
+  * thread, with the anchors re-verified. */
+ void crash2_60fps_note_restore(void) { c2_60_restored = 1; }
++
++/* Guest cycles the v_wait skip has fast-forwarded, cumulative. Over the guest
++ * clock it is the share of the machine's time the host no longer spends
++ * spinning; zero with the mode on and the clock raised means it never engaged. */
++unsigned long long crash2_60fps_vwait_skipped_cycles(void) { return c2_60_vw_skipped; }
+ unsigned crash2_60fps_loop_hz(void) { return c2_60_loop_hz; }
+ /* Percentage of the last window's frames the engine simulated as one field.
+  * This is the number the hold decision is made on, so report it: a scene that
+@@ -452,6 +504,100 @@
+     return (c2_60_verdict = C2_60_OK);
+ }
+ 
++static void c2_60_vwait_skip(CPUState *cpu)
++{
++    extern uint64_t psx_cycle_count;
++    extern uint32_t psx_cycles_to_next_idle_event(void);
++    extern void psx_advance_cycles(uint32_t cycles);
++    extern uint32_t psx_read_word(uint32_t address);
++    extern void psx_write_word(uint32_t address, uint32_t value);
++    extern int psx_get_in_exception(void);
++    extern int g_psx_call_bail, g_precise_mode, g_ls_mode, g_ls_replay_active;
++    extern int psx_netplay_active(void);
++    extern int psx_selfcheck_enabled(void);
++
++    if (c2_60_vw_enabled < 0) {
++        const char *e = getenv("PSX_CRASH2_VWAIT_SKIP");
++        c2_60_vw_enabled = (e && e[0] == '0') ? 0 : 1;
++    }
++    /* Same exclusions as the generic skip: anything replaying, resimulating
++     * or comparing instruction streams must see every pass. And only while
++     * this mode has the clock raised on the verified revision. */
++    if (!c2_60_vw_enabled || c2_60_mode != 1 || !c2_60_gate_open ||
++        c2_60_cpu_now <= 100 || c2_60_verified != 1 ||
++        g_ls_replay_active || psx_get_in_exception() || g_psx_call_bail ||
++        g_precise_mode || g_ls_mode != 0 ||
++        psx_netplay_active() || psx_selfcheck_enabled()) {
++        c2_60_vw_n = 0;
++        c2_60_vw_cycle = 0;
++        return;
++    }
++
++    const uint64_t now = psx_cycle_count;
++    const uint32_t sp = cpu->gpr[29], a0 = cpu->gpr[4];
++    const uint32_t t = psx_read_word(sp + 16u);
++    const int32_t vcount = (int32_t)psx_read_word(C2_60_VCOUNT);
++
++    /* A pass continues the last one when it is the same call (sp, target),
++     * the counter went down by exactly one, and nothing long happened in
++     * between - an interrupt handler shows up as an outsized gap. */
++    const uint64_t q = now - c2_60_vw_cycle;
++    if (c2_60_vw_cycle != 0 && sp == c2_60_vw_sp && a0 == c2_60_vw_a0 &&
++        t == c2_60_vw_t - 1u && q > 0 && q <= C2_60_VW_MAX_Q) {
++        c2_60_vw_n++;
++        c2_60_vw_qsum += q;
++        if ((uint32_t)q > c2_60_vw_qmax) c2_60_vw_qmax = (uint32_t)q;
++    } else {
++        c2_60_vw_n = 0;
++        c2_60_vw_qsum = 0;
++        c2_60_vw_qmax = 0;
++    }
++    c2_60_vw_cycle = now;
++    c2_60_vw_sp = sp;
++    c2_60_vw_a0 = a0;
++    c2_60_vw_t = t;
++
++    /* v1 = -1 is the loop's own sentinel; the wait must still be pending; and
++     * enough clean passes must have been measured to trust the average. */
++    if (cpu->gpr[3] != 0xFFFFFFFFu || !(vcount < (int32_t)a0) ||
++        c2_60_vw_n < C2_60_VW_MIN_STREAK || c2_60_vw_qmax == 0)
++        return;
++    /* Only a genuinely idle pass: nothing pending that a check would deliver.
++     * The generic skip has the same precondition, but it runs INSIDE the
++     * interrupt check, before deliverability is evaluated; this runs just
++     * after it, so it must test it itself - or it could fast-forward over an
++     * interrupt that is raised but not yet taken, and delay the very VBlank
++     * the loop is waiting for. */
++    if ((i_stat & i_mask) != 0u || in_exception ||
++        (cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u) != 0u)
++        return;
++    /* Leave the counter at 2 or more, so the pass after a skip cannot be the
++     * one that reaches -1: the game's own timeout stays reachable. */
++    if ((int32_t)t < 4) return;
++
++    const uint32_t dist = psx_cycles_to_next_idle_event();
++    const uint64_t keep = (uint64_t)C2_60_VW_MARGIN * c2_60_vw_qmax;
++    if ((uint64_t)dist <= keep + c2_60_vw_qmax) return;
++
++    /* Passes that fit before the margin, costed at the measured average. The
++     * average is exact for the 2-pass rhythm the fractional clock produces,
++     * and advancing k * qsum / n never lands past dist - keep. */
++    uint64_t k = (((uint64_t)dist - keep) * c2_60_vw_n) / c2_60_vw_qsum;
++    if (k > (uint64_t)((int32_t)t - 2)) k = (uint64_t)((int32_t)t - 2);
++    if (k == 0) return;
++    const uint64_t adv = (k * c2_60_vw_qsum) / c2_60_vw_n;
++    if (adv == 0 || adv > C2_60_VW_MAX_SKIP) return;
++
++    psx_write_word(sp + 16u, t - (uint32_t)k);
++    psx_advance_cycles((uint32_t)adv);
++    c2_60_vw_skips++;
++    c2_60_vw_skipped += adv;
++
++    /* The next pass continues from here: counter k lower, clock adv later. */
++    c2_60_vw_t = t - (uint32_t)k;
++    c2_60_vw_cycle = psx_cycle_count;
++}
++
+ /* Called at the outer game loop, so at most once per simulated frame: the six
+  * signature reads cost nothing at 30-60 Hz and re-checking every loop is what
+  * makes this survive the title reloading its own executable. */
+@@ -460,6 +606,10 @@
+     extern uint64_t g_vblank_raise_count;
+     extern uint64_t psx_host_mono_ms(void);
+ 
++    if (pc == C2_60_VW_HEAD) {
++        c2_60_vwait_skip(cpu);
++        return;
++    }
+     if (pc != C2_60_LOOP_PC) return;
+ 
+     /* Sampled in every mode: at stock these read 34 and ~1033.6/s, which is
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -39,6 +39,9 @@
+  * With the clock above 100 a 0 here means the timeout can expire before the
+  * VBlank it waits for - the check a stability report most needs to see. */
+ extern int      crash2_60fps_vsync_wide(void);
++/* Guest cycles the SCUS-94154 v_wait skip fast-forwarded (cumulative). Its
++ * per-second rate over the guest clock is the spin the host no longer runs. */
++extern unsigned long long crash2_60fps_vwait_skipped_cycles(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+ /* Assists, so a bug report shows whether they were on. They can change
+@@ -901,6 +904,7 @@
+         "  \"native_60fps_fail_loop_hz\":%u,\n"
+         "  \"native_60fps_cpu_now\":%d,\n"
+         "  \"native_60fps_vsync_wide\":%d,\n"
++        "  \"native_60fps_vwait_skipped\":%llu,\n"
+         "  \"game_frame_ticks\":%u,\n"
+         "  \"cheat_lives\":%d,\n"
+         "  \"cheat_aku_level\":%d,\n"
+@@ -977,6 +981,7 @@
+         crash2_60fps_fail_loop_hz(),
+         crash2_60fps_cpu_now(),
+         crash2_60fps_vsync_wide(),
++        crash2_60fps_vwait_skipped_cycles(),
+         crash2_60fps_frame_ticks(),
+         crash2_cheat_lives_enabled(),
+         crash2_cheat_aku_level(),

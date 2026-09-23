@@ -1,0 +1,171 @@
+Make native 60 FPS survive a savestate load.
+
+Reported in play as "the fallback still works, it drops to 30", with the
+player's own diagnosis - "maybe quick load keeps the door closed" - which was
+right. The run log shows it: `savestate: LOADED slot 0` about eight seconds
+after boot, before the main loop had run once; after it the heartbeat read
+gate_open 0 and cpu_now 100 for the rest of the session, backoffs 0.
+
+The patched words live in guest RAM and so travel inside a savestate. This
+module's own state - gate open, clock raised, VSync widened - is host state
+and does not. A slot saved at 60 holds the OPEN gate word. Loaded into a
+session that had not opened the gate yet, RAM said open while the module said
+closed, and the open path accepted only ORIG: it treated our own patch as a
+foreign revision and never opened. The dirty-text check then correctly ran the
+restored OPEN gate, so the game DID attempt 60 - at the 100% clock, where busy
+frames need two fields. Hence 30, with the mode reporting itself on and no
+back-off recorded.
+
+Fix:
+  - The open path accepts OPEN as well as ORIG and adopts it: re-marks the
+    word as patched code, raises the clock, widens VSync.
+  - interrupts_resync_after_restore(), which every restore reaches (quick
+    load, rewind, netplay rollback, self-check), now flags the module via
+    crash2_60fps_note_restore(); the next outer loop reconciles.
+  - With the mode OFF, a restored 60-era state has its original words put
+    back. Before, it ran the game half-60 at the stock clock. This only
+    happens straight after a restore so the debug server's frame-gate probes,
+    which write the same word on purpose, are not fought.
+  - Demo suspension closes the gate by the RAM word as well as by the flag,
+    so a state loaded into an attract loop cannot keep a stray OPEN gate.
+  - One stderr line when a restore leaves RAM and module disagreeing - silent
+    otherwise, since a held rewind restores many times a second.
+
+Neither file is in codegen_hash_sources.cmake. The pre-existing bug predates
+0033; this fixes it on top of 0033.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -66,6 +66,7 @@
+ #ifndef CRASH2_60FPS_H
+ #define CRASH2_60FPS_H
+ 
++#include <stdio.h>
+ #include <stdlib.h>
+ 
+ #define C2_60_LOOP_PC    0x80011848u
+@@ -192,6 +193,10 @@
+ static int c2_60_verified = -1;        /* -1 unknown, 0 mismatch, 1 confirmed */
+ static int c2_60_gate_open;
+ static int c2_60_vsync_wide;           /* VSync's timeout widened for the clock */
++/* Set by interrupts_resync_after_restore(), which every RAM restore reaches:
++ * quick load, rewind, netplay rollback and the self-check. See
++ * crash2_60fps_note_restore(). */
++static int c2_60_restored;
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
+@@ -332,6 +337,22 @@
+  * gate open and the clock above 100 this must read 1; a 0 there means the
+  * iteration-counted timeout can expire before the VBlank it waits for. */
+ int crash2_60fps_vsync_wide(void) { return c2_60_vsync_wide; }
++
++/* RAM was just replaced wholesale - a savestate, a rewind, a rollback.
++ *
++ * The patched words live in guest RAM, so they travel with a savestate. The
++ * state of this module - gate open, clock raised, VSync widened - does not: it
++ * is host state. A restore can therefore leave the two disagreeing, and the
++ * one that bit in play was the commonest possible action. Quick-load a slot
++ * saved at 60 into a session that has not opened the gate yet, and RAM holds
++ * the OPEN gate word while this module believes it is closed. The open path
++ * then refused the word as a foreign revision (it only accepted ORIG), so the
++ * clock was never raised: the restored gate still ran, busy frames did not fit
++ * a field at 100%, and the game sat at 30 with the mode reporting itself on.
++ *
++ * This only raises a flag; the next outer loop reconciles, on the emulation
++ * thread, with the anchors re-verified. */
++void crash2_60fps_note_restore(void) { c2_60_restored = 1; }
+ unsigned crash2_60fps_loop_hz(void) { return c2_60_loop_hz; }
+ /* Percentage of the last window's frames the engine simulated as one field.
+  * This is the number the hold decision is made on, so report it: a scene that
+@@ -467,7 +488,25 @@
+             if (want >= 0 && want <= 100) c2_60_hold_pct = want;
+         }
+     }
+-    if (c2_60_mode != 1) return;
++    if (c2_60_mode != 1) {
++        /* A slot saved at 60 carries the OPEN gate and the widened VSync in
++         * its RAM. Loaded with the mode off, they would run the game half-60
++         * at the stock clock. Restore the original words - but only straight
++         * after a restore, so the debug server's frame-gate probes, which
++         * write the same word deliberately, are not fought every loop. */
++        if (c2_60_restored) {
++            c2_60_restored = 0;
++            if (c2_60_signature_ok(cpu) &&
++                (cpu->read_word(C2_60_GATE_PC) == C2_60_GATE_OPEN ||
++                 cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE ||
++                 cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE)) {
++                c2_60_close_gate();
++                fprintf(stderr, "crash2 60fps: restored state carried the 60 FPS "
++                                "patch with the mode off - original words put back\n");
++            }
++        }
++        return;
++    }
+ 
+     const unsigned long long now = psx_host_mono_ms();
+     c2_60_win_loops++;
+@@ -475,6 +514,20 @@
+     /* The guest can revert the word itself by reloading its executable. */
+     if (c2_60_gate_open && cpu->read_word(C2_60_GATE_PC) != C2_60_GATE_OPEN)
+         c2_60_gate_open = 0;
++    /* After a restore the RAM words and this module's state are reconciled
++     * below: a restored ORIG word is caught by the line above and reopened,
++     * and a restored OPEN word is adopted by the open path. Clearing the flag
++     * here is enough - both of those run on this same loop or the next. */
++    if (c2_60_restored) {
++        c2_60_restored = 0;
++        /* Only worth a line when the two disagree - a rewind held on F8
++         * restores many times a second and agrees every time. */
++        if ((cpu->read_word(C2_60_GATE_PC) == C2_60_GATE_OPEN) !=
++            (c2_60_gate_open != 0))
++            fprintf(stderr, "crash2 60fps: RAM restored - gate word %s, module %s\n",
++                    cpu->read_word(C2_60_GATE_PC) == C2_60_GATE_OPEN ? "open" : "original",
++                    c2_60_gate_open ? "open" : "closed");
++    }
+     /* ...which reverts VSync's timeout too, while the clock stays raised. */
+     if (c2_60_cpu_now > 100 &&
+         (cpu->read_word(C2_60_VS_ARGN_PC) != C2_60_VS_ARGN_WIDE ||
+@@ -492,7 +545,10 @@
+          * never open, and a flag set only there would leave the report saying
+          * "not suspended" for a gate that is refusing to open for a reason. */
+         c2_60_suspended = 1;
+-        if (c2_60_gate_open) {
++        /* Judge by the RAM word too: a state loaded into an attract loop can
++         * carry an OPEN gate this module never opened. */
++        if (c2_60_gate_open ||
++            cpu->read_word(C2_60_GATE_PC) == C2_60_GATE_OPEN) {
+             c2_60_close_gate();
+             c2_60_good_ms = 0;
+         }
+@@ -571,8 +627,13 @@
+     if (c2_60_latched) return;
+     if (now < c2_60_retry_at) return;
+ 
++    /* ORIG is the game's own word; OPEN is ours, restored from a savestate
++     * made while the mode was on (see crash2_60fps_note_restore). Both belong
++     * to this revision - signature_ok checks the rest - so both are adopted.
++     * Accepting only ORIG is what left a quick-loaded session stuck at 30. */
+     uint32_t gate = cpu->read_word(C2_60_GATE_PC);
+-    if (gate != C2_60_GATE_ORIG || !c2_60_signature_ok(cpu)) {
++    if ((gate != C2_60_GATE_ORIG && gate != C2_60_GATE_OPEN) ||
++        !c2_60_signature_ok(cpu)) {
+         c2_60_verified = 0;
+         return;
+     }
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -751,6 +751,13 @@
+ }
+ 
+ void interrupts_resync_after_restore(void) {
++    /* SCUS-94154 native 60 FPS keeps host-side state about code words that
++     * live in guest RAM, and a restore can leave the two disagreeing - a
++     * quick-loaded slot saved at 60 left the gate open in RAM while the
++     * module believed it closed, stuck at 30. Flag it; crash2_60fps.h
++     * reconciles on the next outer loop. Every restore path reaches here. */
++    extern void crash2_60fps_note_restore(void);
++    crash2_60fps_note_restore();
+     /* Absolute guest-cycle timestamps from the pre-load timeline are invalid
+      * once psx_cycle_count rewinds (typical: save → play N seconds → load).
+      * Leaving post_exception_cooldown_until in the future blocks every IRQ

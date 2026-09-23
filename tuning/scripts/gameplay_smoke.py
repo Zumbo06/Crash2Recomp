@@ -85,8 +85,11 @@ def validate_scenario(scenario: dict) -> list[tuple[int, int]]:
             raise ValueError("assert_ram_delta needs 1, 2 or 4 bytes and an integer delta")
         _ram_address(check["addr"], width)
     percent = scenario.get("cpu_percent", 125)
-    if not isinstance(percent, int) or not 100 <= percent <= 150:
-        raise ValueError("cpu_percent must be 100..150")
+    # Mirrors C2_60_CPU_CAP in crash2_60fps.h. This said 150 until the cap was
+    # raised to 200 (NOTES part 11), which left the shipping configuration -
+    # 200% - impossible to express in a scenario.
+    if not isinstance(percent, int) or not 100 <= percent <= 200:
+        raise ValueError("cpu_percent must be 100..200")
     ticks = scenario.get("expected_game_frame_ticks")
     if ticks is not None and ticks not in (17, 34, 51):
         raise ValueError("expected_game_frame_ticks must be 17, 34 or 51 "

@@ -39,6 +39,10 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   "native_60fps_verdict", "native_60fps_one_field_pct",
                   "native_60fps_backoffs", "native_60fps_fail_pct",
                   "native_60fps_fail_loop_hz", "native_60fps_cpu_now",
+                  # Whether VSync's iteration-counted timeout was widened for
+                  # the raised clock. A report with the clock up and this 0 is
+                  # the one that explains a VBlank wait ending early.
+                  "native_60fps_vsync_wide",
                   "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",
@@ -56,6 +60,74 @@ def cadence_sample(heartbeat_path: Path, host_time: float) -> dict | None:
                    if isinstance(source.get(key), int)}}
     except (OSError, ValueError, UnicodeError):
         return None
+
+
+# c2_60_window_verdict's return values (crash2_60fps.h). The distinction that
+# matters to a player is 1 vs 2: FAIL_HOST means the machine could not DRAW the
+# frames, which lowering internal resolution fixes, while FAIL_HOLD means the
+# emulated game could not SIMULATE them in one field, which it does not.
+VERDICT_PENDING, VERDICT_OK = -1, 0
+VERDICT_FAIL_HOST, VERDICT_FAIL_HOLD, VERDICT_QUIET = 1, 2, 3
+
+
+def sixty_fps_sample(heartbeat_path: Path) -> dict | None:
+    """Live 60 FPS state, for the Play page.
+
+    These fields are computed every second whether or not the sustain guard is
+    allowed to act, so they are a free always-on signal. Returns None when 60
+    FPS is off or the heartbeat is not readable, so the caller shows nothing
+    rather than a misleading zero.
+    """
+    try:
+        source = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(source, dict) or not source.get("native_60fps"):
+        return None
+    wanted = ("native_60fps_gate_open", "native_60fps_verdict",
+              "native_60fps_one_field_pct", "native_60fps_backoffs",
+              "native_60fps_cpu_now", "native_60fps_vsync_wide",
+              "game_frame_ticks")
+    return {key: source[key] for key in wanted
+            if isinstance(source.get(key), int)}
+
+
+def sixty_fps_summary(sample: dict | None) -> tuple[str, str] | None:
+    """Turn a sample into (tone, sentence), or None when there is nothing to say.
+
+    Tone is a `set_status` tone: "Ok", "Warn" or "". The mode never falls back
+    to 30, so every message here is about what is limiting 60 - and the two
+    limits need opposite answers from the player.
+    """
+    if not sample:
+        return None
+    verdict = sample.get("native_60fps_verdict", VERDICT_PENDING)
+    held = sample.get("native_60fps_one_field_pct")
+    cpu = sample.get("native_60fps_cpu_now", 100)
+
+    # VSync counts loop iterations for its timeout, so a raised clock without
+    # the widened timeout can end a VBlank wait early. The runtime applies the
+    # widening with the clock; seeing the clock up without it is a runtime
+    # defect worth saying out loud rather than a tuning problem.
+    if cpu > 100 and sample.get("native_60fps_vsync_wide") == 0:
+        return ("Warn",
+                "60 FPS: the CPU clock is raised but VSync's timeout was not "
+                "widened to match. Please report this with the Log page's "
+                "diagnostic export.")
+    if verdict == VERDICT_FAIL_HOST:
+        return ("Warn",
+                "60 FPS: this machine is behind on DRAWING the frames. Lower "
+                "Internal resolution on the Video page - the game itself is "
+                "keeping up.")
+    if verdict == VERDICT_FAIL_HOLD:
+        note = "" if held is None else f" - {held}% of frames fitted"
+        return ("Warn",
+                f"60 FPS: some frames in this scene need longer than one "
+                f"refresh{note}. Internal resolution will not change this.")
+    if verdict == VERDICT_OK:
+        note = "" if held is None else f" ({held}% of frames)"
+        return ("Ok", f"60 FPS: holding{note}.")
+    return None
 
 
 def make_report(settings: Settings, heartbeat_path: Path,

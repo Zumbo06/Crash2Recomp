@@ -2572,3 +2572,62 @@ virtual PS1 CPU, hold threshold disabled, and the 30 Hz gate forced open.
 `native_60fps_cpu_percent` and `native_60fps_fallback` were removed from the
 settings model, so stale values in an older JSON file are filtered out rather
 than silently changing the checkbox's behavior.
+
+## 60 FPS, part 14: "200%" was not 2x
+
+Part 11 left one lever - the emulated CPU clock - and part 12 set it to the
+200% cap. Nobody measured whether 200% closed the gap, and reading the cost
+model says it could not have: the overclock was still only partly applied.
+
+Patch 0030 scaled instruction charges, icache refills and load completion.
+Three CPU-side costs still ran at 1x:
+
+    main-RAM read wait   3 cycles per load   memory.c psx_mmio_read_wait
+    GTE command latency  RTPT 22, NCDT 43... psx_cycles.c psx_gte_set
+    MULT/DIV latency     14/10/7, DIV 37     psx_cycles.c psx_muldiv_set
+
+The first is the big one. The PS1 has no data cache beyond the 1 KB
+scratchpad, so nearly every load in a frame is a main-RAM load, and 0030 had
+lumped RAM in with the genuine device waits. The GTE case is worse than
+"not faster": the instructions between a command and its read advance the
+clock by half as much at 200%, so the read stalls for MORE of the fixed
+latency. Beetle arms all three in its CPU timestamp domain, where its own
+overclock shortens them. Patch 0033 makes them scale; SPU, CDC, GPU, MDEC,
+DMA and the timers keep their timing, and at 100% nothing changes.
+
+### The fix had a consequence that had to ship with it
+
+PsyQ's `v_wait` (0x8004A5CC), which every `VSync` waits in, times out on loop
+ITERATIONS: `t = timeout << 15`. On expiry it prints "VSync: timeout" and
+calls `ChangeClearPAD(0)` and `ChangeClearRCnt(3, 0)` - the latter changes
+how the kernel acknowledges VBlank for the rest of the session. Per-iteration
+cost from the model:
+
+    stock 100%            ~26 cycles   32768 iterations ~1.5 fields
+    200%, before 0033     ~19          ~1.10  (knife-edge)
+    200%, after 0033      ~13          ~0.76  fires if a frame ends in <24%
+
+The game also calls `VSync(60)`, `VSync(20)` and `VSync(5)` in transitions,
+whose first wait takes `(n-1) << 15`. So while the clock is raised
+`crash2_60fps.h` widens both argument words - `0x8004A510` n-1 -> 2n and
+`0x8004A534` 1 -> 2 - inside `VSync`'s own range. `v_wait` is a separate
+function and stays native; a code write inside it would have sent the spin
+loop, where the idle half of every field is spent, to the interpreter.
+
+The other two timeout strings in the executable were checked and are not
+clock-sensitive: libgpu's `get_alarm` times out on VBlank count (or 983,040
+passes of a loop that itself calls `VSync(-1)`), and "intr timeout" counts
+2,048 interrupt dispatches. The memory card was checked too, because a
+faster CPU is exactly what broke MMX6's card poll: the game's only card loop
+is a pure `TestEvent` spin with no counter, and OpenBIOS has no card timeout.
+Save and load at 60 are still on the test list.
+
+### What it does not do
+
+This is not measured in play yet. It removes the reason 200% could not reach
+2x; whether 2x is enough for Turtle Woods is what `native60_hold.json`
+answers. Anything a frame spends waiting on a real device - SPU register
+access, CD, DMA - is still outside the clock's reach by design. And the
+launcher's fallback selector, reintroduced by mistake after part 13 had
+removed it, is gone again; the launcher also stopped setting `HOLD_PCT=0`,
+which had made a scene alternating between one and two fields report "ok".

@@ -55,10 +55,30 @@ page tells you to relaunch.
 
 Saves live in `userdata/`, next to the launcher.
 
+## Mods
+
+The **Mods** page lists what is installed, switches individual features on and
+off, and exposes whatever settings each one declares. Four enhancements ship
+with the launcher and appear once the game has been built:
+
+| | |
+|---|---|
+| **PGXP Precision** | Sub-pixel vertex precision and perspective-correct texturing, so polygons stop wobbling and large floor textures stop warping. Needs internal resolution 2x or higher to see. |
+| **Fast Loading** | Speeds up the wall-clock pacing of loads. Nothing the game can observe changes, but it does run faster while a load is detected. |
+| **CD Speed** | Shortens loads by dividing the emulated drive's sector delay. Unlike the above this changes *when* the game receives CD interrupts, so raise it gradually. |
+| **Bezel Artwork** | Draws an image of your choosing in the letterbox or pillarbox margins. |
+
+All four are off by default. Changes apply on the next launch.
+
+To add one, press **Install a .psxmod...** and pick the file. It is checked
+before anything is written, so a package with an unexpected layout is refused
+rather than half-installed. If a selection cannot work, the page says so before
+you launch rather than leaving you to read an error on startup.
+
 **Settings -> Performance has an experimental, opt-in 60 FPS mode.** It runs
 Crash 2's own game loop at 60 instead of 30 - a real change to how the game
 executes, not a smoothing filter on the picture. Once enabled it stays at 60
-rather than dropping you back.
+rather than dropping you back to 30.
 
 It is off by default and is a preview. World movement keeps the correct speed
 (the engine already scales motion by measured frame time and this reuses
@@ -68,10 +88,14 @@ game. It also runs the emulated PlayStation processor at 200% so a busy frame
 can fit into one screen refresh, which is the furthest this gets from how the
 console behaved.
 
-Busy scenes will land between 30 and 60 rather than holding a clean 60. If that
-bothers you, lower **Internal resolution** on the Video page first - at 5x the
-renderer draws twenty-five times the pixels of native, and that is usually what
-runs out before the game does.
+While the game runs, the Play page says whether 60 is holding and, if not,
+which of two limits you are hitting, because they need opposite responses. If
+the machine is behind on *drawing* the frames, lower **Internal resolution** on
+the Video page - at 5x the renderer draws twenty-five times the pixels of
+native and running at 60 doubles that again, so it is usually what runs out
+first. If instead some frames in a scene need longer than one refresh,
+internal resolution will not help; that is the emulated console running out of
+time inside the frame.
 
 If something behaves strangely, turn it off and see whether the problem goes
 away - that is a useful thing to report. It changes timing, not saved data.

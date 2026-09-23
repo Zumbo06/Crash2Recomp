@@ -48,6 +48,10 @@ function Build-Tree {
     Remove-Item -Recurse -Force $Dir
   }
 
+  # QUOTED on purpose. Unquoted, PowerShell passes a native argument that
+  # starts with '-' through verbatim, so CMake received the literal text
+  # '$DebugTools' - a truthy string - and BOTH trees were built with the
+  # debug tools compiled in: per-block tracing in the player's release build.
   Write-Host "`n=== CONFIGURE [$Label]  (PSX_DEBUG_TOOLS=$DebugTools) ===`n"
   & "$T\bin\cmake.exe" -S $Project -B $Dir -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
@@ -55,7 +59,7 @@ function Build-Tree {
     -DCMAKE_CXX_COMPILER="$T/bin/clang++.exe" `
     -DCMAKE_MAKE_PROGRAM="$T/bin/ninja.exe" `
     -DPSX_RECOMP_UI=OFF `
-    -DPSX_DEBUG_TOOLS=$DebugTools
+    "-DPSX_DEBUG_TOOLS=$DebugTools"
   if ($LASTEXITCODE -ne 0) {
     Write-Host "CONFIGURE FAILED [$Label] ($LASTEXITCODE)"
     return $LASTEXITCODE

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import Settings, active_diagnostics, diagnostic_label
+from ..diagnostics import sixty_fps_sample, sixty_fps_summary
 from ..paths import Layout
 from ..runtime import GameSession, build_plan, observed_from_log
 from ..version import STATUS, VERSION
@@ -118,6 +119,10 @@ class PlayPage(PlayScene):
         self.preview_note = QLabel("Preview build · Some sound and graphical issues remain", self)
         self.preview_note.setObjectName("PlayFooter")
         self.preview_note.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._sixty_timer = QTimer(self)
+        self._sixty_timer.setInterval(1000)
+        self._sixty_timer.timeout.connect(self._poll_sixty)
 
         self.session.started.connect(self._on_started)
         self.session.finished.connect(self._on_finished)
@@ -235,12 +240,16 @@ class PlayPage(PlayScene):
 
     def _status(self) -> QWidget:
         self.perf_lbl = QLabel("-")
+        self.sixty_lbl = QLabel("")
+        self.sixty_lbl.setWordWrap(True)
+        self.sixty_lbl.setVisible(False)
         self.observed_lbl = QLabel("-")
         self.observed_lbl.setWordWrap(True)
         self.observed_lbl.setTextFormat(Qt.TextFormat.RichText)
         return card(
             section("While running"),
             stat_row("Performance", self.perf_lbl),
+            self.sixty_lbl,
             stat_row("Runtime reports", self.observed_lbl),
             dim("These are what the runtime actually did, which can differ from "
                 "what was requested - the renderer clamps values it cannot honour."),
@@ -389,8 +398,31 @@ class PlayPage(PlayScene):
         self.session.stop()
 
     # -- session -----------------------------------------------------------
+    def _poll_sixty(self) -> None:
+        """Show what the 60 FPS judge decided, once a second.
+
+        The runtime computes this every second whether or not it is allowed to
+        act on it, so it costs nothing extra. It matters because the two
+        failure modes need OPPOSITE responses from the player: host-bound is
+        fixed by lowering internal resolution, scene-bound is not.
+        """
+        if not self.settings.native_60fps:
+            self.sixty_lbl.setVisible(False)
+            return
+        plan = self.session.last_plan
+        source = ((plan.cwd if plan else self.layout_.runtime_exe.parent)
+                  / "psx_freeze_heartbeat.json")
+        summary = sixty_fps_summary(sixty_fps_sample(source))
+        if summary is None:
+            self.sixty_lbl.setVisible(False)
+            return
+        tone, text = summary
+        set_status(self.sixty_lbl, tone, text)
+        self.sixty_lbl.setVisible(True)
+
     def _on_started(self) -> None:
         self._launching = False
+        self._sixty_timer.start()
         self._set_readiness("Game running", "Enjoy the adventure. Home opens the pause menu.")
         self.play_btn.setText("RUNNING")
         self.play_btn.setEnabled(False)
@@ -401,6 +433,8 @@ class PlayPage(PlayScene):
 
     def _on_finished(self, code: int) -> None:
         self._launching = False
+        self._sixty_timer.stop()
+        self.sixty_lbl.setVisible(False)
         self.play_btn.setText("PLAY")
         self.play_btn.setEnabled(self.layout_.has_runtime)
         self.stop_btn.setEnabled(False)

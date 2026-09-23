@@ -126,12 +126,18 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # Both builds honour it - see tuning/60FPS-FINDINGS.md.
     if settings.native_60fps:
         env["PSX_CRASH2_60FPS"] = "1"
-        # The launcher intentionally exposes one simple choice: enabled means
-        # the full experimental mode, fixed at 200% virtual PS1 CPU and with
-        # the original 30 Hz gate kept open. These affect emulation only; they
-        # never overclock the physical CPU.
+        # 200% virtual PS1 CPU. This affects emulation only; it never
+        # overclocks the physical CPU.
         env["PSX_CRASH2_60FPS_CPU_PCT"] = "200"
-        env["PSX_CRASH2_60FPS_HOLD_PCT"] = "0"
+        # Never fall back to 30. FORCE_GATE returns from the sustain guard
+        # before any back-off path (crash2_60fps.h), so the 30 Hz gate stays
+        # open whatever the per-second judge concludes.
+        #
+        # HOLD_PCT is deliberately left at the runtime's own 80. With the gate
+        # forced it can no longer take 60 away - it only decides what the
+        # verdict SAYS. Setting it to 0, as this used to, made a scene that was
+        # alternating between one and two fields report "ok", and the Play
+        # page would then tell the player it was holding 60 while it was not.
         env["PSX_CRASH2_60FPS_FORCE_GATE"] = "1"
 
     # Rewind. The runtime defaults this ON (psx_rewind.c rewind_wanted only

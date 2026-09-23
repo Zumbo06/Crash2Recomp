@@ -1,0 +1,329 @@
+Make the CPU-only overclock cover the rest of the CPU, and widen VSync's
+iteration-counted timeout to match.
+
+Patch 0030 routed instruction charges, icache refills and load completion
+through the crash2 clock. Three CPU-side costs still ran at 1x under "200%":
+
+  - main-RAM read waits (3 cycles per load, memory.c psx_cyc_readmem). The
+    PS1 has no data cache beyond the 1 KB scratchpad, so almost every load in a
+    frame paid it. 0030 lumped RAM in with the genuine device waits.
+  - GTE command latency (psx_gte_set). The GTE is COP2 on the CPU die; left
+    unscaled, GTE-bound code gained nothing from the overclock and stalled
+    slightly LONGER, because the instructions between a command and its read
+    advanced the clock by half as much.
+  - MULT/DIV latency (psx_muldiv_set). Same unit, same reasoning; DIV is 37.
+
+Beetle, whose timing this runtime mirrors, arms all three in the CPU timestamp
+domain, where its overclock shortens them. Real devices - SPU, CDC, GPU, MDEC,
+DMA, timers - keep their own timing, as before. At 100% every change here is
+the identity, so stock timing is bit-for-bit unchanged.
+
+The RAM wait is a charge, so it goes through the shared carry exactly as 0030
+did for load completion. GTE and MULT/DIV latencies are deadlines rather than
+charges, so they use a stateless round-to-nearest scale instead: feeding a
+deadline through the carry would nudge the rounding of the instruction charges
+around it.
+
+Consequence that had to ship with it: PsyQ's v_wait (0x8004A5CC) times out on
+LOOP ITERATIONS, `t = timeout << 15`, and on expiry prints "VSync: timeout" and
+calls ChangeClearPAD(0) / ChangeClearRCnt(3,0), changing how the kernel
+acknowledges VBlank for the rest of the session. Per-iteration cost at a
+fully-scaled 200% is about half of stock, so 32768 iterations covered ~0.76 of
+a field and a frame finishing early could expire it before VBlank. The game
+also calls VSync(5/20/60), whose first wait takes (n-1) << 15. While the clock
+is raised crash2_60fps.h now widens both argument words inside VSync's own
+range, so v_wait - the spin loop - stays native:
+
+  0x8004A510  addiu a1,a0,-1 -> addu a1,a0,a0    (n-1 -> 2n)
+  0x8004A534  addiu a1,zero,1 -> addiu a1,zero,2
+
+Timeout = multiplier x cycles-per-iteration, and every cost in that loop now
+scales with the clock, so x2 restores at least stock margin up to the 200% cap.
+Raising C2_60_CPU_CAP past 200 must raise the multiplier with it. The words are
+signature-guarded with the rest, restored whenever the clock returns to 100,
+and re-applied if the game reloads its executable. The release heartbeat gains
+native_60fps_vsync_wide so a run can prove the widening was in force.
+
+No file here is in codegen_hash_sources.cmake: the codegen tag does not move,
+the recompiler does not need rebuilding and the shard cache stays valid.
+Overlay DLLs reach psx_muldiv_set, the GTE path and loads through g_cbs
+forwarding stubs, so they pick the change up without re-emission.
+
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -56,6 +56,28 @@
+     return (uint32_t)(total >> 32);
+ }
+ 
++/* Scale a CPU-side LATENCY - a completion deadline, not a charge.
++ *
++ * The GTE (COP2) and the MULT/DIV unit are on the R3000A die and run on the
++ * CPU clock, so a CPU overclock shortens how long they take exactly as it
++ * shortens an instruction. Beetle, whose timing this runtime mirrors, arms
++ * both deadlines in the CPU timestamp domain for the same reason.
++ *
++ * Deliberately NOT psx_crash2_cpu_clock_charge. That one carries fractional
++ * cycles between calls because its results are all advanced; a deadline is
++ * only advanced to if nothing else gets there first, so feeding it through
++ * the shared carry would nudge the rounding of the instruction charges around
++ * it. Round to nearest instead, with no state: at 200% RTPT's 22 becomes 11,
++ * DIV's 37 becomes 19, and a 1-cycle latency stays 1 rather than vanishing.
++ *
++ * At 100% this is the identity, so stock timing is bit-for-bit unchanged. */
++static inline uint32_t psx_crash2_cpu_clock_latency(uint32_t cycles) {
++    if (g_crash2_cpu_clock_pct == 100u || cycles == 0u) return cycles;
++    uint64_t scaled = ((uint64_t)cycles * s_crash2_cpu_clock_recip
++                       + (1ull << 31)) >> 32;
++    return scaled ? (uint32_t)scaled : 1u;
++}
++
+ /* Native overlay DLLs batch their CPU charges before invoking this callback.
+  * Share the same fractional carry as main-exe and interpreted instructions. */
+ void psx_crash2_overlay_advance_cycles(uint32_t cycles) {
+@@ -700,7 +722,11 @@
+ /* DIV/DIVU latency is the fixed constant 37 — emitted directly at the op site. */
+ 
+ void psx_muldiv_set(CPUState* cpu, uint32_t latency) {
+-    cpu->muldiv_ts_done = psx_cycle_count + (uint64_t)latency;
++    /* Scaled with the CPU clock: the mult/div unit is part of the CPU. Left at
++     * full length, a 200% clock ran every instruction twice as fast and then
++     * stalled the full 37 cycles on each DIV result anyway. */
++    cpu->muldiv_ts_done = psx_cycle_count
++                        + (uint64_t)psx_crash2_cpu_clock_latency(latency);
+ }
+ 
+ void psx_muldiv_stall(CPUState* cpu) {
+@@ -790,7 +816,14 @@
+     if (cpu->gte_ts_done > psx_cycle_count) {
+         psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
+     }
+-    cpu->gte_ts_done = psx_cycle_count + (uint64_t)latency;
++    /* Scaled with the CPU clock: the GTE is COP2, on the CPU die. Unscaled,
++     * the overclock made GTE-bound code no faster at all - and slightly worse,
++     * because the instructions between a command and its read now advance the
++     * clock by half as much, so the read stalls for MORE of the fixed latency.
++     * Every stall path advances to this deadline, so arming it scaled is the
++     * one change they all need. */
++    cpu->gte_ts_done = psx_cycle_count
++                     + (uint64_t)psx_crash2_cpu_clock_latency(latency);
+ }
+ 
+ void psx_gte_stall(CPUState* cpu) {
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -1978,13 +1978,27 @@
+      * Combined with region+completion into one advance — deadline catch-up
+      * replays exact event boundaries, so splitting the charge is only host cost. */
+     uint32_t region = psx_mmio_read_wait(phys, size);  /* device-region wait */
+-    /* The completion half is the CPU's, so it scales with the crash2 clock;
+-     * the region wait is the device's and does not. Scaled ONCE and reused for
+-     * both the advance and ld_absorb - the give-back has to match what was
+-     * charged or cycles leak. At 100% psx_cyc_cpu_side is the identity, so
+-     * stock timing is bit-for-bit what it was. */
+-    uint32_t compl_scaled = psx_cyc_cpu_side(compl_cost);
+-    uint32_t cost = region + compl_scaled;             /* LDAbsorb = region + completion */
++    /* The completion half is the CPU's, so it scales with the crash2 clock.
++     * So does MAIN RAM's wait: that is the CPU's own memory bus, not a device,
++     * and Beetle - whose MemRW this mirrors - adds it in the CPU timestamp
++     * domain, where an overclock shortens it. Only a real device's wait (SPU,
++     * CDC, GPU, MDEC, timers...) stays on the original clock.
++     *
++     * Leaving RAM out was the largest hole in the overclock. The PS1 has no
++     * data cache beyond the 1 KB scratchpad, so nearly every load in a frame
++     * is a main-RAM load, and each one still paid the full 3-cycle wait at
++     * "200%". Busy frames therefore got well short of the headroom the clock
++     * number promised, in exactly the scenes the overclock exists for.
++     *
++     * Scaled ONCE and reused for both the advance and ld_absorb - the
++     * give-back has to match what was charged or cycles leak. At 100%
++     * psx_cyc_cpu_side is the identity, so stock timing is bit-for-bit what it
++     * was. */
++    uint32_t cost;                                     /* LDAbsorb = region + completion */
++    if (phys < 0x00800000u)
++        cost = psx_cyc_cpu_side(region + compl_cost);
++    else
++        cost = region + psx_cyc_cpu_side(compl_cost);
+     uint32_t fudge = psx_cyc_cpu_side((uint32_t)((cpu->read_fudge >> 4) & 2u));
+     cpu->ld_absorb = cost;
+     psx_advance_cycles(fudge + cost);
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -51,6 +51,15 @@
+  * engine measures time with - on their original rate. That costs host
+  * throughput, which is why the guard restores it on any back-off.
+  *
++ * "CPU-only" has to mean everything on the CPU's own clock, or the headroom is
++ * not what the number says. It covers instruction charges, icache refills and
++ * load completion (patch 0030), and - patch 0033 - main-RAM read waits and the
++ * GTE and MULT/DIV latencies, all of which had stayed at 1x. The PS1 has no
++ * data cache and this engine is GTE-heavy, so those were a large share of a
++ * busy frame. Real devices (SPU, CD, GPU, DMA, timers) still keep their
++ * timing. One consequence: VSync's timeout counts loop iterations, so it is
++ * widened while the clock is raised - see C2_60_VS_ARGN_PC.
++ *
+  * Everything here is reversible and signature-guarded: nothing is written
+  * unless all six anchor words of this exact revision read back correctly.
+  */
+@@ -64,6 +73,41 @@
+ #define C2_60_GATE_ORIG  0x2C630019u   /* sltiu v1,v1,25  - the 30 Hz gate */
+ #define C2_60_GATE_OPEN  0x24030000u   /* addiu v1,zero,0 - never wait twice */
+ #define C2_60_DB_CUR     0x80063450u   /* draw buffer shown last; +20 = ticks */
++
++/* VSync's timeout, which has to grow with the CPU clock.
++ *
++ * PsyQ's v_wait (0x8004A5CC) does not time out on TIME. It counts loop
++ * iterations - `t = timeout << 15`, decremented each pass - and on -1 prints
++ * "VSync: timeout" and calls ChangeClearPAD(0) and ChangeClearRCnt(3, 0),
++ * which changes how the kernel acknowledges the VBlank interrupt for the rest
++ * of the session. 32768 iterations was sized for a 1x CPU: at stock it
++ * outlasts a whole field by about half. Under the raised clock every
++ * iteration is cheaper in guest time, so the same count covers less real time
++ * and a frame that finishes early can exhaust it BEFORE the VBlank it is
++ * waiting for arrives.
++ *
++ * So while the clock is raised VSync passes twice the timeout. Both argument
++ * words live in VSync's own range [0x8004A484, 0x8004A5CC); v_wait is a
++ * separate function, so patching here leaves the spin loop native. A code
++ * write inside v_wait would route it through the dirty-RAM interpreter, and
++ * v_wait is where the idle half of every field is spent.
++ *
++ *   0x8004A510  addiu a1,a0,-1  ->  addu a1,a0,a0   VSync(n>=2) first wait:
++ *                                                   n-1 -> 2n, which the game
++ *                                                   uses for VSync(5/20/60)
++ *   0x8004A534  addiu a1,zero,1 ->  addiu a1,zero,2 every VSync's final wait
++ *
++ * Timeout duration is (multiplier) x (guest cycles per iteration), and every
++ * cost in that loop - instructions, the main-RAM loads, the stack store -
++ * scales with the clock. A multiplier of 2 therefore gives at least stock
++ * margin for any clock up to 200%, which is C2_60_CPU_CAP. Raising the cap
++ * past 200 must raise this multiplier with it. */
++#define C2_60_VS_ARGN_PC   0x8004A510u
++#define C2_60_VS_ARGN_ORIG 0x2485FFFFu   /* addiu a1,a0,-1 */
++#define C2_60_VS_ARGN_WIDE 0x00842821u   /* addu  a1,a0,a0 */
++#define C2_60_VS_ARG1_PC   0x8004A534u
++#define C2_60_VS_ARG1_ORIG 0x24050001u   /* addiu a1,zero,1 */
++#define C2_60_VS_ARG1_WIDE 0x24050002u   /* addiu a1,zero,2 */
+ #define C2_60_TICKS      0x8003BEA4u   /* root-counter-2 tick accumulator */
+ /* The engine's timing mode. 0 is live play; the game writes 2 when it starts
+  * demo PLAYBACK (0x8002FD10, which sets up the recorded stream right after),
+@@ -147,6 +191,7 @@
+ static int c2_60_cpu_now = 100;        /* what the guard is currently using */
+ static int c2_60_verified = -1;        /* -1 unknown, 0 mismatch, 1 confirmed */
+ static int c2_60_gate_open;
++static int c2_60_vsync_wide;           /* VSync's timeout widened for the clock */
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
+@@ -187,7 +232,18 @@
+            cpu->read_word(0x80016860u) == 0x10600003u &&  /* beq v1,zero,+3 */
+            cpu->read_word(0x80016868u) == 0x0C012921u &&  /* jal VSync */
+            cpu->read_word(0x80016F04u) == 0x04800008u &&  /* quantizer entry */
+-           cpu->read_word(0x80016F18u) == 0x34040011u;    /* ori a0,zero,17 */
++           cpu->read_word(0x80016F18u) == 0x34040011u &&  /* ori a0,zero,17 */
++           /* v_wait: the iteration-counted timeout described above. */
++           cpu->read_word(0x8004A5D0u) == 0x00052BC0u &&  /* sll a1,a1,15 */
++           cpu->read_word(0x8004A5F0u) == 0x2403FFFFu &&  /* addiu v1,zero,-1 */
++           cpu->read_word(0x8004A60Cu) == 0x1443000Cu &&  /* bne v0,v1 (-1?) */
++           /* VSync's two calls into it, and the words that set its timeout. */
++           cpu->read_word(0x8004A514u) == 0x0C012973u &&  /* jal v_wait */
++           cpu->read_word(0x8004A538u) == 0x0C012973u &&  /* jal v_wait */
++           (cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_ORIG ||
++            cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE) &&
++           (cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_ORIG ||
++            cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE);
+ }
+ 
+ static uint32_t c2_60_read_ram_word(uint32_t address)
+@@ -198,6 +254,24 @@
+     return psx_read_word(address);
+ }
+ 
++/* Widen or restore VSync's timeout. Only ever swaps between the two known
++ * words, so a revision that does not match is left untouched. */
++static void c2_60_vsync_timeout(int wide)
++{
++    extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++    const uint32_t n_from = wide ? C2_60_VS_ARGN_ORIG : C2_60_VS_ARGN_WIDE;
++    const uint32_t n_to   = wide ? C2_60_VS_ARGN_WIDE : C2_60_VS_ARGN_ORIG;
++    const uint32_t o_from = wide ? C2_60_VS_ARG1_ORIG : C2_60_VS_ARG1_WIDE;
++    const uint32_t o_to   = wide ? C2_60_VS_ARG1_WIDE : C2_60_VS_ARG1_ORIG;
++    if (c2_60_read_ram_word(C2_60_VS_ARGN_PC) == n_from)
++        psx_mod_write_code_word(C2_60_VS_ARGN_PC, n_to);
++    if (c2_60_read_ram_word(C2_60_VS_ARG1_PC) == o_from)
++        psx_mod_write_code_word(C2_60_VS_ARG1_PC, o_to);
++    c2_60_vsync_wide =
++        c2_60_read_ram_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE &&
++        c2_60_read_ram_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE;
++}
++
+ static void c2_60_set_cpu(int percent)
+ {
+     extern void psx_crash2_cpu_clock_set(uint32_t percent);
+@@ -213,6 +287,7 @@
+         psx_mod_write_code_word(C2_60_GATE_PC, C2_60_GATE_ORIG);
+     c2_60_gate_open = 0;
+     c2_60_set_cpu(100);
++    c2_60_vsync_timeout(0);
+ }
+ 
+ /* Close the gate, hand the guest clock back, and set when to try again.
+@@ -253,6 +328,10 @@
+ int crash2_60fps_verified(void) { return c2_60_verified; }
+ int crash2_60fps_cpu_percent(void) { return c2_60_cpu_now; }
+ int crash2_60fps_gate_open(void) { return c2_60_gate_open; }
++/* Whether VSync's timeout is currently widened for the raised clock. With the
++ * gate open and the clock above 100 this must read 1; a 0 there means the
++ * iteration-counted timeout can expire before the VBlank it waits for. */
++int crash2_60fps_vsync_wide(void) { return c2_60_vsync_wide; }
+ unsigned crash2_60fps_loop_hz(void) { return c2_60_loop_hz; }
+ /* Percentage of the last window's frames the engine simulated as one field.
+  * This is the number the hold decision is made on, so report it: a scene that
+@@ -396,6 +475,11 @@
+     /* The guest can revert the word itself by reloading its executable. */
+     if (c2_60_gate_open && cpu->read_word(C2_60_GATE_PC) != C2_60_GATE_OPEN)
+         c2_60_gate_open = 0;
++    /* ...which reverts VSync's timeout too, while the clock stays raised. */
++    if (c2_60_cpu_now > 100 &&
++        (cpu->read_word(C2_60_VS_ARGN_PC) != C2_60_VS_ARGN_WIDE ||
++         cpu->read_word(C2_60_VS_ARG1_PC) != C2_60_VS_ARG1_WIDE))
++        c2_60_vsync_timeout(1);
+ 
+     const int verdict = c2_60_window_verdict(now, g_vblank_raise_count);
+ 
+@@ -497,6 +581,7 @@
+         c2_60_verified = 1;
+         psx_mod_write_code_word(C2_60_GATE_PC, C2_60_GATE_OPEN);
+         c2_60_set_cpu(c2_60_cpu_pct);
++        c2_60_vsync_timeout(c2_60_cpu_pct > 100);
+         c2_60_gate_open = 1;
+         c2_60_good_ms = 0;
+         c2_60_win_ms = 0;          /* do not judge the transition window */
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -35,6 +35,10 @@
+ extern unsigned crash2_60fps_fail_pct(void);
+ extern unsigned crash2_60fps_fail_loop_hz(void);
+ extern int      crash2_60fps_cpu_now(void);
++/* 1 while VSync's iteration-counted timeout is widened for the raised clock.
++ * With the clock above 100 a 0 here means the timeout can expire before the
++ * VBlank it waits for - the check a stability report most needs to see. */
++extern int      crash2_60fps_vsync_wide(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+ /* Assists, so a bug report shows whether they were on. They can change
+@@ -896,6 +900,7 @@
+         "  \"native_60fps_fail_pct\":%u,\n"
+         "  \"native_60fps_fail_loop_hz\":%u,\n"
+         "  \"native_60fps_cpu_now\":%d,\n"
++        "  \"native_60fps_vsync_wide\":%d,\n"
+         "  \"game_frame_ticks\":%u,\n"
+         "  \"cheat_lives\":%d,\n"
+         "  \"cheat_aku_level\":%d,\n"
+@@ -971,6 +976,7 @@
+         crash2_60fps_fail_pct(),
+         crash2_60fps_fail_loop_hz(),
+         crash2_60fps_cpu_now(),
++        crash2_60fps_vsync_wide(),
+         crash2_60fps_frame_ticks(),
+         crash2_cheat_lives_enabled(),
+         crash2_cheat_aku_level(),

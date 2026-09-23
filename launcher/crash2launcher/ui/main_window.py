@@ -25,6 +25,7 @@ from ..version import full_version
 from .dialogs import about, confirm, tell
 from .page_advanced import AdvancedPage
 from .page_log import LogPage
+from .page_mods import ModsPage
 from .page_play import PlayPage
 from .page_settings import SettingsPage
 from .page_setup import SetupPage
@@ -42,6 +43,7 @@ NAV_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ("PLAY", [
         ("play", "Play", ""),
         ("setup", "Setup", ""),
+        ("mods", "Mods", ""),
     ]),
     ("SETTINGS", [
         ("settings.video", "Video", "Video"),
@@ -75,7 +77,8 @@ def nav_groups(developer: bool) -> list[tuple[str, list[tuple[str, str, str]]]]:
 
 # Which stack widget each nav key shows.
 _STACK_FOR = {
-    "play": "play", "setup": "setup", "log": "log", "advanced": "advanced",
+    "play": "play", "setup": "setup", "mods": "mods", "log": "log",
+    "advanced": "advanced",
 }
 
 
@@ -107,12 +110,14 @@ class MainWindow(QWidget):
             lambda: ((self.session.last_plan.cwd if self.session.last_plan
                       else layout_.runtime_exe.parent) / "psx_freeze_heartbeat.json"))
         self.advanced_page = AdvancedPage(settings)
+        self.mods_page = ModsPage(layout_)
 
         # Stack order is independent of the nav order now; _select maps.
         self._stack_index = {}
         for name, widget in (("setup", self.setup_page),
                              ("play", self.play_page),
                              ("settings", self.settings_page),
+                             ("mods", self.mods_page),
                              ("log", self.log_page),
                              ("advanced", self.advanced_page)):
             self._stack_index[name] = self.stack.count()
@@ -126,8 +131,12 @@ class MainWindow(QWidget):
                                       if key == "setup")))
         self.settings_page.changed.connect(self._on_settings_changed)
         self.advanced_page.changed.connect(self._on_settings_changed)
+        self.mods_page.changed.connect(self._on_mods_changed)
         self.session.output.connect(self.log_page.append)
         self.session.failed.connect(self.log_page.append)
+        # The runtime rewrites state.toml as it exits, so whatever the page is
+        # showing after a session is stale until it re-reads.
+        self.session.finished.connect(lambda _code: self.mods_page.reload())
 
         # Stage the builtin mod catalog for an ALREADY-built game. _relayout
         # covers the just-finished-a-build case, but it never fires on an
@@ -277,7 +286,7 @@ class MainWindow(QWidget):
         count, detail = modcatalog.stage_builtin(self.layout_)
         if count or "skipping" not in detail:
             self.log_page.append(f"[launcher] {detail}")
-        for page in (self.setup_page, self.play_page):
+        for page in (self.setup_page, self.play_page, self.mods_page):
             page.set_layout(self.layout_)
         # Push settings out NOW that the build directory finally exists.
         # _settings_targets only returns directories present on disk, so on a
@@ -286,6 +295,16 @@ class MainWindow(QWidget):
         # silently did not apply to their first session, until they happened to
         # change some unrelated option.
         apply_config_settings(self.layout_, self.settings)
+
+    def _on_mods_changed(self) -> None:
+        """A mod selection changed.
+
+        ModsPage has already written state.toml - it owns that file, not
+        config.save(). All that is left is to tell the Play page, so it can
+        say a relaunch is needed rather than letting the player wonder why
+        nothing happened.
+        """
+        self.play_page.mark_settings_changed()
 
     def _on_crash(self, code: int, explanation: str) -> None:
         """The game died. Say so in words, and put the evidence in front of

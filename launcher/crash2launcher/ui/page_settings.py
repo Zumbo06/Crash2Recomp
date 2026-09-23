@@ -252,6 +252,7 @@ class SettingsPage(QWidget):
 
         self._loading = False
         self._sync_dependent_controls()
+        self._refresh_scale_warning()
         self._refresh_preset_label()
 
     # -- chrome ------------------------------------------------------------
@@ -603,6 +604,7 @@ class SettingsPage(QWidget):
         self.native_60fps.setChecked(self.settings.native_60fps)
         self.native_60fps.toggled.connect(self._on_native_60fps)
 
+
         self.cheat_infinite_lives = QCheckBox("Keep 99 lives")
         self.cheat_infinite_lives.setChecked(self.settings.cheat_infinite_lives)
         self.cheat_infinite_lives.toggled.connect(self._on_cheat_infinite_lives)
@@ -638,12 +640,12 @@ class SettingsPage(QWidget):
             card(
                 section("Game update rate"),
                 self.native_60fps,
-                dim("Experimental native game updates, not interpolation. Some "
-                    "scenes hold 60; others cannot. World-speed, script and "
-                    "audio timing across the whole game are not yet validated. "
-                    "When enabled it always uses Prefer 60 and 200% virtual "
-                    "PS1 CPU. Your physical CPU is not overclocked. Relaunch "
-                    "to apply."),
+                dim("Experimental native game updates, not interpolation. The "
+                    "game runs its own loop at 60 and stays there - it never "
+                    "hands a scene back to 30. World-speed, script and audio "
+                    "timing across the whole game are not yet validated. It "
+                    "runs the emulated PS1 CPU at 200%; your physical CPU is "
+                    "not overclocked. Relaunch to apply."),
                 dim("Keep native level-code compilation on, below. With it off "
                     "every level function runs interpreted and almost nothing "
                     "will hold 60."),
