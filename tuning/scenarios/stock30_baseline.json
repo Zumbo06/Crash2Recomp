@@ -5,6 +5,7 @@
   "expected_game_loop_hz": [25, 35],
   "expected_game_frame_ticks": 34,
   "min_speed": 0.95,
+  "expected_script_hz": [27, 33],
   "steps": [
     {"frames": 300, "buttons": "0xFFFF"}
   ]

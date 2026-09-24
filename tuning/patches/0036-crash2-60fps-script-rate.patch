@@ -1,0 +1,554 @@
+Run GOOL scripts at the game's own 30 Hz step while physics runs every field.
+
+With the 30 Hz gate open (0027) the outer loop runs once per NTSC field and
+physics - scaled by measured frame time - is correct. The GOOL scripts are not:
+everything GoolObjectUpdate (0x8001C718) does once per CALL was written for one
+call per 34-tick frame, so in play animations, moving platforms and scripted
+timers ran at twice their speed. The per-call work is the trans block, code
+blocks resuming with a wait of 0 (0 and 1 are the same at 30 Hz), the stall
+countdown at obj+228, and the pad read from Crash's update.
+
+Nine recompile-time words (game.toml [[recompiler.patch]] c2-60-gool-*,
+written by launcher/crash2launcher/recompprofile.py) make those depend on a
+flag at sp+60 of the function's 64-byte frame - its unused padding word.
+game.toml's mod_function_entry_funcs routes the function's entry to
+c2_60_gool_entry here, which stores it: 0 on a physics-only field, otherwise
+the crash object pointer (1 if none), which is the value the original code
+compared the object against. With the flag never 0 the function is the
+original, so the mode off is exact. Guest RAM keeps the disc's words; the text
+image guard still validates the function and it stays native.
+
+A loop is a script step once 34 ticks have passed since the last one: every
+loop at 30 Hz, every other at 60. On top of the patched function:
+
+  - 0x1F800054, the clamped ticks the GOOL opcodes at 0x8003A530 and 0x8003A758
+    scale by, is rewritten after 0x80019F08 fills it (returns at 0x8001C2F0 and
+    0x8001DF8C) with the ticks the script step covers, so scripted motion keeps
+    its speed.
+  - draw_count (0x80060944: texture animation, colour cycling, the
+    (a + draw_count) % b opcode, flicker) is held back on physics-only fields,
+    so it advances once per script step.
+  - pad tapped words (0x80069920 + i*76 + 36) are hidden for a physics-only
+    field and restored before the next read: the main loop tests START from
+    them every loop (0x80011848) and would otherwise pause and unpause.
+  - FIRST_FRAME (status_a 0x20), which the function clears after physics, is
+    restored on a physics-only field, so an event-driven state change is still
+    seen by the object's next script step.
+
+Only paced once the entry hook has been called - the proof the generated code
+is the patched build - so a project generated without the profile keeps the old
+behaviour instead of getting the tick override alone. Off under netplay.
+PSX_CRASH2_60FPS_SCRIPT_RATE=0 disables it for A/B.
+
+Host writes go through memory_get_ram_ptr / memory_get_scratchpad_ptr: they
+are the machine's own bookkeeping, must land in the load/store replay mode
+(where psx_write_word does not write) and must not enter the lockstep or
+data-shard recorders.
+
+Heartbeat gains native_60fps_script_hz (~30 when paced right, at 30 or 60 FPS),
+native_60fps_physics_fields and native_60fps_script_hooked. The debug
+server's frame_rates gains native_60fps_script_steps (rate over its window)
+for tuning/scripts/gameplay_smoke.py's expected_script_hz.
+
+No file here is in codegen_hash_sources.cmake. The game.toml change moves the
+overlay config hash (7399b41b -> d6362e32), so shards land in a new cache
+directory; compile_overlays.py repopulates it from the stored captures.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -10,15 +10,19 @@
+  * "round this frame up to two fields", and that second wait - only that one -
+  * is what pins the game to 30 Hz.
+  *
+- * Opening the gate does NOT double game speed, because the engine already
+- * scales motion by measured time. func_80016F04 snaps the last frame's tick
+- * count to a whole number of fields (< 19 -> 17, < 36 -> 34, < 53 -> 51) and
+- * 0x8001697C stores it in the draw buffer at +20. Motion call sites read it
+- * back - 0x8001D400, 0x8001D9D4 and 0x8001DADC all do the same
+- * clamp-to-102 then (velocity * field_ticks) >> 10. At 60 Hz that field count
+- * becomes 17 instead of 34 and per-frame displacement halves. This is the
+- * compensation the original design already carries for dropped frames; we are
+- * reusing it, not inventing one.
++ * Opening the gate does not double the speed of PHYSICS, because physics is
++ * scaled by measured time. func_80016F04 snaps the last frame's tick count to
++ * a whole number of fields (< 19 -> 17, < 36 -> 34, < 53 -> 51) and 0x8001697C
++ * stores it in the draw buffer at +20. Every reader of that word is physics -
++ * 0x8001D63C and the helpers only it calls (0x8001D2C4, 0x8001E3DC,
++ * 0x8001E544) - plus 0x80019F08, which copies it to the scratchpad for the
++ * GOOL interpreter. All clamp to 102 then (velocity * field_ticks) >> 10. At
++ * 60 Hz that field count becomes 17 instead of 34 and per-frame displacement
++ * halves. This is the compensation the original design already carries for
++ * dropped frames; we are reusing it, not inventing one.
++ *
++ * The GOOL SCRIPTS are not scaled that way, and ran at double speed until they
++ * were paced separately - see C2_60_GOOL_UPDATE.
+  *
+  * The FIRST wait stays, so a frame whose guest work does not fit in one field
+  * lands on the next VBlank and the game falls back to 30 (or 20) Hz exactly as
+@@ -68,6 +72,9 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
++
++#include "mod_plugins.h"
+ 
+ #define C2_60_LOOP_PC    0x80011848u
+ #define C2_60_GATE_PC    0x8001685Cu
+@@ -150,6 +157,81 @@
+  * consumed - which is not something this mode should be deciding. */
+ #define C2_60_TIMING     0x8006CD14u
+ 
++/* Script rate: GOOL keeps the engine's 30 Hz step, physics runs every field.
++ *
++ * Measured in play with the gate open: animations, moving platforms and
++ * scripted timers ran at twice their speed while Crash's own movement was
++ * right. Everything GoolObjectUpdate (0x8001C718) does once per CALL was
++ * written for one call per 34-tick frame:
++ *
++ *   - the trans block runs on every call (0x8001C930);
++ *   - the code block resumes once frames_elapsed - stamp >= wait
++ *     (0x8001C974). A wait of 0 - common, because at 30 Hz 0 and 1 behave the
++ *     same - resumes on every call;
++ *   - the stall countdown, obj+228, ticks once per call (0x8001C8B8);
++ *   - the pad is read once per call, from Crash's update (0x8001C750).
++ *
++ * So at 60 Hz the scripts must keep their 30 Hz step while physics, already
++ * scaled by measured time, runs on every field. Nine recompile-time words in
++ * game.toml ([[recompiler.patch]] c2-60-gool-*) make those four things depend
++ * on a flag that c2_60_gool_entry - the function-entry hook game.toml routes
++ * 0x8001C718 to - stores at sp+60 of the function's 64-byte frame, its unused
++ * padding word, before the function runs. 0 means a physics-only field;
++ * anything else is the crash object pointer (1 if there is none), which is
++ * exactly what the original code compared each object against - so while the
++ * flag is never 0 the function IS the original. The trans save, 0x8001BFDC,
++ * physics and the render/bound path run on every field either way: the
++ * collision bound list is rebuilt every loop (0x8002CA98) and must stay whole.
++ *
++ * A field is a script step once a stock frame (34 ticks) has passed since the
++ * last one: every loop at 30 Hz, every other loop at 60, and straight away
++ * after a frame that needed two fields. Three more things the scripts read
++ * follow that step:
++ *
++ *   - the tick scale the GOOL opcodes use. 0x8003A530 (b + a*ticks >> 10) and
++ *     the angle seek at 0x8003A758 read 0x1F800054, which 0x80019F08 refills
++ *     from the draw buffer every loop. It is overwritten with the ticks the
++ *     script step really covers, so scripted motion keeps its speed;
++ *   - draw_count (0x80060944): world and object texture animation, colour
++ *     cycling, the (a + draw_count) % b opcode, flicker. The frame finalizer
++ *     advances it every loop; a physics-only field takes that back, so it
++ *     advances once per script step, as it did at 30 Hz;
++ *   - the pad's tapped bits. The pad read now runs on script steps only, but
++ *     the main loop tests START from them at 0x80011848 on every loop, so a
++ *     tap left standing through a physics-only field would pause and then
++ *     unpause. They are hidden for that field and put back just before the
++ *     next read, which files them as "tapped last time" - what a 30 Hz read
++ *     does - before computing new ones.
++ *
++ * And one flag: GoolObjectUpdate clears FIRST_FRAME (status_a 0x20) after
++ * physics. A state change an event delivers during a physics-only field would
++ * lose it before the object's scripts ever saw it, so on those fields the bit
++ * is put back.
++ *
++ * All of it is idle unless this mode is on, and exact at 30 Hz: every loop is
++ * then a script step, the flag is the crash pointer, and the scratchpad value
++ * written is the one 0x80019F08 just wrote. PSX_CRASH2_60FPS_SCRIPT_RATE=0
++ * turns it off for A/B - which brings the double speed back. */
++#define C2_60_GOOL_UPDATE    0x8001C718u  /* GoolObjectUpdate(obj, flag) */
++#define C2_60_GOOL_FLAG_SLOT 4u           /* below the caller's sp: its sp+60 */
++#define C2_60_CRASH          0x8005F38Cu  /* the crash object pointer */
++#define C2_60_PHYS_RET       0x8001C9ECu  /* physics returning into it */
++#define C2_60_AFTER_FF_CLEAR 0x8001CA0Cu  /* ...once it has cleared FIRST_FRAME */
++#define C2_60_CTX_RET_OBJS   0x8001C2F0u  /* 0x80019F08 returning to 0x8001C29C */
++#define C2_60_CTX_RET_PHYS   0x8001DF8Cu  /* ...and to physics */
++#define C2_60_SCRIPT_TICKS   0x1F800054u  /* clamped ticks the GOOL opcodes read */
++#define C2_60_DRAW_COUNT     0x80060944u
++#define C2_60_PADS           0x80069920u  /* pad records */
++#define C2_60_PAD_COUNT      0x8006991Cu
++#define C2_60_PAD_STRIDE     76u
++#define C2_60_PAD_TAPPED     36u          /* held & ~held_prev, per read */
++#define C2_60_PAD_HELD       40u
++#define C2_60_PAD_MAX        4u
++#define C2_60_STATUS_A       168u
++#define C2_60_FIRST_FRAME    0x20u
++#define C2_60_STEP_TICKS     34u          /* one stock frame: two NTSC fields */
++#define C2_60_TICK_CLAMP     102u         /* the engine's own clamp (sltiu 103) */
++
+ /* One second is long enough to average out a single slow frame and short
+  * enough that a bad scene is not endured. 57 of the 59.94 VBlanks a second is
+  * ~95% speed: below that the slowdown is audible, above it nobody can tell. */
+@@ -236,6 +318,26 @@ static uint64_t c2_60_vw_qsum;
+ static uint32_t c2_60_vw_qmax;
+ static unsigned c2_60_vw_n;
+ static unsigned long long c2_60_vw_skips, c2_60_vw_skipped;
++/* Script rate - see C2_60_GOOL_UPDATE. */
++static int c2_60_gool_enabled = -1;    /* -1 unread; PSX_CRASH2_60FPS_SCRIPT_RATE */
++static int c2_60_gool_active;          /* this loop is being paced */
++/* Set by the entry hook. The hook and the nine patched words are applied
++ * together (launcher/crash2launcher/recompprofile.py), so a call to it is the
++ * proof the generated code is the patched build. A project generated without
++ * them must not be paced: the tick override alone would make every scripted
++ * motion twice as fast instead of right. */
++static int c2_60_gool_hooked;
++static int c2_60_gool_step = 1;        /* this loop is a script step */
++static unsigned c2_60_gool_since;      /* ticks since the last script step */
++static unsigned c2_60_gool_ticks = C2_60_STEP_TICKS;  /* what that step covers */
++static uint32_t c2_60_dc_last;
++static int c2_60_dc_valid;
++static int c2_60_pad_hidden;
++static uint32_t c2_60_pad_n;
++static uint32_t c2_60_pad_tapped[C2_60_PAD_MAX], c2_60_pad_held[C2_60_PAD_MAX];
++static uint32_t c2_60_ff_obj, c2_60_ff_bit;
++static unsigned long long c2_60_gool_steps, c2_60_gool_fields;
++static unsigned c2_60_win_steps, c2_60_script_hz;
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
+@@ -306,6 +408,39 @@ static uint32_t c2_60_read_ram_word(uint32_t address)
+     return psx_read_word(address);
+ }
+ 
++/* Guest memory through the host pointers, for the script-rate bookkeeping.
++ * These are the machine's own adjustments made from a hook, not guest stores:
++ * they have to land even in the load/store replay mode, where psx_write_word
++ * does not write, and must not enter the lockstep or data-shard recorders as
++ * guest traffic. Main RAM and the scratchpad - the flag goes wherever the
++ * stack is; anything else reads 0 and is not written. */
++static uint8_t *c2_60_ram(uint32_t address)
++{
++    extern uint8_t *memory_get_ram_ptr(void);
++    extern uint8_t *memory_get_scratchpad_ptr(void);
++    const uint32_t phys = address & 0x1FFFFFFFu;
++    if (address & 3u) return NULL;
++    if (phys <= 0x001FFFFCu) return memory_get_ram_ptr() + phys;
++    if (phys >= 0x1F800000u && phys <= 0x1F8003FCu)
++        return memory_get_scratchpad_ptr() + (phys - 0x1F800000u);
++    return NULL;
++}
++
++static uint32_t c2_60_peek(uint32_t address)
++{
++    const uint8_t *p = c2_60_ram(address);
++    uint32_t v = 0;
++    if (p) memcpy(&v, p, 4);
++    return v;
++}
++
++static void c2_60_poke(uint32_t address, uint32_t value)
++{
++    uint8_t *p = c2_60_ram(address);
++    if (p) memcpy(p, &value, 4);
++}
++
++
+ /* Widen or restore VSync's timeout. Only ever swaps between the two known
+  * words, so a revision that does not match is left untouched. */
+ static void c2_60_vsync_timeout(int wide)
+@@ -405,6 +540,18 @@ void crash2_60fps_note_restore(void) { c2_60_restored = 1; }
+  * clock it is the share of the machine's time the host no longer spends
+  * spinning; zero with the mode on and the clock raised means it never engaged. */
+ unsigned long long crash2_60fps_vwait_skipped_cycles(void) { return c2_60_vw_skipped; }
++
++/* Script steps per second over the last window. ~30 whenever the scripts are
++ * paced right, at 30 Hz or at 60 - that is the point. ~60 with the gate open
++ * means they are running once per field again, i.e. double speed. */
++unsigned crash2_60fps_script_hz(void) { return c2_60_script_hz; }
++/* Cumulative script steps and physics-only fields since boot. */
++unsigned long long crash2_60fps_script_steps(void) { return c2_60_gool_steps; }
++unsigned long long crash2_60fps_physics_fields(void) { return c2_60_gool_fields; }
++/* 1 once the patched GoolObjectUpdate has called in. 0 with the mode on and
++ * objects running means the project was generated without the recompile
++ * profile, and 60 FPS will run scripts at double speed until it is rebuilt. */
++int crash2_60fps_script_hooked(void) { return c2_60_gool_hooked; }
+ unsigned crash2_60fps_loop_hz(void) { return c2_60_loop_hz; }
+ /* Percentage of the last window's frames the engine simulated as one field.
+  * This is the number the hold decision is made on, so report it: a scene that
+@@ -480,6 +627,7 @@ static int c2_60_window_verdict(unsigned long long now, unsigned long long vbl)
+         c2_60_win_ms = now;
+         c2_60_win_vbl = vbl;
+         c2_60_win_loops = c2_60_win_one_field = 0;
++        c2_60_win_steps = 0;
+         return C2_60_PENDING;
+     }
+     unsigned long long span = now - c2_60_win_ms;
+@@ -488,9 +636,11 @@ static int c2_60_window_verdict(unsigned long long now, unsigned long long vbl)
+     const unsigned loops = c2_60_win_loops, one_field = c2_60_win_one_field;
+     c2_60_loop_hz = (unsigned)((unsigned long long)loops * 1000u / span);
+     c2_60_hold_seen = loops ? (unsigned)((unsigned long long)one_field * 100u / loops) : 0u;
++    c2_60_script_hz = (unsigned)((unsigned long long)c2_60_win_steps * 1000u / span);
+     c2_60_win_ms = now;
+     c2_60_win_vbl = vbl;
+     c2_60_win_loops = c2_60_win_one_field = 0;
++    c2_60_win_steps = 0;
+ 
+     if (vblanks * 1000u < (unsigned long long)C2_60_MIN_VBLANK * span)
+         return (c2_60_verdict = C2_60_FAIL_HOST);
+@@ -598,6 +748,151 @@ static void c2_60_vwait_skip(CPUState *cpu)
+     c2_60_vw_cycle = psx_cycle_count;
+ }
+ 
++/* Hide the tapped bits for a physics-only field, or put them back just before
++ * the next read. The read (0x800158E0) copies tapped into tapped_prev (+48)
++ * and recomputes it, so restoring first is what lets a "tapped now or last
++ * time" test see what it saw at 30 Hz. A word the guest changed in between -
++ * a pad reset, a level load - is left alone. */
++static void c2_60_pad_edges(int step)
++{
++    if (!step) {
++        if (c2_60_pad_hidden) return;
++        uint32_t n = c2_60_peek(C2_60_PAD_COUNT);
++        if (n > C2_60_PAD_MAX) n = C2_60_PAD_MAX;
++        for (uint32_t i = 0; i < n; i++) {
++            const uint32_t pad = C2_60_PADS + i * C2_60_PAD_STRIDE;
++            c2_60_pad_tapped[i] = c2_60_peek(pad + C2_60_PAD_TAPPED);
++            c2_60_pad_held[i] = c2_60_peek(pad + C2_60_PAD_HELD);
++            c2_60_poke(pad + C2_60_PAD_TAPPED, 0u);
++        }
++        c2_60_pad_n = n;
++        c2_60_pad_hidden = 1;
++        return;
++    }
++    if (!c2_60_pad_hidden) return;
++    for (uint32_t i = 0; i < c2_60_pad_n; i++) {
++        const uint32_t pad = C2_60_PADS + i * C2_60_PAD_STRIDE;
++        if (c2_60_peek(pad + C2_60_PAD_TAPPED) == 0u &&
++            c2_60_peek(pad + C2_60_PAD_HELD) == c2_60_pad_held[i])
++            c2_60_poke(pad + C2_60_PAD_TAPPED, c2_60_pad_tapped[i]);
++    }
++    c2_60_pad_hidden = 0;
++}
++
++/* Entry to GoolObjectUpdate, before its first instruction: publish this call's
++ * flag. Written unconditionally - the patched function reads it on every call,
++ * in every mode - into the word that becomes sp+60 once the function has
++ * allocated its frame. Nothing runs in between: the first block is straight-
++ * line code whose only stores are the saved registers at sp+48..56. */
++static void c2_60_gool_entry(CPUState *cpu, uint32_t address)
++{
++    (void)address;
++    const uint32_t obj = cpu->gpr[4];
++    const uint32_t crash = c2_60_peek(C2_60_CRASH);
++    c2_60_gool_hooked = 1;
++    const int step = c2_60_gool_active ? c2_60_gool_step : 1;
++    c2_60_poke(cpu->gpr[29] - C2_60_GOOL_FLAG_SLOT,
++               step ? (crash ? crash : 1u) : 0u);
++    c2_60_ff_obj = 0;
++    /* Only the call that reaches the pad read: crash, and active (status 3). */
++    if (crash && obj == crash && c2_60_peek(obj + 4u) == 3u)
++        c2_60_pad_edges(step);
++}
++
++PSX_MOD_CONSTRUCTOR(c2_60_register_gool_entry)
++{
++    psx_mod_register_function_entry_plugin("crash2.native60.script_rate",
++                                           C2_60_GOOL_UPDATE, c2_60_gool_entry);
++}
++
++/* Once per outer loop, before any object runs: is this loop a script step? */
++static void c2_60_gool_loop(void)
++{
++    extern int psx_netplay_active(void);
++    if (c2_60_gool_enabled < 0) {
++        const char *e = getenv("PSX_CRASH2_60FPS_SCRIPT_RATE");
++        c2_60_gool_enabled = (e && e[0] == '0') ? 0 : 1;
++    }
++    if (c2_60_restored) {
++        /* RAM was replaced wholesale: nothing hidden or pending belongs to
++         * it, and the next loop starts a fresh step. */
++        c2_60_pad_hidden = 0;
++        c2_60_dc_valid = 0;
++        c2_60_ff_obj = 0;
++        c2_60_gool_since = 0;
++    }
++    /* Netplay rolls RAM back underneath this host-side count; keep the
++     * scripts per call there rather than let two peers disagree. */
++    const int active = c2_60_mode == 1 && c2_60_gool_enabled == 1 &&
++                       c2_60_gool_hooked && !psx_netplay_active();
++    const unsigned t = c2_60_last_frame_ticks;
++    int step = 1;
++    if (active && t != 0u) {
++        c2_60_gool_since += t;
++        if (c2_60_gool_since >= C2_60_STEP_TICKS) {
++            c2_60_gool_ticks = c2_60_gool_since;
++            c2_60_gool_since = 0;
++        } else {
++            step = 0;
++        }
++    } else {
++        c2_60_gool_since = 0;
++        c2_60_gool_ticks = t;
++    }
++    c2_60_gool_active = active;
++    c2_60_gool_step = step;
++    if (step) {
++        c2_60_gool_steps++;
++        c2_60_win_steps++;
++    } else {
++        c2_60_gool_fields++;
++    }
++
++    /* The finalizer advanced draw_count at the end of the loop just gone;
++     * on a physics-only field that advance is taken back, so the count moves
++     * once per script step. Only an advance of exactly one is ours to undo -
++     * a reset or a demo's own value is left as the guest set it. */
++    if (active) {
++        uint32_t dc = c2_60_peek(C2_60_DRAW_COUNT);
++        if (c2_60_dc_valid && !step && dc == c2_60_dc_last + 1u) {
++            c2_60_poke(C2_60_DRAW_COUNT, c2_60_dc_last);
++            dc = c2_60_dc_last;
++        }
++        c2_60_dc_last = dc;
++        c2_60_dc_valid = 1;
++    } else {
++        c2_60_dc_valid = 0;
++    }
++}
++
++/* The block edges inside the object update that the pacing needs. */
++static void c2_60_gool_edge(CPUState *cpu, uint32_t pc)
++{
++    if (!c2_60_gool_active) return;
++    if (pc == C2_60_CTX_RET_OBJS || pc == C2_60_CTX_RET_PHYS) {
++        c2_60_poke(C2_60_SCRIPT_TICKS,
++                   c2_60_gool_ticks < C2_60_TICK_CLAMP
++                       ? c2_60_gool_ticks : C2_60_TICK_CLAMP);
++        return;
++    }
++    const uint32_t obj = cpu->gpr[16];  /* s0: the object, all through 0x8001C718 */
++    if (pc == C2_60_PHYS_RET) {
++        if (!c2_60_gool_step) {
++            c2_60_ff_obj = obj;
++            c2_60_ff_bit = c2_60_peek(obj + C2_60_STATUS_A) & C2_60_FIRST_FRAME;
++        }
++        return;
++    }
++    /* C2_60_AFTER_FF_CLEAR - reached from both the animate and the idle path;
++     * only a physics-only field's animate path armed c2_60_ff_obj. */
++    if (c2_60_ff_obj && c2_60_ff_obj == obj) {
++        if (c2_60_ff_bit)
++            c2_60_poke(obj + C2_60_STATUS_A,
++                       c2_60_peek(obj + C2_60_STATUS_A) | C2_60_FIRST_FRAME);
++        c2_60_ff_obj = 0;
++    }
++}
++
+ /* Called at the outer game loop, so at most once per simulated frame: the six
+  * signature reads cost nothing at 30-60 Hz and re-checking every loop is what
+  * makes this survive the title reloading its own executable. */
+@@ -610,6 +905,11 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+         c2_60_vwait_skip(cpu);
+         return;
+     }
++    if (pc == C2_60_PHYS_RET || pc == C2_60_AFTER_FF_CLEAR ||
++        pc == C2_60_CTX_RET_OBJS || pc == C2_60_CTX_RET_PHYS) {
++        c2_60_gool_edge(cpu, pc);
++        return;
++    }
+     if (pc != C2_60_LOOP_PC) return;
+ 
+     /* Sampled in every mode: at stock these read 34 and ~1033.6/s, which is
+@@ -638,6 +938,9 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+             if (want >= 0 && want <= 100) c2_60_hold_pct = want;
+         }
+     }
++    /* Before anything below consumes c2_60_restored, and in every mode: with
++     * the mode off it keeps every loop a script step. */
++    c2_60_gool_loop();
+     if (c2_60_mode != 1) {
+         /* A slot saved at 60 carries the OPEN gate and the widened VSync in
+          * its RAM. Loaded with the mode off, they would run the game half-60
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -42,6 +42,13 @@ extern int      crash2_60fps_vsync_wide(void);
+ /* Guest cycles the SCUS-94154 v_wait skip fast-forwarded (cumulative). Its
+  * per-second rate over the guest clock is the spin the host no longer runs. */
+ extern unsigned long long crash2_60fps_vwait_skipped_cycles(void);
++/* Script steps per second (crash2_60fps.h, C2_60_GOOL_UPDATE): ~30 when the
++ * GOOL scripts keep their stock step, at 30 or 60 Hz. ~60 with the gate open
++ * means they run once per field - animations and platforms at double speed. */
++extern unsigned crash2_60fps_script_hz(void);
++extern unsigned long long crash2_60fps_physics_fields(void);
++/* 0 with the mode on means the project lacks the recompile profile. */
++extern int      crash2_60fps_script_hooked(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+ /* Assists, so a bug report shows whether they were on. They can change
+@@ -905,6 +912,9 @@ static void heartbeat_write(void) {
+         "  \"native_60fps_cpu_now\":%d,\n"
+         "  \"native_60fps_vsync_wide\":%d,\n"
+         "  \"native_60fps_vwait_skipped\":%llu,\n"
++        "  \"native_60fps_script_hz\":%u,\n"
++        "  \"native_60fps_physics_fields\":%llu,\n"
++        "  \"native_60fps_script_hooked\":%d,\n"
+         "  \"game_frame_ticks\":%u,\n"
+         "  \"cheat_lives\":%d,\n"
+         "  \"cheat_aku_level\":%d,\n"
+@@ -982,6 +992,9 @@ static void heartbeat_write(void) {
+         crash2_60fps_cpu_now(),
+         crash2_60fps_vsync_wide(),
+         crash2_60fps_vwait_skipped_cycles(),
++        crash2_60fps_script_hz(),
++        crash2_60fps_physics_fields(),
++        crash2_60fps_script_hooked(),
+         crash2_60fps_frame_ticks(),
+         crash2_cheat_lives_enabled(),
+         crash2_cheat_aku_level(),
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7860,6 +7860,7 @@ static uint64_t s_fr_base_ms = 0;
+ static uint64_t s_fr_base_raise, s_fr_base_deliver, s_fr_base_present;
+ static uint64_t s_fr_base_flip, s_fr_base_swap, s_fr_base_sim;
+ static uint32_t s_fr_base_guest_ticks;
++static unsigned long long s_fr_base_script;
+ 
+ static void frame_rates_baseline(void)
+ {
+@@ -7875,6 +7876,10 @@ static void frame_rates_baseline(void)
+     s_fr_base_swap    = g_gl_swap_total;
+     s_fr_base_sim     = crash2_sim_tick_count();
+     s_fr_base_guest_ticks = crash2_60fps_guest_ticks();
++    {
++        extern unsigned long long crash2_60fps_script_steps(void);
++        s_fr_base_script = crash2_60fps_script_steps();
++    }
+ }
+ 
+ static void handle_frame_rates(int id, const char *json)
+@@ -7892,6 +7897,8 @@ static void handle_frame_rates(int id, const char *json)
+     extern unsigned crash2_60fps_hold_pct(void);
+     extern unsigned crash2_60fps_suspended(void);
+     extern int crash2_60fps_last_verdict(void);
++    extern unsigned long long crash2_60fps_script_steps(void);
++    extern int crash2_60fps_script_hooked(void);
+     const double budget = (double)json_get_int(json, "budget_ms", 0);
+     if (json_get_int(json, "reset", 0) || s_fr_base_ms == 0) {
+         frame_rates_baseline();
+@@ -7939,6 +7946,12 @@ static void handle_frame_rates(int id, const char *json)
+     const unsigned game_ticks = crash2_60fps_frame_ticks();
+     const double guest_tick_s =
+         (double)(uint32_t)(crash2_60fps_guest_ticks() - s_fr_base_guest_ticks) / secs;
++    /* Script steps per second (crash2_60fps.h, C2_60_GOOL_UPDATE): the rate
++     * GOOL scripts - animation, platforms, scripted timers - advance at. It
++     * must read ~30 at 30 AND at 60 FPS; game_loop_steps near 60 with this
++     * near 60 too is the double-speed bug. */
++    const double script_s =
++        (double)(crash2_60fps_script_steps() - s_fr_base_script) / secs;
+ 
+     send_fmt("{\"id\":%d,\"ok\":true,\"seconds\":%.3f,"
+              "\"vblank_raise\":%.2f,\"vblank_deliver\":%.2f,"
+@@ -7950,6 +7963,7 @@ static void handle_frame_rates(int id, const char *json)
+              "\"native_60fps_gate_open\":%d,\"native_60fps_backoffs\":%llu,"
+              "\"native_60fps_one_field_pct\":%u,\"native_60fps_demo_mode\":%u,"
+              "\"native_60fps_verdict\":%d,"
++             "\"native_60fps_script_steps\":%.2f,\"native_60fps_script_hooked\":%d,"
+              "\"speed\":%.3f,\"perf_samples\":%d,"
+              "\"frame_ms_p50\":%.3f,\"frame_ms_p95\":%.3f,"
+              "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
+@@ -7960,6 +7974,7 @@ static void handle_frame_rates(int id, const char *json)
+              (unsigned long long)crash2_60fps_backoff_count(),
+              crash2_60fps_hold_pct(), crash2_60fps_suspended(),
+              crash2_60fps_last_verdict(),
++             script_s, crash2_60fps_script_hooked(),
+              raise_s / 59.94, psamples, p[0], p[1], p[2], (int)p[3]);
+ }
+ 

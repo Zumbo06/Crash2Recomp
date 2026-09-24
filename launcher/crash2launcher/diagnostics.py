@@ -43,6 +43,13 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   # the raised clock. A report with the clock up and this 0 is
                   # the one that explains a VBlank wait ending early.
                   "native_60fps_vsync_wide",
+                  # Script pacing (crash2_60fps.h, C2_60_GOOL_UPDATE). hz is
+                  # script steps per second - ~30 is right at 30 or 60 FPS,
+                  # ~60 with the gate open is double-speed animation. hooked 0
+                  # with objects running means the build lacks the recompile
+                  # profile (recompprofile.py) and needs rebuilding.
+                  "native_60fps_script_hz", "native_60fps_script_hooked",
+                  "native_60fps_physics_fields",
                   "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",
@@ -87,6 +94,7 @@ def sixty_fps_sample(heartbeat_path: Path) -> dict | None:
     wanted = ("native_60fps_gate_open", "native_60fps_verdict",
               "native_60fps_one_field_pct", "native_60fps_backoffs",
               "native_60fps_cpu_now", "native_60fps_vsync_wide",
+              "native_60fps_script_hz", "native_60fps_script_hooked",
               "game_frame_ticks")
     return {key: source[key] for key in wanted
             if isinstance(source.get(key), int)}
@@ -126,7 +134,14 @@ def sixty_fps_summary(sample: dict | None) -> tuple[str, str] | None:
                 f"refresh{note}. Internal resolution will not change this.")
     if verdict == VERDICT_OK:
         note = "" if held is None else f" ({held}% of frames)"
-        return ("Ok", f"60 FPS: holding{note}.")
+        # Scripts step at the game's own 30 Hz while the picture runs at 60;
+        # saying so is how a player can tell the speed fix is in effect.
+        scripts = ""
+        if sample.get("native_60fps_script_hooked") == 1:
+            hz = sample.get("native_60fps_script_hz")
+            if isinstance(hz, int) and hz > 0:
+                scripts = f", game logic at {hz}/s"
+        return ("Ok", f"60 FPS: holding{note}{scripts}.")
     return None
 
 

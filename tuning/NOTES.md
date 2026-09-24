@@ -2631,3 +2631,116 @@ access, CD, DMA - is still outside the clock's reach by design. And the
 launcher's fallback selector, reintroduced by mistake after part 13 had
 removed it, is gone again; the launcher also stopped setting `HOLD_PCT=0`,
 which had made a scene alternating between one and two fields report "ok".
+
+
+## 60 FPS, part 15: the scripts ran at double speed
+
+Reported in play with the gate open: animations and moving platforms ran twice
+as fast, while Crash's own movement was right. Part 1's claim that the engine
+"already scales motion by measured time" was only half true.
+
+### What is scaled and what is not
+
+Every reader of the frame tick count (draw buffer +20) is physics:
+`0x8001D63C` and the helpers only it calls (`0x8001D2C4`, `0x8001E3DC`,
+`0x8001E544`), plus `0x80019F08`, which copies it to the scratchpad for the
+GOOL interpreter. That is a scan of the whole executable for loads through the
+draw-buffer pointers, and a scan of every sector of the disc's user data for
+native code doing the same - none outside the executable. The Crash 1 port
+(wurlyfox/c1, `GoolObjectUpdate` / `GoolObjectPhysics`) has the same shape:
+physics multiplies by `ticks_per_frame`, the interpreter never does.
+
+GoolObjectUpdate (`0x8001C718`) was written for one call per 34-tick frame,
+and four things in it happen once per CALL:
+
+    trans block          0x8001C930  runs every call
+    code block           0x8001C974  resumes when frames_elapsed - stamp >= wait;
+                                     wait 0 (same as 1 at 30 Hz) = every call
+    stall countdown      0x8001C8B8  obj+228, once per call
+    pad read             0x8001C750  0x800158E0 from Crash's update
+
+and three per-loop values feed the scripts:
+
+    0x1F800054   clamped ticks, refilled by 0x80019F08 every loop; read by the
+                 GOOL opcodes at 0x8003A530 (b + a*ticks >> 10) and 0x8003A758
+                 (angle seek) - these were RIGHT at 60 before: 17 per call x 2
+    draw_count   0x80060944, +1 per loop in the finalizer: world texture
+                 animation (0x80011CA4 -> 0x80041E5C), the draw_count % 128
+                 wave in 0x80017BC4, object texture phase (0x8001AFD4), colour
+                 cycling (0x8001C198), the (a + draw_count) % b opcode
+                 (0x8003A5E8), flicker (draw_count & 1 at 0x8001CB34)
+    pad tapped   pad[i]+36 (0x80069944 for pad 0) - also tested for START by
+                 the main loop at 0x80011848, every loop
+
+### The fix: scripts at the stock step, physics every field
+
+A loop is a script step once 34 ticks have passed since the last one - every
+loop at 30 Hz, every other one at 60, straight away after a two-field frame.
+Nine opcode-verified words (game.toml `[[recompiler.patch]]` `c2-60-gool-*`)
+make the four per-call things depend on a flag the runtime stores at sp+60 of
+the function's 64-byte frame, its unused padding word:
+
+    0x8001C73C/40  crash pointer compared against comes from the flag (0 = no pad read)
+    0x8001C898     t0 = flag, in a delay slot
+    0x8001C8A8     t2 = trans pointer, early, in a load-delay nop
+    0x8001C8BC/C4  stall countdown subtracts (flag != 0) instead of 1
+    0x8001C930-38  flag 0 -> 0x8001C9D4 (0x8001BFDC + physics), else the
+                   original trans test on t2
+
+The flag is the crash pointer (1 if none) on a script step - exactly the value
+the original compared against - so with the mode off the function is the
+original. `mod_function_entry_funcs = ["0x8001C718"]` routes the entry to
+`c2_60_gool_entry`, which writes it before the first instruction. Guest RAM
+keeps the disc's words: the text-image guard compares RAM to the disc image,
+so the patched function stays native.
+
+Around it, in `crash2_60fps.h`: the scratchpad ticks are rewritten with the
+ticks the step covers when `0x80019F08` returns (`0x8001C2F0`, `0x8001DF8C`);
+a physics-only field takes back the finalizer's draw_count advance; the pad's
+tapped words are hidden for that field and restored before the next read (so
+START is seen once and "tapped last time" still works); and FIRST_FRAME,
+which the function clears after physics, is put back on a physics-only field
+so an event-driven state change still reaches the next script step.
+
+Not done and why: a runtime code-word patch would send the object update -
+every object, every loop - to the dirty-RAM interpreter; skipping whole object
+updates on alternate fields would put everything back to 30 Hz motion;
+interpolating from 30 Hz logic needs a second render pass per logic frame.
+
+### Shipping it
+
+`psxrecomp.exe build` writes a fresh game.toml and translates from it, so the
+profile lives in `launcher/crash2launcher/recompprofile.py`: the Setup page
+re-applies it and runs our `psxrecomp-game` again before compiling, and the
+workspace game.toml carries exactly what it writes. The Play page warns when a
+project's game.toml lacks it. The runtime only paces once the entry hook has
+fired - the proof the generated code is the patched build - so an old project
+keeps the old behaviour rather than getting the tick override alone.
+
+The profile moves the overlay config hash (7399b41b -> d6362e32). Both trees'
+caches were repopulated in the same step from the 358 unique stored captures
+(5 shards). Separately, this is the first release build without debug tools:
+build_clang.ps1's quoting fix only takes effect on reconfigure, and the release
+tree's CMake cache had still held the literal `$DebugTools`.
+
+### What to check in play
+
+- `native_60fps_script_hz` in the heartbeat must read ~30 with the gate open
+  (~60 is the old double speed); `native_60fps_script_hooked` must be 1.
+  `tuning/scenarios/native60_script_rate.json` and `stock30_baseline.json`
+  assert `expected_script_hz` [27, 33]. `PSX_CRASH2_60FPS_SCRIPT_RATE=0` is the
+  A/B switch.
+- Motion scripts set directly - path-following platforms - now steps at 30 Hz:
+  right speed, 30 Hz cadence under a 60 Hz camera. Physics-driven motion stays
+  at 60. Interpolating script-set positions across the physics-only field is
+  the follow-up if that reads as judder.
+- Physics clears its per-step collision bits (mask 0xFACA207E at 0x8001DD24)
+  on every call, so a script step sees the latest physics result, not the union
+  of both fields'. Landing is time-stamped (obj+272) and is not lost; a
+  momentary contact bit could be.
+- The camera update and other non-script per-loop code still run per field:
+  catch-up limits converge sooner. Smoother, not faster gameplay.
+- Gravity integrates in two 17-tick steps instead of one 34-tick step, which
+  with the engine's integration raises a jump's apex slightly; the stock
+  engine has the same dependence on frame time, in the other direction, when
+  it drops frames.

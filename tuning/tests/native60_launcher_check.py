@@ -21,7 +21,9 @@ class Native60LauncherTests(unittest.TestCase):
         self.assertEqual(env.get("PSX_CRASH2_60FPS"), "1")
         self.assertEqual(env.get("PSX_CRASH2_60FPS_CPU_PCT"), "200")
         self.assertEqual(env.get("PSX_CRASH2_60FPS_FORCE_GATE"), "1")
-        self.assertEqual(env.get("PSX_CRASH2_60FPS_HOLD_PCT"), "0")
+        # Not set since NOTES part 14: with the gate forced, 0 could not take
+        # 60 away and only made a scene alternating one/two fields read "ok".
+        self.assertNotIn("PSX_CRASH2_60FPS_HOLD_PCT", env)
 
     def test_legacy_tuning_keys_are_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:

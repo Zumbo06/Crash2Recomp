@@ -13,6 +13,7 @@ seeds = "seeds/functions.txt"
 bios_config = "psxrecomp/bios/OpenBIOS.toml"
 strict = true
 out_dir = "generated"
+mod_function_entry_funcs = ["0x8001C718"]
 
 [runtime]
 window_title = "Crash Bandicoot 2 Recompiled"
@@ -35,3 +36,86 @@ offer_ultrawide = false
 native_wide = false
 gte_game_mode = true
 precise_nclip = true
+
+# >>> crash2 recompile profile (launcher/crash2launcher/recompprofile.py)
+# Native 60 FPS - script-rate GOOL (runtime/src/crash2_60fps.h).
+# Written by the launcher after every generate; edit recompprofile.py, not
+# this block.
+#
+# With the 30 Hz gate open the game loop runs once per field, and everything
+# GoolObjectUpdate (0x8001C718) does once per call ran twice as often: the
+# trans block, code blocks that resume every call, the stall countdown and
+# the pad read - so animations, platforms and scripted timers ran at double
+# speed. Physics is scaled by measured frame time and correctly runs every
+# field. These words make the per-call script work depend on a flag the
+# runtime's entry hook stores at sp+60 (the frame's unused padding word):
+#   0            physics-only field - no pad read, no stall tick, no scripts
+#   otherwise    the crash object pointer (1 if there is none), which is
+#                exactly the value the original code compared against
+# With the mode off the flag is never 0 and the function is the original.
+# Recompile-time only: guest RAM keeps the disc's words, so the text-image
+# guard still validates this function and it stays native.
+
+[[recompiler.patch]]
+id = "c2-60-gool-pad-flag"
+address = "0x8001C73C"
+expected = "0x3C028006"
+replacement = "0x8FA2003C"
+note = "lui v0,0x8006 -> lw v0,60(sp): the pointer compared against is the frame flag (crash on a script step, 0 on a physics-only field), so the pad is read at script rate"
+
+[[recompiler.patch]]
+id = "c2-60-gool-pad-flag-2"
+address = "0x8001C740"
+expected = "0x8C42F38C"
+replacement = "0x00000000"
+note = "lw v0,-3188(v0) -> nop: the crash pointer now comes from the frame flag"
+
+[[recompiler.patch]]
+id = "c2-60-gool-step-flag"
+address = "0x8001C898"
+expected = "0x00000000"
+replacement = "0x8FA8003C"
+note = "delay-slot nop -> lw t0,60(sp): t0 = frame flag for the animate path"
+
+[[recompiler.patch]]
+id = "c2-60-gool-trans-ptr"
+address = "0x8001C8A8"
+expected = "0x00000000"
+replacement = "0x8E0A00C8"
+note = "load-delay nop -> lw t2,200(s0): trans-block pointer, read early to free a slot at 0x8001C930"
+
+[[recompiler.patch]]
+id = "c2-60-gool-stall-step"
+address = "0x8001C8BC"
+expected = "0x00000000"
+replacement = "0x0008482B"
+note = "load-delay nop -> sltu t1,zero,t0: 1 on a script step, 0 on a physics-only field"
+
+[[recompiler.patch]]
+id = "c2-60-gool-stall-count"
+address = "0x8001C8C4"
+expected = "0x2442FFFF"
+replacement = "0x00491023"
+note = "addiu v0,v0,-1 -> subu v0,v0,t1: the stall countdown only runs on script steps"
+
+[[recompiler.patch]]
+id = "c2-60-gool-skip"
+address = "0x8001C930"
+expected = "0x8E0200C8"
+replacement = "0x11000028"
+note = "lw v0,200(s0) -> beq t0,zero,0x8001C9D4: a physics-only field skips the trans and code blocks"
+
+[[recompiler.patch]]
+id = "c2-60-gool-skip-arg"
+address = "0x8001C934"
+expected = "0x00000000"
+replacement = "0x02002021"
+note = "load-delay nop -> addu a0,s0,zero: the object argument for 0x8001BFDC on the skip path"
+
+[[recompiler.patch]]
+id = "c2-60-gool-trans-test"
+address = "0x8001C938"
+expected = "0x1040000E"
+replacement = "0x1140000E"
+note = "beq v0,zero -> beq t2,zero: same test, on the pointer loaded at 0x8001C8A8"
+# <<< crash2 recompile profile

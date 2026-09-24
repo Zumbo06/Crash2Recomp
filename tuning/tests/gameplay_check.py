@@ -122,6 +122,39 @@ class Native60ScenarioTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["failures"][0]["one_field_pct"], 76)
 
+    def test_double_speed_scripts_fail_at_a_perfect_sixty(self):
+        # The bug patch 0036 fixes: 60 loops, one field each, speed 1.0 - and
+        # the GOOL scripts stepping once per loop, i.e. twice as fast.
+        client, _ = self._client({**self.MODERN, "game_loop_steps": 59.9,
+                                  "speed": 1.0, "game_frame_ticks": 17,
+                                  "native_60fps_script_steps": 59.9,
+                                  "native_60fps_script_hooked": 0})
+        result = module.run(client, {**self.BASE, "name": "double",
+                                     "native_60fps": True,
+                                     "expected_script_hz": [27, 33]}, timeout=1)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failures"][0]["script_hz"], 59.9)
+        self.assertEqual(result["failures"][0]["script_hooked"], 0)
+
+    def test_paced_scripts_pass_at_sixty(self):
+        client, _ = self._client({**self.MODERN, "game_loop_steps": 59.9,
+                                  "speed": 1.0, "game_frame_ticks": 17,
+                                  "native_60fps_script_steps": 30.0,
+                                  "native_60fps_script_hooked": 1})
+        result = module.run(client, {**self.BASE, "name": "paced",
+                                     "native_60fps": True,
+                                     "expected_script_hz": [27, 33]}, timeout=1)
+        self.assertTrue(result["passed"], result["failures"])
+
+    def test_a_runtime_without_script_pacing_is_refused(self):
+        client, _ = self._client({**self.MODERN, "game_loop_steps": 59.9,
+                                  "speed": 1.0, "game_frame_ticks": 17})
+        with self.assertRaises(RuntimeError) as caught:
+            module.run(client, {**self.BASE, "name": "old",
+                                "native_60fps": True,
+                                "expected_script_hz": [27, 33]}, timeout=1)
+        self.assertIn("script pacing", str(caught.exception))
+
     def test_mode_is_set_both_ways_and_always_restored(self):
         client, calls = self._client({**self.MODERN, "game_loop_steps": 59,
                                       "speed": 1.0, "game_frame_ticks": 17})
@@ -181,9 +214,12 @@ class Native60ScenarioTests(unittest.TestCase):
         self.assertEqual(sets[0], {"lives": 0, "aku": 0})
 
     def test_scenario_rejects_impossible_frame_time(self):
-        for bad in ({"expected_game_frame_ticks": 20}, {"cpu_percent": 200},
+        # 200 is the shipping clock since the cap was raised (NOTES part 11);
+        # the first value past C2_60_CPU_CAP is what must be refused.
+        for bad in ({"expected_game_frame_ticks": 20}, {"cpu_percent": 201},
                     {"min_speed": 2}, {"min_one_field_pct": 101},
-                    {"cheat_aku": 3}, {"cheat_aku": -1}):
+                    {"cheat_aku": 3}, {"cheat_aku": -1},
+                    {"expected_script_hz": [40, 20]}, {"expected_script_hz": [27]}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 module.validate_scenario({**self.BASE, **bad})
 

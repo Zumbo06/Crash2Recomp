@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import disc
+from .. import disc, recompprofile
 from ..config import Settings
 from ..paths import Layout
 from ..pipeline import EXIT_DISC_VERIFY_FAILED, Job
@@ -422,6 +422,50 @@ class SetupPage(QWidget):
             self.steps.set_state("generate", FAILED, message)
             self._finish_build(False, message, code)
             return
+
+        # `psxrecomp.exe build` wrote a fresh game.toml and translated from it,
+        # so nothing the generated C needs beyond the CLI's defaults is in it
+        # yet - the native 60 FPS script pacing among them, without which the
+        # 60 FPS mode runs animations and platforms at double speed. Put the
+        # profile back and translate again before compiling.
+        try:
+            changed = recompprofile.apply(self.layout_.game_toml)
+        except (OSError, ValueError) as exc:
+            set_status(self.build_note, "Error",
+                       "Could not add this port's recompile settings to "
+                       "game.toml: %s" % exc)
+            self.steps.set_state("generate", FAILED, "game.toml not updated")
+            self._finish_build(False, str(exc), 1)
+            return
+        if not changed:
+            self._start_compile()
+            return
+
+        recompiler = self.layout_.recompiler_exe
+        if not recompiler.is_file():
+            set_status(self.build_note, "Error",
+                       "The recompiler is missing. It should be at %s - if the "
+                       "download is incomplete, unpack it again." % recompiler)
+            self.steps.set_state("generate", FAILED, "recompiler missing")
+            self._finish_build(False, "No recompiler at %s" % recompiler, 1)
+            return
+        self.build_log.append_line(
+            "Adding this port's recompile settings (native 60 FPS script "
+            "pacing) and translating again...")
+        self._job = Job(str(recompiler), ["--config", "game.toml"],
+                        cwd=self.layout_.project)
+        self._job.line.connect(self.build_log.append_line)
+        self._job.finished.connect(self._on_profile_finished)
+        self._job.start()
+
+    def _on_profile_finished(self, code: int, message: str) -> None:
+        if code != 0:
+            self.steps.set_state("generate", FAILED, message)
+            self._finish_build(False, message, code)
+            return
+        self._start_compile()
+
+    def _start_compile(self) -> None:
         self.steps.set_state("generate", DONE)
         self.steps.set_state("compile", ACTIVE)
 

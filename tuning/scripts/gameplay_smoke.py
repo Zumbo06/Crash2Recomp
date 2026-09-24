@@ -15,6 +15,11 @@ segments are consumed per guest VBlank. Assert the mode with
 "min_speed" (guest time keeping up with the wall clock) and "max_backoffs" (how
 many times the runtime's sustain guard gave up and fell back to 30).
 
+"expected_script_hz" [lo, hi] asserts how fast the GOOL scripts - animation,
+moving platforms, scripted timers - advanced over the route. It must be ~30 at
+30 AND at 60 FPS (crash2_60fps.h, C2_60_GOOL_UPDATE): a loop rate near 60 with
+this near 60 too is the double-speed bug the script pacing exists to prevent.
+
 A scenario can also drive the assists with "cheat_lives" (bool) and "cheat_aku"
 (0 off, 1 keep masks, 2 no damage). Both are set before the route and cleared
 afterwards whatever the outcome, so a scenario can never inherit the previous
@@ -100,6 +105,10 @@ def validate_scenario(scenario: dict) -> list[tuple[int, int]]:
     share = scenario.get("min_one_field_pct")
     if share is not None and not 0 <= share <= 100:
         raise ValueError("min_one_field_pct must be 0..100")
+    script = scenario.get("expected_script_hz")
+    if script is not None and not (isinstance(script, list) and len(script) == 2
+                                   and 0 < script[0] <= script[1] <= 70):
+        raise ValueError("expected_script_hz must be [lo, hi] within 0..70")
     aku = scenario.get("cheat_aku")
     if aku is not None and aku not in (0, 1, 2):
         raise ValueError("cheat_aku must be 0 (off), 1 (keep masks) or 2 (no damage)")
@@ -134,6 +143,11 @@ def run(client: DebugClient, scenario: dict, timeout: float) -> dict:
                 f"the running game does not report {field!r}: it predates the "
                 "60 FPS sustain guard. Rebuild with _build/build_clang.ps1 "
                 "(close the game first - it holds its own .exe) and relaunch.")
+    if scenario.get("expected_script_hz") and "native_60fps_script_steps" not in probe:
+        raise RuntimeError(
+            "the running game does not report 'native_60fps_script_steps': it "
+            "predates the script pacing (patch 0036). Rebuild with "
+            "_build/build_clang.ps1 (close the game first) and relaunch.")
     cheat_probe = client.call("crash2_cheats")
     for field in ("aku", "god_word", "suspended"):
         if field not in cheat_probe:
@@ -237,6 +251,17 @@ def _run_route(client: DebugClient, scenario: dict, route: list[tuple[int, int]]
                              "loop_hz": rates.get("game_loop_steps"),
                              "note": "frames alternated between one and two "
                                      "fields instead of holding 60"})
+    script_range = scenario.get("expected_script_hz")
+    if script_range:
+        script_hz = rates.get("native_60fps_script_steps", -1)
+        if not script_range[0] <= script_hz <= script_range[1]:
+            failures.append({"script_hz": script_hz, "expected_range": script_range,
+                             "script_hooked": rates.get("native_60fps_script_hooked"),
+                             "loop_hz": rates.get("game_loop_steps"),
+                             "note": "GOOL scripts did not advance at the game's "
+                                     "own 30 Hz step - near 60 is double speed; "
+                                     "script_hooked 0 means the build lacks the "
+                                     "recompile profile"})
     expected_ticks = scenario.get("expected_game_frame_ticks")
     if expected_ticks is not None and rates.get("game_frame_ticks") != expected_ticks:
         # The value motion is multiplied by. 60 loops a second with this still

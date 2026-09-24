@@ -1,0 +1,23 @@
+{
+  "name": "native60-scripts-keep-thirty",
+  "require_game_loop": true,
+  "native_60fps": true,
+  "cpu_percent": 200,
+  "expected_game_loop_hz": [
+    54,
+    62
+  ],
+  "min_one_field_pct": 95,
+  "min_speed": 0.95,
+  "max_backoffs": 0,
+  "steps": [
+    {
+      "frames": 300,
+      "buttons": "0xFFFF"
+    }
+  ],
+  "expected_script_hz": [
+    27,
+    33
+  ]
+}

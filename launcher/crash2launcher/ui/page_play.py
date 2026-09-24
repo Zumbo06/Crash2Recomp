@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import recompprofile
 from ..config import Settings, active_diagnostics, diagnostic_label
 from ..diagnostics import sixty_fps_sample, sixty_fps_summary
 from ..paths import Layout
@@ -344,7 +345,18 @@ class PlayPage(PlayScene):
             self.play_btn.setEnabled(not running and not self._launching)
             self.play_btn.setToolTip("Launch with your current settings")
             if not running and not self._launching:
-                self._set_readiness("Ready to play", "Game build found · Settings apply on launch")
+                stale = (self.settings.native_60fps
+                         and recompprofile.missing(self.layout_.game_toml))
+                if stale:
+                    # Playable, but 60 FPS would run every animation and
+                    # platform at double speed: the build was generated
+                    # before the script-pacing profile existed.
+                    self._set_readiness(
+                        "Rebuild recommended",
+                        "This build predates the 60 FPS speed fix - rebuild "
+                        "it in Setup, or play at 30 FPS until then.", "Warn")
+                else:
+                    self._set_readiness("Ready to play", "Game build found · Settings apply on launch")
         self.notice.setVisible(bool(self.notice.text()))
         self._position_children()
 
