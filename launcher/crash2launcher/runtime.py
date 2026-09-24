@@ -16,7 +16,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from . import config, gametoml, keybinds, usersettings
+from . import config, gametoml, keybinds, padbinds, usersettings
 from .config import Settings
 from .paths import Layout, find_c_toolchain_bin, find_overlay_python
 
@@ -398,9 +398,20 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
             if existing:
                 settings.bindings = existing
                 break
+    if not settings.pad_bindings:
+        # Same rule for the controller map: adopt what input.ini already says
+        # the first time, rather than overwrite a hand-edited file.
+        for build_dir in targets:
+            existing = padbinds.read(build_dir / "input.ini")
+            if existing:
+                settings.pad_bindings = existing
+                break
     for build_dir in targets:
         usersettings.save(build_dir / "settings.toml", settings)
         keybinds.save(build_dir / "keybinds.ini", settings.bindings)
+        # input.ini sits beside each runtime too; the game re-reads it at start.
+        padbinds.save(build_dir / "input.ini", settings.pad_bindings,
+                      settings.pad_deadzone)
 
     # game.toml is optional; settings.toml is not. Returning early on a missing
     # game.toml used to skip the settings.toml write above too, so in any tree

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -43,6 +44,7 @@ from ..config import (
 from .common import card, dim, heading, row, section, warn
 from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
 from .widgets.key_bindings import KeyBindingsEditor
+from .widgets.pad_bindings import PadBindingsEditor
 
 # Crash 2's own framebuffer, measured from the runtime's gpu_state. The
 # supersampling multiplier scales THIS, not the 320x240 the PS1 is usually
@@ -515,6 +517,13 @@ class SettingsPage(QWidget):
     def _input_page(self) -> QWidget:
         self.bindings = KeyBindingsEditor(self.settings)
         self.bindings.changed.connect(self._touch)
+        self.pad_bindings = PadBindingsEditor(self.settings)
+        self.pad_bindings.changed.connect(self._touch)
+        self.pad_deadzone = QSpinBox()
+        self.pad_deadzone.setRange(0, 50)
+        self.pad_deadzone.setSuffix(" %")
+        self.pad_deadzone.setValue(self.settings.pad_deadzone)
+        self.pad_deadzone.valueChanged.connect(self._on_pad_deadzone)
         self.merge_input = QCheckBox("Player 1 reads keyboard and all controllers")
         self.merge_input.setChecked(self.settings.merge_all_input)
         self.merge_input.toggled.connect(self._on_merge)
@@ -544,6 +553,14 @@ class SettingsPage(QWidget):
                 dim("Use the keyboard alongside any connected controller."),
             ),
             card(section("Keyboard configuration · Player 1"), self.bindings),
+            card(
+                section("Controller configuration · Player 1"),
+                self.pad_bindings,
+                row("Stick deadzone", self.pad_deadzone),
+                dim("How far a stick must move before the game sees it. Raise "
+                    "it if Crash creeps with the stick let go; lower it for a "
+                    "more responsive stick. 10% is the default."),
+            ),
             card(
                 section("Save states"),
                 row("Quick save slot", self.quick_save_slot),
@@ -735,6 +752,8 @@ class SettingsPage(QWidget):
         """Push the dataclass back into the widgets after a bulk change."""
         self._loading = True
         self.bindings.refresh()
+        self.pad_bindings.refresh()
+        self.pad_deadzone.setValue(self.settings.pad_deadzone)
         self._refresh_scale_warning()
         self.renderer.setCurrentText(self.settings.renderer)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
@@ -927,6 +946,10 @@ class SettingsPage(QWidget):
 
     def _on_merge(self, on: bool) -> None:
         self.settings.merge_all_input = on
+        self._touch()
+
+    def _on_pad_deadzone(self, value: int) -> None:
+        self.settings.pad_deadzone = value
         self._touch()
 
     def _on_quick_slot(self, index: int) -> None:

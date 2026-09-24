@@ -380,6 +380,12 @@ class Settings:
     # --- input ------------------------------------------------------------
     # action -> key name. Empty means "use the runtime default".
     bindings: dict[str, str] = field(default_factory=dict)
+    # PS1 button -> controller source(s), written to input.ini [mapping]
+    # (padbinds.py). Empty means "leave input.ini's own map alone".
+    pad_bindings: dict[str, str] = field(default_factory=dict)
+    # Stick deadzone, percent of full travel. 10 is the runtime's own default
+    # (3277 raw); it shapes both the analog sticks and trigger thresholds.
+    pad_deadzone: int = 10
     # Drive player 1 from the keyboard AND every connected controller at once.
     # On by default: a Release runtime otherwise pins player 1 to "keyboard"
     # and never opens a gamepad, so a pad would appear dead.
@@ -478,6 +484,13 @@ class Settings:
         self.quick_save_slot = max(0, min(11, int(self.quick_save_slot or 0)))
         from .keybinds import normalize
         self.bindings = normalize(self.bindings)
+        from . import padbinds
+        self.pad_bindings = padbinds.normalize(self.pad_bindings)
+        try:
+            deadzone = int(self.pad_deadzone)
+        except (TypeError, ValueError):
+            deadzone = padbinds.DEADZONE_DEFAULT
+        self.pad_deadzone = max(0, min(padbinds.DEADZONE_MAX, deadzone))
         return self
 
 
