@@ -50,6 +50,9 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   # profile (recompprofile.py) and needs rebuilding.
                   "native_60fps_script_hz", "native_60fps_script_hooked",
                   "native_60fps_physics_fields",
+                  # Rewind captures by path: sync ones stalled on the GPU
+                  # (the periodic dip in the 1% lows before patch 0037).
+                  "rewind_async_captures", "rewind_sync_captures",
                   "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",

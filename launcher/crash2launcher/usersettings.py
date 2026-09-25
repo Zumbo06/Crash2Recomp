@@ -17,6 +17,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from . import padbinds
 from .config import Settings
 
 # [video] crt_filter accepts exactly these.
@@ -75,6 +76,14 @@ def render(settings: Settings) -> str:
         lines.append(f"window_width      = {width}")
         lines.append(f"window_height     = {height}")
     lines.append("")
+    # The stick deadzone lives HERE, not in input.ini: the runtime reads
+    # input.ini first and then applies this value over it (main.cpp, right
+    # after load_input_config), so an input.ini deadzone never takes effect.
+    lines += [
+        "[controller]",
+        f"deadzone          = {padbinds.deadzone_raw(settings.pad_deadzone)}",
+        "",
+    ]
     return "\n".join(lines)
 
 

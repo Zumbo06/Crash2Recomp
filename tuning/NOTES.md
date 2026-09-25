@@ -2744,3 +2744,72 @@ tree's CMake cache had still held the literal `$DebugTools`.
   with the engine's integration raises a jump's apex slightly; the stock
   engine has the same dependence on frame time, in the other direction, when
   it drops frames.
+
+## 60 FPS, part 16: the 1% lows
+
+Reported after part 15: 60 FPS "seems stable" but the 1% low sometimes drops
+far enough to cause pacing hitches and slowdowns. The session's heartbeat and
+run report (build-debugtools, 24 Sep):
+
+    native_60fps_one_field_pct   100     every frame fitted one field
+    native_60fps_script_hz        29     part 15 working
+    vblank_raise_count        11,083
+    host_swap_count            9,830     host fell short of VBlank
+    overlay disp native/interp 2.32M / 2.67M
+    display                    2560x1440 @ 280 Hz (RTX 5070)
+
+The guest is not the problem. Three host-side costs were found, one of them
+periodic by construction.
+
+**Rewind stalled on the GPU four times a second.** Rewind is on by default
+("short" in the launcher) and captures a full snapshot every 15 VBlanks. Its
+VRAM went through `gr_vram_transfer_out` -> `ensure_cpu()`: flush the batches,
+pack, then a synchronous `glReadPixels` of all of VRAM into client memory,
+which makes the CPU wait for the GPU to finish everything queued. On the
+emulation thread, one frame in fifteen - a pattern that lands squarely in a 1%
+low. Patch 0037 queues the same read into a pixel-pack buffer with a fence,
+stores the snapshot at once with a zero VRAM payload, and fills it a frame or
+two later; the snapshot is listed, and its thumbnail made from the downloaded
+bytes, only then. Heartbeat `rewind_async_captures` / `rewind_sync_captures`
+show which path each capture took.
+
+**The emulation thread ran at normal priority.** Emulation, rendering and
+pacing are all on the main thread, so any busy process could preempt it for a
+scheduler quantum - an isolated spike. 0037 raises it to
+`SDL_THREAD_PRIORITY_HIGH` (`THREAD_PRIORITY_HIGHEST`); the pacer sleeps on a
+high-resolution waitable timer, so it does not become a busy core.
+`PSX_THREAD_PRIORITY=0` opts out.
+
+**The session ran the debug-tools build.** Developer mode with a debug port
+set makes the launcher run `build-debugtools` (per-block tracing, TCP server).
+That is the player's setting, not a code change: clear the debug port in
+Advanced for normal play.
+
+Found and not changed, with the reasons:
+
+- Over half the overlay dispatches were interpreted. They are the small MIPS
+  snippets Crash 2 embeds in GOOL entries and runs with `jalr $s5` from the
+  interpreter (0x8003AAD4): no prologue and GOOL bytecode before them, so
+  `compile_overlays.py` cannot prove a function boundary and, correctly, will
+  not build them. A few percent of steady CPU, not spikes.
+- VSync (0x8004A484) runs in the dirty-RAM interpreter because the timeout
+  widening writes two words into it. Small; it could move into the recompile
+  profile like the script words if it ever shows up in a profile.
+- The pacer repays debt by running frames unpaced after a stall. That is
+  deliberate (audio rate, see the comment in frame_pacing.c); fewer stalls is
+  the fix, not a different pacer.
+- At 280 Hz, immediate presents (`vsync = 0`) hold each 60 FPS frame for 4 or 5
+  refreshes; with G-Sync on, for exactly as long as it took. Neither is a
+  pacing defect worth code.
+
+## Controller mapping (launcher)
+
+The runtime already had a full controller map: `input.ini [mapping]`, one or
+more SDL sources per PS1 button, honoured by both the per-port path and the
+launcher's default "keyboard and all controllers" merge. The launcher now edits
+it: Settings > Input, press-to-assign through XInput (same positional names
+SDL uses), a list for everything else. Two findings shaped it. Stick
+directions are not offered as sources, because the runtime ignores them as
+buttons whenever the pad presents as analog. And the deadzone is written to
+settings.toml, not input.ini: the runtime applies settings.toml's value over
+input.ini's right after reading it.

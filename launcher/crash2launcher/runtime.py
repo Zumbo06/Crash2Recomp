@@ -410,8 +410,7 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
         usersettings.save(build_dir / "settings.toml", settings)
         keybinds.save(build_dir / "keybinds.ini", settings.bindings)
         # input.ini sits beside each runtime too; the game re-reads it at start.
-        padbinds.save(build_dir / "input.ini", settings.pad_bindings,
-                      settings.pad_deadzone)
+        padbinds.save(build_dir / "input.ini", settings.pad_bindings)
 
     # game.toml is optional; settings.toml is not. Returning early on a missing
     # game.toml used to skip the settings.toml write above too, so in any tree

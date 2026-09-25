@@ -2,10 +2,12 @@
 
 The runtime reads ``input.ini`` beside its executable (``load_input_config`` in
 runtime/src/main.cpp). In ``[mapping]`` each PS1 button lists one or more SDL
-gamepad sources and is held while any of them is; ``[controller] deadzone`` is
-the stick deadzone in raw axis units. The same map drives the launcher's
-default "keyboard and all controllers" mode (``dev_all_controllers_buttons``),
-so editing it applies whichever way player 1 is set up.
+gamepad sources and is held while any of them is. The same map drives the
+launcher's default "keyboard and all controllers" mode
+(``dev_all_controllers_buttons``), so editing it applies whichever way player 1
+is set up. The stick deadzone is NOT taken from here: the runtime applies
+settings.toml's ``[controller] deadzone`` over input.ini's right after reading
+it, so usersettings.py writes that one.
 
 Source names are SDL's positional, Xbox-layout names: ``a`` is the BOTTOM face
 button on every pad - Cross on a PlayStation controller - ``b`` the right one,
@@ -16,7 +18,7 @@ one would silently do nothing in this game's analog mode.
 
 Only the sixteen button keys are managed. Stick-direction keys (``ls_up`` ...
 ``rs_right``), per-controller ``[mapping.<guid>]`` sections, ``[controller]``
-keys other than the deadzone, and comments are left exactly as they are.
+and comments are left exactly as they are.
 """
 
 from __future__ import annotations
@@ -164,17 +166,6 @@ def read(path: Path) -> dict[str, str]:
     return normalize(_sections(path.read_text(encoding="utf-8-sig")).get("mapping", {}))
 
 
-def read_deadzone(path: Path) -> int | None:
-    """[controller] deadzone as a percentage, or None when absent/invalid."""
-    if not path.is_file():
-        return None
-    raw = _sections(path.read_text(encoding="utf-8-sig")).get("controller", {}).get("deadzone")
-    try:
-        return deadzone_percent(int(raw)) if raw is not None else None
-    except ValueError:
-        return None
-
-
 def device_overrides(path: Path) -> list[str]:
     """GUIDs with a [mapping.<guid>] section - those override [mapping]."""
     if not path.is_file():
@@ -186,8 +177,9 @@ def device_overrides(path: Path) -> list[str]:
 
 _HEADER = (
     "; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.\n"
-    "; The Crash 2 launcher manages the button keys in [mapping] and the deadzone;\n"
-    "; everything else here is left as you write it.\n"
+    "; The Crash 2 launcher manages the button keys in [mapping]; everything else\n"
+    "; here is left as you write it. The stick deadzone comes from settings.toml,\n"
+    "; which the runtime applies over this file's.\n"
     "; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,\n"
     "; lefttrigger,righttrigger,leftstick,rightstick,dpup,dpdown,dpleft,dpright,\n"
     "; leftx-/leftx+/lefty-/lefty+. Optional per-device overrides: [mapping.<sdl-guid>].\n"
@@ -237,22 +229,20 @@ def _update_section(lines: list[str], name: str, values: dict[str, str]) -> list
     return lines[:start + 1] + body + missing + tail + lines[end:]
 
 
-def save(path: Path, bindings: dict[str, str], deadzone: int = DEADZONE_DEFAULT) -> None:
-    """Write the managed buttons and the deadzone, preserving everything else.
+def save(path: Path, bindings: dict[str, str]) -> None:
+    """Write the managed buttons, preserving everything else.
 
     Only buttons present in ``bindings`` are rewritten, so a key the player
     edited by hand keeps its value until they change that button here. A
     missing file is created with the runtime's full default layout.
     """
     chosen = normalize(bindings)
-    raw_dz = deadzone_raw(deadzone)
     if not path.is_file():
-        content = _fresh({**DEFAULTS, **chosen}, raw_dz)
+        content = _fresh({**DEFAULTS, **chosen}, deadzone_raw(DEADZONE_DEFAULT))
         old = None
     else:
         old = path.read_text(encoding="utf-8-sig")
         lines = old.splitlines(keepends=True)
-        lines = _update_section(lines, "controller", {"deadzone": str(raw_dz)})
         lines = _update_section(lines, "mapping", chosen)
         content = "".join(lines)
     if content == old:

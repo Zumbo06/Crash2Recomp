@@ -1,0 +1,622 @@
+Take rewind snapshots without stalling on the GPU; raise the emulation thread.
+
+Measured in a 60 FPS session (heartbeat, run report): 100% of frames fitted
+one field and the scripts ran at 29/s, yet the host presented 9,830 frames for
+11,083 VBlanks and the player saw a low 1% frame rate. One cause is periodic
+by construction. Rewind (on by default, "short" in the launcher) captures a
+full machine snapshot every 15 VBlanks, and the VRAM part went through
+gr_vram_transfer_out -> ensure_cpu(): flush the batches, pack, and a
+synchronous glReadPixels of the whole 1024x512 VRAM. Into client memory that
+makes the CPU wait until the GPU has finished everything queued - on the
+emulation thread, four times a second. Whenever the GPU had most of a frame
+in flight that is a missed field, 1 frame in 15: exactly what drags a 1% low.
+
+  - gpu_render: optional vram_readback_begin/poll. The GL backend queues the
+    same pack + read into a pixel-pack buffer, fences it and glFlush()es;
+    poll() maps it once the fence has signalled. s_vram / s_gpu_dirty are left
+    alone, so the next real ensure_cpu() behaves as before. glFenceSync and
+    friends (GL 3.2 core; the context is 3.3) are loaded as optional, so a
+    driver without them only loses the async path.
+  - boot_state: boot_state_save_buffer_raw_deferred_vram writes the VRAM
+    section with a zero payload and returns its offset (raw, little-endian,
+    not with the netplay dirty-tracking mirror).
+  - psx_rewind: do_capture starts the download at the same instant as the rest
+    of the state, stores the snapshot straight away and fills its VRAM a frame
+    or two later (polled at most once per frame). The snapshot is listed, and
+    its thumbnail made from the downloaded bytes, only then; loading or opening
+    the strip finishes a pending one first; a snapshot whose download failed
+    is dropped, never loaded with a blank VRAM. Without the async path it
+    captures synchronously as before.
+
+Also: the emulation thread (main thread - emulation, rendering and pacing)
+now runs at SDL_THREAD_PRIORITY_HIGH, i.e. THREAD_PRIORITY_HIGHEST on Windows,
+so an ordinary busy process cannot preempt it for a scheduler quantum - the
+other source of isolated spikes. The pacer sleeps on a high-resolution
+waitable timer, so this does not become a busy core. PSX_THREAD_PRIORITY=0
+opts out.
+
+Heartbeat: rewind_async_captures / rewind_sync_captures.
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/include/gpu_render.h
++++ b/runtime/include/gpu_render.h
+@@ -100,6 +100,16 @@ void gr_vram_write(int x, int y, uint16_t pixel);
+ uint16_t gr_vram_read(int x, int y);
+ void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data);
+ void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *data);
++/* Asynchronous whole-VRAM download, for periodic snapshots (rewind) that must
++ * not stall the CPU on the GPU. begin() queues a download of VRAM as it stands
++ * after every command submitted so far and returns 1; it returns 0 when the
++ * backend cannot, or need not because its CPU copy is already current - the
++ * caller then uses gr_vram_transfer_out, which is a plain copy in that case.
++ * poll() copies a finished download into dst (1024x512 halfwords) and returns
++ * 1, returns 0 while the GPU is still working, -1 with nothing in flight or on
++ * failure. block waits for completion; dst NULL discards the download. */
++int  gr_vram_readback_begin(void);
++int  gr_vram_readback_poll(uint16_t *dst, int block);
+ 
+ /* Draw area / offset */
+ void gr_set_draw_area(int x1, int y1, int x2, int y2);
+@@ -199,6 +209,10 @@ typedef struct GpuRenderBackend {
+      * pixel count, writes width/height to ow/oh. NULL if unsupported. */
+     int  (*wide_dump_full)(uint32_t *out, int cap_pixels, int *ow, int *oh,
+                            int base_x);
++    /* Asynchronous whole-VRAM download (optional; NULL = unsupported). See
++     * gr_vram_readback_begin / gr_vram_readback_poll. */
++    int  (*vram_readback_begin)(void);
++    int  (*vram_readback_poll)(uint16_t *dst, int block);
+ } GpuRenderBackend;
+ 
+ #ifdef __cplusplus
+--- a/runtime/include/boot_state.h
++++ b/runtime/include/boot_state.h
+@@ -120,6 +120,19 @@ int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
+                                 uint32_t entry_pc, uint8_t** out_data,
+                                 size_t* out_len);
+ 
++/* As boot_state_save_buffer_raw, but the VRAM section's 1 MiB payload is
++ * written as zeros and its byte offset in *out_data is returned in
++ * *vram_offset, for the caller to fill from an asynchronous download started
++ * at the same instant (gr_vram_readback_begin). The blob is NOT loadable until
++ * it has been filled. Little-endian hosts only; returns 0 elsewhere so the
++ * caller takes the synchronous path. */
++int  boot_state_save_buffer_raw_deferred_vram(const CPUState* cpu,
++                                              uint32_t bios_checksum,
++                                              uint32_t entry_pc,
++                                              uint8_t** out_data,
++                                              size_t* out_len,
++                                              size_t* vram_offset);
++
+ /* §96 telemetry: after the latest save, how many VRAM scanlines were dirty
+  * and whether the incremental mirror path patched (vs full memcpy). */
+ uint32_t boot_state_last_vram_dirty_rows(void);
+--- a/runtime/src/gpu_render.c
++++ b/runtime/src/gpu_render.c
+@@ -158,6 +158,12 @@ void gr_vram_write(int x, int y, uint16_t pixel)     { g_b->vram_write(x, y, pix
+ uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, y); }
+ void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { g_b->vram_transfer_in(x, y, w, h, d); }
+ void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->vram_transfer_out(x, y, w, h, d); }
++int  gr_vram_readback_begin(void) {
++    return g_b->vram_readback_begin ? g_b->vram_readback_begin() : 0;
++}
++int  gr_vram_readback_poll(uint16_t *dst, int block) {
++    return g_b->vram_readback_poll ? g_b->vram_readback_poll(dst, block) : -1;
++}
+ void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1, x2, y2); }
+ void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2) { g_b->get_draw_area(x1, y1, x2, y2); }
+ void gr_set_draw_offset(int x, int y)                { g_b->set_draw_offset(x, y); }
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -236,6 +236,27 @@ static PFN_glEndQuery            p_glEndQuery;
+ static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v;
+ static PFN_glGetQueryObjectiv    p_glGetQueryObjectiv;
+ static PFN_glQueryCounter        p_glQueryCounter;
++/* Asynchronous VRAM download (gr_vram_readback_*): a pixel-pack buffer and a
++ * fence. GL 3.2 core, which the 3.3 context always has; loaded as optional so
++ * a driver without them only loses the async path, not the renderer. */
++typedef struct psxgl_sync_s *PSXGLsync;
++typedef PSXGLsync (APIENTRY *PFN_psx_glFenceSync)(GLenum, GLbitfield);
++typedef GLenum    (APIENTRY *PFN_psx_glClientWaitSync)(PSXGLsync, GLbitfield, GLuint64);
++typedef void      (APIENTRY *PFN_psx_glDeleteSync)(PSXGLsync);
++typedef void *    (APIENTRY *PFN_psx_glMapBufferRange)(GLenum, ptrdiff_t, ptrdiff_t, GLbitfield);
++typedef GLboolean (APIENTRY *PFN_psx_glUnmapBuffer)(GLenum);
++static PFN_psx_glFenceSync      p_glFenceSync;
++static PFN_psx_glClientWaitSync p_glClientWaitSync;
++static PFN_psx_glDeleteSync     p_glDeleteSync;
++static PFN_psx_glMapBufferRange p_glMapBufferRange;
++static PFN_psx_glUnmapBuffer    p_glUnmapBuffer;
++#define PSXGL_PIXEL_PACK_BUFFER       0x88EB
++#define PSXGL_STREAM_READ             0x88E1
++#define PSXGL_SYNC_GPU_COMMANDS_DONE  0x9117
++#define PSXGL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
++#define PSXGL_TIMEOUT_EXPIRED         0x911B
++#define PSXGL_WAIT_FAILED             0x911D
++#define PSXGL_MAP_READ_BIT            0x0001
+ static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
+ static void gl_perf_mirror_begin(void); /* frame_perf: GPU-time bracket around ONE native-wide */
+ static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits scene canonical/mirror) */
+@@ -294,6 +315,12 @@ static int load_modern_gl(void) {
+     p_glGetQueryObjectui64v = (void *)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
+     p_glGetQueryObjectiv    = (void *)SDL_GL_GetProcAddress("glGetQueryObjectiv");
+     p_glQueryCounter        = (void *)SDL_GL_GetProcAddress("glQueryCounter");
++    /* Async VRAM download - optional, like the timer queries. */
++    p_glFenceSync      = (void *)SDL_GL_GetProcAddress("glFenceSync");
++    p_glClientWaitSync = (void *)SDL_GL_GetProcAddress("glClientWaitSync");
++    p_glDeleteSync     = (void *)SDL_GL_GetProcAddress("glDeleteSync");
++    p_glMapBufferRange = (void *)SDL_GL_GetProcAddress("glMapBufferRange");
++    p_glUnmapBuffer    = (void *)SDL_GL_GetProcAddress("glUnmapBuffer");
+ #undef LOAD
+     return ok;
+ }
+@@ -1490,6 +1517,85 @@ static void ensure_cpu(void) {
+     coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+ }
+ 
++/* ---- asynchronous whole-VRAM download ------------------------------------ */
++/* ensure_cpu() is correct but synchronous: glReadPixels into client memory
++ * makes the CPU wait until the GPU has finished every queued command. A caller
++ * that only needs VRAM "as of now" some time later - the rewind ring, four
++ * times a second - paid that wait on the emulation thread every time, which
++ * is a missed field whenever the GPU had most of a frame queued.
++ *
++ * This queues the same pack + read into a pixel-pack buffer instead, fences
++ * it, and hands the bytes over once the fence has signalled. It deliberately
++ * leaves s_vram and s_gpu_dirty alone: the CPU copy is no more current than
++ * before, and the next real ensure_cpu() reads back as it always did. */
++static GLuint    s_rb_pbo;
++static PSXGLsync s_rb_fence;
++static int       s_rb_pending;
++
++static int glb_vram_readback_begin(void)
++{
++    extern int psx_netplay_active(void);
++    if (!p_glFenceSync || !p_glClientWaitSync || !p_glDeleteSync ||
++        !p_glMapBufferRange || !p_glUnmapBuffer)
++        return 0;
++    /* Nothing to wait for: the CPU copy is current (or authoritative), so the
++     * caller's gr_vram_transfer_out is a plain copy with no GPU round-trip. */
++    if (!s_raster_ok || !s_gpu_dirty || s_cpu_auth_dual || psx_netplay_active())
++        return 0;
++    if (s_rb_pending)
++        return 0;
++    flush_flat_batch();
++    flush_tex_batch();
++    flush_cpu_upload();
++    pack_flush();
++    if (!s_rb_pbo) {
++        p_glGenBuffers(1, &s_rb_pbo);
++        p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, s_rb_pbo);
++        p_glBufferData(PSXGL_PIXEL_PACK_BUFFER,
++                       (ptrdiff_t)VRAM_W * VRAM_H * (ptrdiff_t)sizeof(uint16_t),
++                       NULL, PSXGL_STREAM_READ);
++    } else {
++        p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, s_rb_pbo);
++    }
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
++    glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, (void *)0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, 0);
++    s_rb_fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_DONE, 0);
++    if (!s_rb_fence)
++        return 0;
++    glFlush();   /* submit now, so a later zero-timeout poll can see it signal */
++    s_rb_pending = 1;
++    return 1;
++}
++
++static int glb_vram_readback_poll(uint16_t *dst, int block)
++{
++    if (!s_rb_pending)
++        return -1;
++    const GLenum r = p_glClientWaitSync(s_rb_fence, PSXGL_SYNC_FLUSH_COMMANDS_BIT,
++                                        block ? (GLuint64)5000000000ull : 0u);
++    if (r == PSXGL_TIMEOUT_EXPIRED && !block)
++        return 0;
++    p_glDeleteSync(s_rb_fence);
++    s_rb_fence = NULL;
++    s_rb_pending = 0;
++    if (r == PSXGL_WAIT_FAILED || !dst)
++        return dst ? -1 : 1;
++    int ok = 0;
++    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, s_rb_pbo);
++    const void *src = p_glMapBufferRange(PSXGL_PIXEL_PACK_BUFFER, 0,
++                                         (ptrdiff_t)VRAM_W * VRAM_H * (ptrdiff_t)sizeof(uint16_t),
++                                         PSXGL_MAP_READ_BIT);
++    if (src) {
++        memcpy(dst, src, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
++        p_glUnmapBuffer(PSXGL_PIXEL_PACK_BUFFER);
++        ok = 1;
++    }
++    p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, 0);
++    return ok ? 1 : -1;
++}
++
+ /* ---- GPU primitives ------------------------------------------------------ */
+ 
+ static uint64_t s_scene_prims = 0;     /* frame_perf: scene primitives submitted (pre double-draw) */
+@@ -4677,6 +4783,8 @@ static const GpuRenderBackend GL_BACKEND = {
+     .wide_clear_margins = glb_wide_clear_margins,
+     .render_wide_display = glb_render_wide_display,
+     .wide_dump_full = glb_wide_dump_full,
++    .vram_readback_begin = glb_vram_readback_begin,
++    .vram_readback_poll = glb_vram_readback_poll,
+ };
+ 
+ const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }
+--- a/runtime/src/boot_state.c
++++ b/runtime/src/boot_state.c
+@@ -326,11 +326,32 @@ static int write_timer_section(BsOut* o) {
+ 
+ /* ============================ SAVE ============================ */
+ 
++/* Deferred VRAM (boot_state_save_buffer_raw_deferred_vram): while set, the
++ * VRAM payload is written as zeros and its offset recorded, instead of being
++ * read back from the renderer. Only ever set around one raw in-memory save. */
++static int    s_defer_vram;
++static size_t s_deferred_vram_offset;
++
+ /* Classic full VRAM section (offline / zlib / tracking off). */
+ static int write_vram_section_full(BsOut *o)
+ {
+-    uint16_t *vbuf = (uint16_t *)malloc(VRAM_SIZE);
++    uint16_t *vbuf;
+     int ok;
++#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
++    if (s_defer_vram && o->data && o->no_zlib) {
++        vbuf = (uint16_t *)calloc(1, VRAM_SIZE);
++        if (!vbuf)
++            return 0;
++        ok = write_section(o, BS_SEC_VRAM, vbuf, VRAM_SIZE);
++        free(vbuf);
++        if (ok)
++            s_deferred_vram_offset = o->len - VRAM_SIZE;
++        s_last_vram_dirty_rows = VRAM_H;
++        s_last_vram_incremental = 0;
++        return ok;
++    }
++#endif
++    vbuf = (uint16_t *)malloc(VRAM_SIZE);
+     if (!vbuf)
+         return 0;
+     gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, vbuf);
+@@ -512,6 +533,38 @@ int boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
+                                      out_len, 1);
+ }
+ 
++int boot_state_save_buffer_raw_deferred_vram(const CPUState* cpu,
++                                             uint32_t bios_checksum,
++                                             uint32_t entry_pc,
++                                             uint8_t** out_data,
++                                             size_t* out_len,
++                                             size_t* vram_offset) {
++#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
++    int ok;
++    if (!vram_offset || gpu_vram_dirty_tracking())
++        return 0;   /* the tracked-mirror path owns VRAM there */
++    s_defer_vram = 1;
++    s_deferred_vram_offset = 0;
++    ok = boot_state_save_buffer_ex(cpu, bios_checksum, entry_pc, out_data,
++                                   out_len, 1);
++    s_defer_vram = 0;
++    if (ok && (s_deferred_vram_offset == 0 ||
++               s_deferred_vram_offset + VRAM_SIZE > *out_len)) {
++        free(*out_data);
++        *out_data = NULL;
++        *out_len = 0;
++        ok = 0;
++    }
++    if (ok)
++        *vram_offset = s_deferred_vram_offset;
++    return ok;
++#else
++    (void)cpu; (void)bios_checksum; (void)entry_pc;
++    (void)out_data; (void)out_len; (void)vram_offset;
++    return 0;
++#endif
++}
++
+ /* ============================ LOAD ============================ */
+ 
+ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
+--- a/runtime/src/psx_rewind.c
++++ b/runtime/src/psx_rewind.c
+@@ -5,6 +5,7 @@
+ #include "boot_state.h"
+ #include "cdrom.h"
+ #include "gpu.h"
++#include "gpu_render.h"
+ #include "host_keymap.h"
+ #include "host_osd.h"
+ #include "interrupts.h"
+@@ -114,6 +115,8 @@ int  psx_rewind_enabled(void) { return 0; }
+ int  psx_rewind_is_open(void) { return 0; }
+ int  psx_rewind_needs_present(void) { return 0; }
+ void psx_rewind_note_frame(void) {}
++unsigned long long psx_rewind_async_captures(void) { return 0; }
++unsigned long long psx_rewind_sync_captures(void) { return 0; }
+ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
+ {
+     (void)cpu;
+@@ -175,6 +178,21 @@ static int s_panel_dirty = 1;
+ static int s_load_pending;
+ static uint32_t s_load_tick;
+ 
++/* A capture whose VRAM is still downloading (see do_capture). The snapshot is
++ * already in the ring with a zeroed VRAM payload at s_pend_off; it is neither
++ * listed nor loadable until rw_finish_pending() has filled it. */
++static int s_pend;
++static uint32_t s_pend_tick;
++static uint8_t *s_pend_blob;
++static size_t s_pend_off;
++static GpuDisplayInfo s_pend_di;
++static uint32_t s_pend_poll_frame;
++/* Captures by path, for the heartbeat: async ones never waited on the GPU. */
++static unsigned long long s_async_caps, s_sync_caps;
++
++unsigned long long psx_rewind_async_captures(void) { return s_async_caps; }
++unsigned long long psx_rewind_sync_captures(void) { return s_sync_caps; }
++
+ static int s_left_was, s_right_was, s_acc_was, s_can_was;
+ static uint32_t s_rep_next;
+ static int s_rep_dir;
+@@ -336,6 +354,54 @@ static void capture_thumb(uint32_t *dst)
+     }
+ }
+ 
++/* The same picture capture_thumb() takes, built from a VRAM image instead of
++ * the renderer's CPU copy - which an asynchronous download leaves as stale as
++ * it was. Mirrors gpu_display_pixel_rgb, minus the optional screen colour LUT
++ * (a thumbnail, not the picture). Bytes are little-endian halfwords at any
++ * alignment. */
++static uint8_t rw_vram_byte(const uint8_t *v, uint32_t byte_x, uint32_t vy)
++{
++    return v[((size_t)(vy & 511u) * 1024u) * 2u + (byte_x & 2047u)];
++}
++
++static void thumb_from_vram(uint32_t *dst, const GpuDisplayInfo *di,
++                            const uint8_t *v)
++{
++    uint32_t dw, dh, x, y;
++    dw = di->width ? di->width : 320u;
++    dh = di->height ? di->height : 240u;
++    if (di->disabled) {
++        memset(dst, 0, (size_t)RW_THUMB_W * RW_THUMB_H * sizeof(uint32_t));
++        return;
++    }
++    for (y = 0; y < RW_THUMB_H; y++) {
++        uint32_t sy = y * dh / RW_THUMB_H;
++        uint32_t vy = (di->display_y + sy) & 511u;
++        for (x = 0; x < RW_THUMB_W; x++) {
++            uint32_t sx = x * dw / RW_THUMB_W;
++            uint32_t r, g, b;
++            if (di->depth24) {
++                uint32_t byte_x = ((di->display_x & 1023u) * 2u) + sx * 3u;
++                if (byte_x + 2u >= 2048u) {
++                    r = g = b = 0;
++                } else {
++                    r = rw_vram_byte(v, byte_x + 0u, vy);
++                    g = rw_vram_byte(v, byte_x + 1u, vy);
++                    b = rw_vram_byte(v, byte_x + 2u, vy);
++                }
++            } else {
++                uint32_t vx = (di->display_x + sx) & 1023u;
++                const uint8_t *p = v + ((size_t)vy * 1024u + vx) * 2u;
++                uint32_t c = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++                r = (c & 0x1Fu) << 3;
++                g = ((c >> 5) & 0x1Fu) << 3;
++                b = ((c >> 10) & 0x1Fu) << 3;
++            }
++            dst[y * RW_THUMB_W + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
++        }
++    }
++}
++
+ static void list_drop_after(uint32_t tick)
+ {
+     uint32_t i, n = 0;
+@@ -424,6 +490,11 @@ void psx_rewind_shutdown(void)
+     s_anim_dir = 0;
+     s_load_pending = 0;
+     s_capture_due = 0;
++    /* No GL call here: this also runs on exit paths after the context is
++     * gone. A download the renderer still holds is discarded by the next
++     * do_capture instead. */
++    s_pend = 0;
++    s_pend_blob = NULL;
+ }
+ 
+ int psx_rewind_enabled(void)
+@@ -453,6 +524,43 @@ void psx_rewind_note_frame(void)
+         s_capture_due = 1;
+ }
+ 
++/* Fill a pending capture's VRAM once its download is done (block: wait for
++ * it). Only then is the snapshot listed - and so selectable - with a thumbnail
++ * made from the same bytes. */
++static void rw_finish_pending(int block)
++{
++    size_t size = 0;
++    const uint8_t *live;
++    int r;
++    if (!s_pend)
++        return;
++    live = s_ring ? rbe_snap_ring_peek(s_ring, s_pend_tick, &size) : NULL;
++    if (live != s_pend_blob || size < s_pend_off + 1024u * 512u * 2u) {
++        /* The snapshot left the ring before its VRAM arrived: drop the
++         * download, there is nothing left to fill. */
++        (void)gr_vram_readback_poll(NULL, 1);
++        s_pend = 0;
++        s_pend_blob = NULL;
++        return;
++    }
++    r = gr_vram_readback_poll((uint16_t *)(void *)(s_pend_blob + s_pend_off), block);
++    if (r == 0)
++        return;
++    s_pend = 0;
++    if (r < 0) {
++        /* A snapshot with a zeroed VRAM must never be loaded. */
++        rbe_snap_ring_drop_tick(s_ring, s_pend_tick);
++        s_pend_blob = NULL;
++        return;
++    }
++    {
++        uint32_t thumb[RW_THUMB_W * RW_THUMB_H];
++        thumb_from_vram(thumb, &s_pend_di, s_pend_blob + s_pend_off);
++        list_push(s_pend_tick, thumb);
++    }
++    s_pend_blob = NULL;
++}
++
+ static int do_capture(CPUState *cpu, uint32_t resume_pc)
+ {
+     uint8_t *blob = NULL;
+@@ -461,14 +569,56 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
+     CPUState snap;
+     uint32_t tick = s_frame;
+     uint32_t pc;
++    size_t vram_off = 0;
++    int deferred;
+ 
+     if (!cpu || !s_ring)
+         return 0;
++    /* The previous capture's VRAM has had most of a quarter-second: take it
++     * now if it is there, and otherwise let this capture wait rather than
++     * stall on it. */
++    rw_finish_pending(0);
++    if (s_pend)
++        return 0;
+     pc = rewind_resolve_resume_pc(cpu, resume_pc);
+     if (!psx_irq_resume_context_snapshot_safe() || !resume_pc_ok(pc))
+         return 0;
+     snap = *cpu;
+     snap.pc = pc;
++
++    /* Every capture used to read VRAM back synchronously (gr_vram_transfer_out
++     * -> glReadPixels), making the emulation thread wait for the GPU to finish
++     * whatever it had queued - four times a second, a missed field whenever
++     * the GPU was busy, and the regular dip in the 1% lows. Start the download
++     * now, at the same instant as the rest of the state, and fill it in a
++     * frame or two later. */
++    deferred = gr_vram_readback_begin();
++    if (!deferred && gr_vram_readback_poll(NULL, 0) > 0)
++        deferred = gr_vram_readback_begin();  /* a stale download was in the way */
++    if (deferred) {
++        if (!boot_state_save_buffer_raw_deferred_vram(&snap, s_bios, s_entry,
++                                                      &blob, &len, &vram_off) ||
++            !blob || !len) {
++            (void)gr_vram_readback_poll(NULL, 1);
++            return 0;
++        }
++        if (!rbe_snap_ring_store(s_ring, tick, blob, len)) {
++            free(blob);
++            (void)gr_vram_readback_poll(NULL, 1);
++            return 0;
++        }
++        s_pend = 1;
++        s_pend_tick = tick;
++        s_pend_blob = blob;
++        s_pend_off = vram_off;
++        s_pend_poll_frame = s_frame;
++        gpu_get_display_info(&s_pend_di);
++        s_last_capture_frame = s_frame;
++        s_capture_due = 0;
++        s_async_caps++;
++        return 1;
++    }
++
+     if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
+         !blob || !len)
+         return 0;
+@@ -480,6 +630,7 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
+     list_push(tick, thumb);
+     s_last_capture_frame = s_frame;
+     s_capture_due = 0;
++    s_sync_caps++;
+     return 1;
+ }
+ 
+@@ -490,6 +641,7 @@ static int do_load(CPUState *cpu, uint32_t tick)
+ 
+     if (!cpu || !s_ring)
+         return 0;
++    rw_finish_pending(1);
+     if (!psx_hle_scheduler_enabled()) {
+         fprintf(stderr, "psxrecomp: rewind load needs HLE scheduler\n");
+         return 0;
+@@ -518,6 +670,12 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
+ {
+     if (!psx_rewind_enabled())
+         return;
++    /* This runs at nearly every interrupt check; ask the GPU about a pending
++     * download at most once per frame. */
++    if (s_pend && s_pend_poll_frame != s_frame) {
++        s_pend_poll_frame = s_frame;
++        rw_finish_pending(0);
++    }
+     if (s_load_pending) {
+         uint32_t tick = s_load_tick;
+         s_load_pending = 0;
+@@ -544,6 +702,9 @@ int psx_rewind_toggle(void)
+         s_anim_t0 = 0u;
+         return 1;
+     }
++    /* The newest capture may still be downloading its VRAM; the strip should
++     * show it. */
++    rw_finish_pending(1);
+     s_open = 1;
+     s_anim_dir = 1;
+     s_anim_t0 = 0u;
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -13605,6 +13605,19 @@ session_reboot:
+             return 1;
+         }
+     }
++    /* Emulation, rendering and pacing all run on this thread. At normal
++     * priority any busy process on the machine - a browser, an overlay, the
++     * launcher itself - can take the core for a scheduler quantum, and at
++     * 60 Hz that is a missed field: an isolated spike in the frame times.
++     * HIGH is THREAD_PRIORITY_HIGHEST on Windows: above ordinary apps, below
++     * the audio device thread SDL raises itself. The pacer sleeps on a
++     * waitable timer, so this does not turn into a busy core.
++     * PSX_THREAD_PRIORITY=0 leaves the thread at normal priority. */
++    {
++        const char* tp = std::getenv("PSX_THREAD_PRIORITY");
++        if (!(tp && tp[0] == '0'))
++            (void)SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
++    }
+     load_input_config(argv[0]);
+     /* The launcher / settings.toml / game.toml deadzone (when set) is the
+      * user-facing authority; apply it over the input.ini value here, after
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -49,6 +49,10 @@ extern unsigned crash2_60fps_script_hz(void);
+ extern unsigned long long crash2_60fps_physics_fields(void);
+ /* 0 with the mode on means the project lacks the recompile profile. */
+ extern int      crash2_60fps_script_hooked(void);
++/* Rewind captures by path (psx_rewind.c). A sync capture waited for the GPU
++ * to drain; with rewind on, async should be all but the first few. */
++extern unsigned long long psx_rewind_async_captures(void);
++extern unsigned long long psx_rewind_sync_captures(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+ /* Assists, so a bug report shows whether they were on. They can change
+@@ -915,6 +919,8 @@ static void heartbeat_write(void) {
+         "  \"native_60fps_script_hz\":%u,\n"
+         "  \"native_60fps_physics_fields\":%llu,\n"
+         "  \"native_60fps_script_hooked\":%d,\n"
++        "  \"rewind_async_captures\":%llu,\n"
++        "  \"rewind_sync_captures\":%llu,\n"
+         "  \"game_frame_ticks\":%u,\n"
+         "  \"cheat_lives\":%d,\n"
+         "  \"cheat_aku_level\":%d,\n"
+@@ -995,6 +1001,8 @@ static void heartbeat_write(void) {
+         crash2_60fps_script_hz(),
+         crash2_60fps_physics_fields(),
+         crash2_60fps_script_hooked(),
++        psx_rewind_async_captures(),
++        psx_rewind_sync_captures(),
+         crash2_60fps_frame_ticks(),
+         crash2_cheat_lives_enabled(),
+         crash2_cheat_aku_level(),

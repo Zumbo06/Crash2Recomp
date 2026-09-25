@@ -55,6 +55,16 @@ page tells you to relaunch.
 
 Saves live in `userdata/`, next to the launcher.
 
+## Controls
+
+**Settings > Input** remaps both the keyboard and the controller for player 1.
+For a controller, click a PS1 button and press the button you want; each PS1
+button can have two. Press-to-assign hears Xbox-compatible controllers; any
+other pad (a PlayStation controller without Steam Input, say) is assigned from
+the list and still works in the game. Names are positions: A is the bottom
+face button on every pad, Cross on a PlayStation controller. The stick deadzone
+is set there too.
+
 ## Mods
 
 The **Mods** page lists what is installed, switches individual features on and
