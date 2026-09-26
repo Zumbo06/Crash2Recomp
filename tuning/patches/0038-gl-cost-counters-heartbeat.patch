@@ -1,0 +1,321 @@
+GL renderer: release-build cost counters in the heartbeat ("gl").
+
+At 60 FPS the one measurement of internal resolution 5x on record is a host
+failure: 2,580 presents against 3,823 emulated VBlanks, while 2x was clean.
+What could not be answered from the build the player runs is WHY - frame_perf,
+which splits a frame into scene/present GPU time, only exists in the
+debug-tools build behind the TCP server. The candidates all grow with the
+internal scale S, or turn GPU time into emulation-thread time:
+
+  - SwapWindow blocking because the driver's queue is full (GPU-bound)
+  - ensure_cpu's synchronous glReadPixels for guest VRAM reads, which waits
+    for everything the GPU has queued
+  - full-surface work: the mask stencil rebuilt from alpha over the whole
+    1024S x 512S surface and every native-wide surface, and the hold-last
+    copy of the whole drawable on every present
+  - batch splits, semi-transparent prims drawn one per batch, and native-wide
+    mirror passes
+
+Each is now a monotonic total in a GlCost struct, bumped on the render thread
+and written by the heartbeat thread as a "gl" JSON object
+(gl_renderer_cost_json): presents, swap_us, batches, semi_isolated, the seven
+existing batch-break reasons, stencil_rebuilds/_px, sync_reads/_skips/_us,
+hold_copies/_px, pack_px, mirror_passes. The launcher and
+tuning/scripts/scale_bench.py take rates over a window, like the cadence
+counters.
+
+GPU timings: PSX_GPU_PERF=1 turns on the existing GL_TIME_ELAPSED brackets in
+a release build (they were compiled out with the debug server), without the
+native-wide mirror timestamps, which are hundreds of queries a frame and stay
+debug-only. Totals gpu_frames / gpu_scene_us / gpu_present_us, and
+gpu_scene_max_us for the worst frame of the last second. Debug-tools builds
+behave as before (on unless PSX_GL_PERF=0).
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -507,6 +507,48 @@ static int s_tex_filter = 0;
+  * duplicate stencil copy current is deferred until mask checking is requested. */
+ static int s_stencil_valid = 1;
+ 
++/* ---- release cost counters (heartbeat "gl") ------------------------------
++ * frame_perf answers "where did this frame go" only in a debug-tools build,
++ * with a debug port and a TCP client. These answer the same question from the
++ * release build the player runs: every path below either grows with the
++ * internal scale S (full-surface work is S*S pixels) or makes the emulation
++ * thread wait for the GPU, which turns GPU time into lost VBlanks. Monotonic
++ * totals, bumped on the render thread only; the heartbeat thread reads them
++ * and the launcher / tuning/scripts/scale_bench.py take rates over a window,
++ * the same contract as the cadence counters. */
++typedef struct {
++    uint64_t presents;          /* frames that reached SwapWindow               */
++    uint64_t swap_us;           /* CPU time inside SwapWindow (GPU queue full,  */
++                                /* or vsync when it is on)                      */
++    uint64_t batches;           /* textured + flat batch draws                  */
++    uint64_t semi_isolated;     /* of which: one semi-transparent prim alone    */
++    uint64_t stencil_rebuilds;  /* mask stencil re-derived from alpha           */
++    uint64_t stencil_px;        /* hr-resolution pixels those rebuilds covered  */
++    uint64_t sync_reads;        /* ensure_cpu glReadPixels: waits for the GPU   */
++    uint64_t sync_skips;        /* guest reads that did not need to wait        */
++    uint64_t sync_us;           /* CPU time blocked in those reads              */
++    uint64_t hold_copies;       /* hold-last copies of the whole drawable       */
++    uint64_t hold_px;
++    uint64_t pack_px;           /* native pixels re-packed into the raw mirror  */
++    uint64_t mirror_passes;     /* native-wide mirror passes                    */
++    /* GPU timeline, only with PSX_GPU_PERF=1 in a release build (always on in
++     * debug-tools builds unless PSX_GL_PERF=0). TIME_ELAPSED counts idle gaps
++     * inside the bracket, so scene time near the frame time can also mean the
++     * GPU was waiting for the emulator; present time is submitted in one go
++     * and is tight. */
++    uint64_t gpu_frames;
++    uint64_t gpu_scene_us, gpu_present_us;
++    uint64_t gpu_scene_max_us;  /* worst frame of the last completed second     */
++} GlCost;
++static GlCost   s_gc;
++static uint64_t s_gc_scene_max_cur, s_gc_max_t0;
++
++static uint64_t gc_now_us(void) {
++    static uint64_t freq = 0;
++    if (!freq) { freq = SDL_GetPerformanceFrequency(); if (!freq) freq = 1; }
++    return (uint64_t)((double)SDL_GetPerformanceCounter() * 1.0e6 / (double)freq);
++}
++
+ /* ---- native-wide compositor (mirrors gpu_sw_renderer.c g_wide_*) ----------
+  * Canonical VRAM (the hr FBO) stays 100% faithful. Native-wide lives in
+  * SEPARATE wide FBOs keyed by framebuffer base_x; each framebuffer-targeting
+@@ -745,6 +787,8 @@ static void hold_capture_drawable(void) {
+     if (ww < 1 || wh < 1)
+         return;
+     hold_ensure_tex(ww, wh);
++    s_gc.hold_copies++;
++    s_gc.hold_px += (uint64_t)ww * (uint64_t)wh;
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+     glBindTexture(GL_TEXTURE_2D, s_hold_tex);
+     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, ww, wh);
+@@ -1402,6 +1446,8 @@ static void flush_cpu_upload(void) {
+  * Sampling an attached render target is undefined, so copy color to the shared
+  * scratch texture first. Wide targets never exceed the 1024-pixel VRAM width. */
+ static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h) {
++    s_gc.stencil_rebuilds++;
++    s_gc.stencil_px += (uint64_t)target_w * (uint64_t)target_h;
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, target_fbo);
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
+     p_glBlitFramebuffer(0, 0, target_w, target_h, 0, 0, target_w, target_h,
+@@ -1450,6 +1496,7 @@ static void pack_flush(void) {
+     int h = s_pack_dirty.y1 - s_pack_dirty.y0 + 1;
+     rect_clear(&s_pack_dirty);
+     coh_record(GL_COH_PACK, x, y, x + w - 1, y + h - 1);
++    s_gc.pack_px += (uint64_t)w * (uint64_t)h;
+ 
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
+     glViewport(0, 0, VRAM_W, VRAM_H);
+@@ -1510,9 +1557,12 @@ static void ensure_cpu(void) {
+     flush_tex_batch();   /* realise queued textured draws before reading the FBO back */
+     flush_cpu_upload();
+     pack_flush();
++    const uint64_t t0 = gc_now_us();
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
+     glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    s_gc.sync_reads++;
++    s_gc.sync_us += gc_now_us() - t0;
+     s_gpu_dirty = 0;
+     coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+ }
+@@ -1652,6 +1702,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
+  * surface) bleed into the OTHER band's rows — presented one frame later as
+  * top/bottom edge flicker (16:9 GL only). */
+ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
++    s_gc.mirror_passes++;
+     if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
+         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+@@ -1883,6 +1934,7 @@ static void flush_tex_batch(void) {
+     s_tb_n = 0;                             /* clear first: re-entrancy safe */
+     double cw_t0 = cw_ms();
+     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
++    s_gc.batches++;
+ 
+     hr_begin(1);
+     p_glUseProgram(s_tex_prog);
+@@ -1942,6 +1994,7 @@ static void flush_flat_batch(void) {
+     if (s_fb_n == 0) return;
+     int nverts = s_fb_n, semi = s_fb_semi, mask = s_fb_mask;
+     s_fb_n = 0;
++    s_gc.batches++;
+ 
+     hr_begin(1);
+     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+@@ -2151,7 +2204,10 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
+         }
+         s_tb_n += 3;
+-        if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
++        if (isolate) {                    /* draw this semi prim alone, in submission order */
++            s_gc.semi_isolated++;
++            flush_tex_batch();
++        }
+     }
+ }
+ 
+@@ -3901,8 +3957,17 @@ static GlPerfSample s_pf_ring[GLPERF_RING];
+ static uint64_t     s_pf_ring_seq = 0;
+ 
+ static void gl_perf_init(void) {
++    int release_opt_in = 0;
+ #ifdef PSX_NO_DEBUG_TOOLS
+-    return;
++    /* Release: off unless PSX_GPU_PERF=1 asks for it (tuning/scripts/
++     * scale_bench.py). Only the two per-frame brackets - the native-wide
++     * mirror timestamps are hundreds of queries a frame and stay debug-only.
++     * The results reach the heartbeat's "gl" object (gl_renderer_cost_json). */
++    {
++        const char *enabled = getenv("PSX_GPU_PERF");
++        if (!(enabled && enabled[0] == '1')) return;
++        release_opt_in = 1;
++    }
+ #else
+     /* Timer queries are intentionally available in diagnostics builds, but a
+      * driver may serialize command submission while collecting them.  Keep an
+@@ -3912,10 +3977,11 @@ static void gl_perf_init(void) {
+         const char *enabled = getenv("PSX_GL_PERF");
+         if (enabled && enabled[0] == '0') return;
+     }
++#endif
+     if (!p_glGenQueries || !p_glBeginQuery || !p_glEndQuery || !p_glGetQueryObjectui64v) return;
+     p_glGenQueries(GLPERF_NBUF, s_pf_scene_q);
+     p_glGenQueries(GLPERF_NBUF, s_pf_present_q);
+-    s_mq_ok = (p_glQueryCounter != NULL);
++    s_mq_ok = (p_glQueryCounter != NULL) && !release_opt_in;
+     if (s_mq_ok)
+         for (int i = 0; i < GLPERF_NBUF; i++) {
+             p_glGenQueries(GLPERF_MIRQ * 2, s_mq_q[i]);
+@@ -3927,7 +3993,6 @@ static void gl_perf_init(void) {
+     s_pf_b = 0; s_pf_scene_active = 0; s_pf_count = 0; s_pf_ring_seq = 0;
+     s_pf_last_enter = 0;
+     s_pf_on = 1;
+-#endif
+ }
+ 
+ /* Bracket ONE native-wide mirror pass (called from the wide-mirror draw sites).
+@@ -4017,6 +4082,20 @@ static void gl_perf_present_exit(int wide) {
+         s->wide            = s_pf_buf_wide[rd];
+         s->frame           = s_pf_buf_frame[rd];
+         s_pf_ring_seq++;
++        /* Release totals for the heartbeat (see GlCost). */
++        {
++            const uint64_t sc_us = (uint64_t)(sc / 1000u);
++            const uint64_t now_us = gc_now_us();
++            s_gc.gpu_frames++;
++            s_gc.gpu_scene_us += sc_us;
++            s_gc.gpu_present_us += (uint64_t)(pr / 1000u);
++            if (sc_us > s_gc_scene_max_cur) s_gc_scene_max_cur = sc_us;
++            if (now_us - s_gc_max_t0 >= 1000000u) {
++                s_gc.gpu_scene_max_us = s_gc_scene_max_cur;
++                s_gc_scene_max_cur = 0;
++                s_gc_max_t0 = now_us;
++            }
++        }
+     }
+     s_mq_n[rd] = 0; s_mq_over[rd] = 0;   /* rd becomes the next frame's buffer */
+     s_pf_count++;
+@@ -4116,6 +4195,44 @@ int gl_renderer_perf_percentiles(int wide_filter, double budget_ms, double out[4
+     return n;
+ }
+ 
++/* The heartbeat's "gl" object: GlCost plus why textured batches were split
++ * (break_* in gpu_textured_triangle's reason order). Written from the
++ * heartbeat thread; every field is a monotonic total except scale, wide and
++ * gpu_scene_max_us. Returns the snprintf length, or 0 with "null" written
++ * when the GL pipeline is not running. */
++int gl_renderer_cost_json(char *out, size_t cap) {
++    if (!out || cap < 8) return 0;
++    if (!s_raster_ok) return snprintf(out, cap, "null");
++    const GlCost c = s_gc;
++    return snprintf(out, cap,
++        "{\"scale\":%d,\"wide\":%d,\"gpu_timed\":%d,"
++        "\"presents\":%llu,\"swap_us\":%llu,"
++        "\"batches\":%llu,\"semi_isolated\":%llu,"
++        "\"break_semi\":%llu,\"break_blend\":%llu,\"break_mask\":%llu,"
++        "\"break_filter\":%llu,\"break_gate\":%llu,\"break_twin\":%llu,"
++        "\"break_full\":%llu,"
++        "\"stencil_rebuilds\":%llu,\"stencil_px\":%llu,"
++        "\"sync_reads\":%llu,\"sync_skips\":%llu,\"sync_us\":%llu,"
++        "\"hold_copies\":%llu,\"hold_px\":%llu,\"pack_px\":%llu,"
++        "\"mirror_passes\":%llu,"
++        "\"gpu_frames\":%llu,\"gpu_scene_us\":%llu,\"gpu_present_us\":%llu,"
++        "\"gpu_scene_max_us\":%llu}",
++        s_scale, g_wide_w > 0 ? 1 : 0, s_pf_on,
++        (unsigned long long)c.presents, (unsigned long long)c.swap_us,
++        (unsigned long long)c.batches, (unsigned long long)c.semi_isolated,
++        (unsigned long long)s_batch_reason[0], (unsigned long long)s_batch_reason[1],
++        (unsigned long long)s_batch_reason[2], (unsigned long long)s_batch_reason[3],
++        (unsigned long long)s_batch_reason[4], (unsigned long long)s_batch_reason[5],
++        (unsigned long long)s_batch_reason[6],
++        (unsigned long long)c.stencil_rebuilds, (unsigned long long)c.stencil_px,
++        (unsigned long long)c.sync_reads, (unsigned long long)c.sync_skips,
++        (unsigned long long)c.sync_us,
++        (unsigned long long)c.hold_copies, (unsigned long long)c.hold_px,
++        (unsigned long long)c.pack_px, (unsigned long long)c.mirror_passes,
++        (unsigned long long)c.gpu_frames, (unsigned long long)c.gpu_scene_us,
++        (unsigned long long)c.gpu_present_us, (unsigned long long)c.gpu_scene_max_us);
++}
++
+ /* Native-wide mirror ablation (perf attribution): see s_ws_ablate. */
+ void gl_renderer_set_ws_ablate(int mode) { s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
+ int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
+@@ -4422,7 +4539,12 @@ static void gl_swap_with_osd(void) {
+      * s_probe_swap next to it is ZEROED by present_probe_take(), which the
+      * savestate probe consumes, so it cannot answer "swaps per second". */
+     g_gl_swap_total++;
+-    SDL_GL_SwapWindow(s_win);
++    {
++        const uint64_t t0 = gc_now_us();
++        SDL_GL_SwapWindow(s_win);
++        s_gc.swap_us += gc_now_us() - t0;
++        s_gc.presents++;
++    }
+ }
+ 
+ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -53,6 +53,9 @@ extern int      crash2_60fps_script_hooked(void);
+  * to drain; with rewind on, async should be all but the first few. */
+ extern unsigned long long psx_rewind_async_captures(void);
+ extern unsigned long long psx_rewind_sync_captures(void);
++/* GL renderer cost totals as a JSON object, or null (gpu_gl_renderer.c).
++ * Per-second rates of these are what tell a 5x frame's cost apart. */
++extern int gl_renderer_cost_json(char *out, size_t cap);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+ /* Assists, so a bug report shows whether they were on. They can change
+@@ -897,6 +900,11 @@ static void heartbeat_write(void) {
+ 
+     /* Buffer sized for current-state JSON + ring (~256B per ring entry).
+      * Cadence totals are monotonic, enabling launcher-side 30s rate windows. */
++    char gl_json[1024];
++    {
++        const int gl_n = gl_renderer_cost_json(gl_json, sizeof(gl_json));
++        if (gl_n <= 0 || gl_n >= (int)sizeof(gl_json)) strcpy(gl_json, "null");
++    }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),
+         "{\n"
+@@ -921,6 +929,7 @@ static void heartbeat_write(void) {
+         "  \"native_60fps_script_hooked\":%d,\n"
+         "  \"rewind_async_captures\":%llu,\n"
+         "  \"rewind_sync_captures\":%llu,\n"
++        "  \"gl\":%s,\n"
+         "  \"game_frame_ticks\":%u,\n"
+         "  \"cheat_lives\":%d,\n"
+         "  \"cheat_aku_level\":%d,\n"
+@@ -1003,6 +1012,7 @@ static void heartbeat_write(void) {
+         crash2_60fps_script_hooked(),
+         psx_rewind_async_captures(),
+         psx_rewind_sync_captures(),
++        gl_json,
+         crash2_60fps_frame_ticks(),
+         crash2_cheat_lives_enabled(),
+         crash2_cheat_aku_level(),

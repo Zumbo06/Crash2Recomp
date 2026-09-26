@@ -1,0 +1,1111 @@
+Native 120 FPS for SCUS-94154 (experimental): the open 60 FPS gate at twice
+the field rate.
+
+PSX_CRASH2_60FPS=1 PSX_CRASH2_FPS=120 [PSX_CRASH2_120FPS_CPU_PCT=100..400,
+default 400]. Debug server: crash2_60fps {"fps":120, "cpu_percent_120":400}.
+
+interrupts.c: the VBlank period is a variable. interrupts_set_vblank_divisor(2)
+fires VBlank every 282,240 cycles instead of 564,480; nothing else moves - the
+root counters, CD, SPU, SIO and DMA keep their device timing, so guest time and
+the engine's 1033.6 Hz tick stay where they were. psx_set_vblank_edge_hook()
+runs a callback at the end of every VBlank edge. A boot/rematch resets to NTSC.
+
+crash2_60fps.h, with the gate open and 120 asked for:
+  - VBlank at 120 Hz while the 3D loop turns.
+  - Frame time. func_80016F04 rounds any frame under 19 ticks up to 17, so a
+    120 Hz field (8.62 ticks) would be simulated as a 60 Hz one - double
+    speed. At the top of the next loop, before any reader, [DB_CUR]+20 is
+    replaced by the frame's length in fields (from the game's own stamps,
+    [DB_NEXT]+12 - [DB_CUR]+12, nearest field) times 8.5 ticks through a
+    half-tick carry: 8 and 9 alternately, 17 a pair - the 60 Hz timeline
+    exactly. 2 and 4 fields give 17 and 34 as the quantizer would; 3 and 5,
+    which it would round up, 25/26 and 42/43; 53+ ticks keep the game's value.
+  - Music. On NTSC libsnd runs its VSync tick mode (SsSetTickMode(1) at
+    0x80033D20 becomes mode 5) and SsStart(1) chains the sequencer tick behind
+    libetc's VBlank handler: 0x80054E74 calls the displaced handler, then
+    [0x8005EFE0]. The VBlank edge hook alternates that pointer between the tick
+    (0x80054F04) and an empty function nothing references (0x80016EFC), so the
+    tick keeps 59.94 Hz. The SsStart2 form (a VSync callback slot) is handled
+    the same way. The stand-in is put back whenever 120 is not engaged,
+    including in RAM a savestate brings back.
+  - Loads. VSync(n) counts fields and the game waits whole numbers of them
+    only outside the loop (VSync 5/20/60). 12 fields with no loop drop VBlank
+    to NTSC from the edge hook itself; 4 quick loops re-arm.
+  - Scripts: unchanged. The 0036 pacing accumulates ticks, so at 8/9 a field
+    it steps every fourth field.
+  - Clock. Twice the frames in the same guest second need twice the headroom:
+    the gate opens at 400% with VSync's iteration-counted timeout widened x4
+    (sll a1,a0,2 / addiu a1,zero,4 - the multiplier must be at least the
+    clock over 100). It stays at 400% when 120 steps down to 60: 120 at 400%
+    and 60 at 200% give a frame the same instruction budget, so lowering the
+    clock would drop a scene that missed its 120 Hz field straight to 30.
+  - Staircase. A window that fails at 120 (host behind twice, or frames not
+    on one field) steps down to 60 with the gate open - also under Prefer 60,
+    which promises 60 - and retries after 10 s, 20 s, 40 s; three in a row
+    stay at 60 until a quiet window. Netplay and frame interpolation never
+    engage it; demo playback closes the gate as before. The verdict's host
+    check counts VBlanks against the rate in force, and a window never spans
+    a rate change.
+  - Every word it relies on is checked on top of the 60 FPS anchors
+    (c2_120_signature_ok), and everything reverts with the gate, on mode off,
+    and when the game reloads its executable.
+
+main.cpp: the pacer waits one guest field at the rate in force; driver vsync
+never owns cadence while VBlank is faster than NTSC, and the swap interval is
+re-derived whenever the rate changes. The speed readout is VBlanks over the
+rate in force. psx_frame_interpolation_active() for crash2_60fps.h.
+psx_rewind.c: the capture interval is counted in VBlanks, so it scales with the
+rate - same seconds of history. freeze_heartbeat.c / debug_server.c:
+native_fps_target, native_fps_field_hz, native_120fps_engaged / fallbacks /
+stalls / latched; frame_rates speed against the rate in force.
+
+Verified offline with tuning/native120_sim (crash2_60fps.h driven by a model
+of the VBlank, root counter 2, the frame end and libsnd's chain, over the real
+executable): at 120 the engine is fed 8/9 ticks and 1020 ticks/s - the 60 and
+30 Hz timeline - music ticks at 60/s, scripts step at 30/s; stalls drop and
+re-arm; a scene over budget at 120 steps down to 60 and holds it; mode off
+restores every word, the clock and the VBlank rate. Not verified: how physics
+behaves on 8/9-tick steps in play (fixed-point truncation), which is why this
+is experimental.
+
+No file here is in codegen_hash_sources.cmake; no rebuild of generated code.
+
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -182,6 +182,15 @@ void psx_irq_raise(uint32_t bit, uint32_t detail)
+ static uint32_t dispatch_count;
+ static uint64_t total_checks;
+ static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
++/* The VBlank period in force: NTSC's field, unless a game mode runs the
++ * display at a multiple of the field rate. SCUS-94154's native 120 FPS
++ * (crash2_60fps.h) halves it while its 3D loop runs; nothing else changes it.
++ * Only VBlank moves - the root counters, CD, SPU, SIO and DMA keep their own
++ * device timing, so guest time, and every clock a game measures time with,
++ * stays where it was. */
++static uint32_t s_vblank_period = VBLANK_CYCLES;
++static unsigned s_vblank_div = 1u;
++static void (*s_vblank_edge_hook)(void);
+ extern uint64_t g_vblank_raise_count;
+ extern int g_cosim_dirty_pump_site;
+ 
+@@ -390,13 +399,13 @@ static void fire_vblank_edge(void) {
+     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
+      * carries forward. Prevents long-running blocks from rounding multiple
+      * VBlanks together. */
+-    cycles_since_vblank -= VBLANK_CYCLES;
++    cycles_since_vblank -= s_vblank_period;
+     dispatch_count = 0;
+     /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
+     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
+                           (uint32_t)psx_get_cycle_count());
+     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
+-                          (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
++                          (uint32_t)(psx_get_cycle_count() + s_vblank_period));
+     psx_irq_raise(IRQ_VBLANK, 0);
+     g_vblank_raise_count++;
+     event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
+@@ -407,20 +416,40 @@ static void fire_vblank_edge(void) {
+ #endif
+     /* Keep SPU time flowing across guest busy-waits (see comment above). */
+     if (s_midframe_audio_pump) s_midframe_audio_pump();
++    /* Last: it may change the period for the NEXT field. */
++    if (s_vblank_edge_hook) s_vblank_edge_hook();
+ }
+ 
+ void interrupts_service_scheduled_events(void) {
+     note_sio_progress_cycle();
+     if (in_exception) return;
+-    while (cycles_since_vblank >= VBLANK_CYCLES) {
++    while (cycles_since_vblank >= s_vblank_period) {
+         if (should_defer_vblank_for_sio()) return;
+         fire_vblank_edge();
+     }
+ }
+ 
+ uint32_t interrupts_cycles_to_vblank(void) {
+-    if (cycles_since_vblank >= VBLANK_CYCLES) return 0;
+-    return VBLANK_CYCLES - cycles_since_vblank;
++    if (cycles_since_vblank >= s_vblank_period) return 0;
++    return s_vblank_period - cycles_since_vblank;
++}
++
++/* 1 = NTSC's 59.94 Hz field, 2 = twice that. Takes effect from the next
++ * field: a phase already past the new period fires on the next service. */
++void interrupts_set_vblank_divisor(unsigned div) {
++    if (div < 1u) div = 1u;
++    if (div > 4u) div = 4u;
++    s_vblank_div = div;
++    s_vblank_period = VBLANK_CYCLES / div;
++}
++
++unsigned interrupts_vblank_divisor(void) {
++    return s_vblank_div;
++}
++
++/* Called at the end of every VBlank edge, on the emulation thread. */
++void psx_set_vblank_edge_hook(void (*fn)(void)) {
++    s_vblank_edge_hook = fn;
+ }
+ 
+ uint32_t interrupts_get_cycles_since_vblank(void) {
+@@ -720,6 +749,8 @@ void interrupts_init(void) {
+     exception_entries_total = 0;
+     exception_reentry_blocks = 0;
+     cycles_since_vblank = 0;
++    s_vblank_div = 1u;
++    s_vblank_period = VBLANK_CYCLES;
+     /* Rematch / session_reboot re-enters bring-up without process exit.
+      * Stale I_STAT/I_MASK from the prior match (e.g. VBlank pending + game
+      * mask) makes boot take a phantom IRQ at ~cycle 4 and wedge under
+@@ -910,8 +941,8 @@ uint32_t cycles_to_next_event(void) {
+      * card-SIO case only pushes VBlank LATER, so this estimate stays a safe
+      * under-estimate. */
+     if (i_mask & (1u << IRQ_VBLANK)) {
+-        uint32_t d = (cycles_since_vblank >= VBLANK_CYCLES)
+-                       ? 0u : (VBLANK_CYCLES - cycles_since_vblank);
++        uint32_t d = (cycles_since_vblank >= s_vblank_period)
++                       ? 0u : (s_vblank_period - cycles_since_vblank);
+         if (d < best) best = d;
+     }
+     uint32_t t = timers_cycles_to_irq(i_mask); if (t < best) best = t;
+--- a/runtime/include/interrupts.h
++++ b/runtime/include/interrupts.h
+@@ -80,6 +80,12 @@ void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_p
+ void interrupts_advance_cycles(uint32_t cycles);
+ void interrupts_service_scheduled_events(void);
+ uint32_t interrupts_cycles_to_vblank(void);
++/* VBlank rate as a multiple of NTSC's field rate (1 = 59.94 Hz, 2 = twice
++ * that). Only SCUS-94154's native 120 FPS mode sets it (crash2_60fps.h). */
++void interrupts_set_vblank_divisor(unsigned div);
++unsigned interrupts_vblank_divisor(void);
++/* Called at the end of every VBlank edge on the emulation thread. */
++void psx_set_vblank_edge_hook(void (*fn)(void));
+ /* VBlank phase within the current frame (0 .. VBLANK_CYCLES-1). Persisted in
+  * BS_SEC_IRQ (and selfcheck's out-of-band latch) so resim keeps the snap's
+  * phase. Legacy 8-byte IRQ sections still rebase to 0 on load. */
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -66,6 +66,9 @@
+  *
+  * Everything here is reversible and signature-guarded: nothing is written
+  * unless all six anchor words of this exact revision read back correctly.
++ *
++ * Native 120 FPS (experimental, PSX_CRASH2_FPS=120) is the same open gate at
++ * twice the field rate - see C2_120_SND_FN.
+  */
+ #ifndef CRASH2_60FPS_H
+ #define CRASH2_60FPS_H
+@@ -108,14 +111,17 @@
+  * Timeout duration is (multiplier) x (guest cycles per iteration), and every
+  * cost in that loop - instructions, the main-RAM loads, the stack store -
+  * scales with the clock. A multiplier of 2 therefore gives at least stock
+- * margin for any clock up to 200%, which is C2_60_CPU_CAP. Raising the cap
+- * past 200 must raise this multiplier with it. */
+-#define C2_60_VS_ARGN_PC   0x8004A510u
+-#define C2_60_VS_ARGN_ORIG 0x2485FFFFu   /* addiu a1,a0,-1 */
+-#define C2_60_VS_ARGN_WIDE 0x00842821u   /* addu  a1,a0,a0 */
+-#define C2_60_VS_ARG1_PC   0x8004A534u
+-#define C2_60_VS_ARG1_ORIG 0x24050001u   /* addiu a1,zero,1 */
+-#define C2_60_VS_ARG1_WIDE 0x24050002u   /* addiu a1,zero,2 */
++ * margin for any clock up to 200%, which is C2_60_CPU_CAP. Native 120 FPS
++ * runs the clock up to 400%, and there the multiplier is 4 (the WIDE4
++ * words); c2_60_vs_level() picks the one a clock needs. */
++#define C2_60_VS_ARGN_PC    0x8004A510u
++#define C2_60_VS_ARGN_ORIG  0x2485FFFFu  /* addiu a1,a0,-1 */
++#define C2_60_VS_ARGN_WIDE  0x00842821u  /* addu  a1,a0,a0 */
++#define C2_60_VS_ARGN_WIDE4 0x00042880u  /* sll   a1,a0,2 */
++#define C2_60_VS_ARG1_PC    0x8004A534u
++#define C2_60_VS_ARG1_ORIG  0x24050001u  /* addiu a1,zero,1 */
++#define C2_60_VS_ARG1_WIDE  0x24050002u  /* addiu a1,zero,2 */
++#define C2_60_VS_ARG1_WIDE4 0x24050004u  /* addiu a1,zero,4 */
+ 
+ /* v_wait's idle half, skipped on the host.
+  *
+@@ -300,6 +306,69 @@
+ #define C2_60_FAIL_HOLD   2        /* scene cannot stay on one field */
+ #define C2_60_QUIET       3        /* too few loops to judge: load, 2D, pause */
+ 
++/* Native 120 FPS (experimental): the open gate at twice the field rate.
++ *
++ * With the gate open a frame ends on the first VBlank after its work. Halve
++ * the VBlank period (interrupts_set_vblank_divisor) and a frame that fits in
++ * 8.3 ms ends on a 120 Hz field. The root counter the engine measures time
++ * with keeps its rate, so physics would stay right by itself - except that
++ * the quantizer rounds any frame under 19 ticks up to 17: a 120 Hz field
++ * (8.62 ticks) would be simulated as a 60 Hz one and everything would move
++ * at twice its speed. So while the fast rate is engaged, the value the
++ * quantizer stored is replaced - at the top of the next loop, before any
++ * reader - by the frame's own length in fields times 8.5 ticks: 8 and 9
++ * alternately for one field, 17 a pair, exactly the 60 Hz timeline. Two
++ * fields give 17 and four 34, as the quantizer would; three and five, which
++ * it would round up, give 25/26 and 42/43. Longer frames keep the game's
++ * own value. The length comes from the game's own stamps - the subtraction
++ * 0x80016978 feeds the quantizer - rounded to the nearest field.
++ *
++ * Three more things run per VBlank rather than per measured tick:
++ *
++ *   - the music. On NTSC libsnd uses its VSync tick mode (SsSetTickMode(1)
++ *     at 0x80033D20 becomes mode 5), and SsStart(1) chains the sequencer
++ *     tick behind libetc's VBlank handler: 0x80054E74 calls the handler it
++ *     displaced, then [0x8005EFE0]. At 120 Hz that pointer alternates
++ *     between the tick and an empty function nothing references
++ *     (0x80016EFC), switched at each VBlank edge before the guest takes
++ *     the interrupt, so the tick keeps 59.94 Hz and the tempo is unchanged.
++ *     The SsStart2 form, a VSync callback slot, is handled the same way.
++ *     The tick goes back the moment the fast rate drops;
++ *   - VSync(n) counts fields. The game only waits whole numbers of them
++ *     outside its 3D loop (VSync 5/20/60: boot, memory card, reset), so the
++ *     fast rate lasts only while the loop turns. C2_120_STALL_FIELDS fields
++ *     with no loop - a load, anything that owns the machine for a while -
++ *     drop VBlank back to NTSC from the VBlank edge itself, and
++ *     C2_120_REARM_LOOPS quick loops bring it back;
++ *   - the scripts. Nothing extra: the script-rate pacing accumulates ticks,
++ *     so at 8/9 a field it steps every fourth field, as it steps every
++ *     other one at 60.
++ *
++ * Twice the frames in the same guest second needs twice the CPU headroom,
++ * so asked for 120 the gate opens with the clock at C2_120_CPU_PCT, VSync's
++ * timeout widened four times to match, and it stays there at 60 (see
++ * c2_60_gate_cpu). Falling back is a staircase, not a cliff: a
++ * window that fails at 120 - the host behind, or frames not staying on one
++ * field - drops to the 60 FPS mode with the gate still open, retried after
++ * C2_120_RETRY_MS (doubling); only a failure at 60 closes the gate. Netplay
++ * and frame interpolation never engage it, and demo playback closes the
++ * gate as before. Every word is checked (c2_120_signature_ok) on top of the
++ * 60 FPS anchors, and everything reverts with the gate. */
++#define C2_120_SND_FN        0x8005EFE0u  /* libsnd tick, called per VBlank */
++#define C2_120_SND_MODE      0x8005EFD8u  /* libsnd tick mode; 5 = VSync */
++#define C2_120_SND_TICK      0x80054F04u
++#define C2_120_SND_NOP       0x80016EFCu  /* jr ra; nop - referenced nowhere */
++#define C2_120_VSYNC_CBS     0x8005DC78u  /* libetc's eight VSync callbacks */
++#define C2_120_TICK_HALVES   17u          /* half-ticks in one 120 Hz field */
++#define C2_120_OVERRIDE_MAX  53u          /* raw ticks the quantizer rounds */
++#define C2_120_STALL_FIELDS  12u          /* 100 ms of fields with no loop */
++#define C2_120_REARM_LOOPS   4u
++#define C2_120_QUICK_TICKS   36u          /* a loop shorter counts as quick */
++#define C2_120_CPU_PCT       400
++#define C2_120_CPU_CAP       400
++#define C2_120_RETRY_MS      10000u       /* 10s, 20s, then 40s */
++#define C2_120_GIVE_UP       3            /* ...then 60 until a quiet window */
++
+ static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
+ static int c2_60_cpu_pct = 200;        /* what the setting asked for */
+ static int c2_60_cpu_now = 100;        /* what the guard is currently using */
+@@ -368,6 +437,22 @@ static unsigned c2_60_fail_loop_hz;
+ static unsigned c2_60_last_frame_ticks;
+ static unsigned c2_60_last_guest_ticks;
+ 
++/* Native 120 FPS - see C2_120_SND_FN. */
++static int c2_120_want;                 /* the setting asks for 120 */
++static int c2_120_on;                   /* engaged: VBlank at 120 Hz now */
++static int c2_120_verified = -1;        /* its own anchors; -1 unread */
++static int c2_120_cpu_pct = C2_120_CPU_PCT;
++static unsigned c2_120_half;            /* half-tick carried between frames */
++static unsigned c2_120_fields;          /* fast fields since the last loop */
++static unsigned c2_120_last_fields;     /* ...that the last frame took */
++static unsigned c2_120_snd_phase;
++static int c2_120_stalled;              /* dropped by a loop-less stretch */
++static unsigned c2_120_quick;           /* quick loops since */
++static int c2_120_fails, c2_120_latched;
++static unsigned long long c2_120_retry_at, c2_120_good_ms;
++static unsigned long long c2_120_engaged, c2_120_fallbacks, c2_120_stalls;
++static int c2_120_interp_noted;
++
+ /* The quantizer and both VSync call sites, not just the gate word: the gate is
+  * only safe to remove while the engine's own frame-time compensation is the
+  * one documented above. */
+@@ -395,9 +480,32 @@ static int c2_60_signature_ok(CPUState *cpu)
+            cpu->read_word(0x8004A514u) == 0x0C012973u &&  /* jal v_wait */
+            cpu->read_word(0x8004A538u) == 0x0C012973u &&  /* jal v_wait */
+            (cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_ORIG ||
+-            cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE) &&
++            cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE ||
++            cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE4) &&
+            (cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_ORIG ||
+-            cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE);
++            cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE ||
++            cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE4);
++}
++
++/* What native 120 FPS touches beyond the 60 FPS anchors: the frame stamp and
++ * the quantizer's store it rewrites, libsnd's chained VBlank tick and the
++ * empty function it alternates with, and libetc's callback table. */
++static int c2_120_signature_ok(CPUState *cpu)
++{
++    return cpu->read_word(0x8001694Cu) == 0x3C028004u &&  /* lui v0,0x8004 */
++           cpu->read_word(0x80016950u) == 0x8C42BEA4u &&  /* lw v0,ticks */
++           cpu->read_word(0x80016958u) == 0xAC62000Cu &&  /* sw v0,12(v1) */
++           cpu->read_word(0x80016974u) == 0x0C005BC1u &&  /* jal quantizer */
++           cpu->read_word(0x80016978u) == 0x00442023u &&  /* subu a0,v0,a0 */
++           cpu->read_word(0x80016988u) == 0xAC620014u &&  /* sw v0,20(v1) */
++           cpu->read_word(0x80054E90u) == 0x3C028006u &&  /* lui v0,0x8006 */
++           cpu->read_word(0x80054E94u) == 0x8C42EFE0u &&  /* lw v0,[tick] */
++           cpu->read_word(0x80054E9Cu) == 0x0040F809u &&  /* jalr v0 */
++           cpu->read_word(C2_120_SND_TICK) == 0x27BDFFB8u &&
++           cpu->read_word(C2_120_SND_NOP) == 0x03E00008u &&        /* jr ra */
++           cpu->read_word(C2_120_SND_NOP + 4u) == 0x00000000u &&   /* nop */
++           cpu->read_word(0x8004AE58u) == 0x3C108006u &&  /* the VBlank */
++           cpu->read_word(0x8004AE5Cu) == 0x2610DC78u;    /* callback table */
+ }
+ 
+ static uint32_t c2_60_read_ram_word(uint32_t address)
+@@ -441,22 +549,43 @@ static void c2_60_poke(uint32_t address, uint32_t value)
+ }
+ 
+ 
+-/* Widen or restore VSync's timeout. Only ever swaps between the two known
+- * words, so a revision that does not match is left untouched. */
+-static void c2_60_vsync_timeout(int wide)
++/* VSync's timeout words by level: the game's own, twice it, four times it. */
++static const uint32_t c2_60_vs_argn[3] = {
++    C2_60_VS_ARGN_ORIG, C2_60_VS_ARGN_WIDE, C2_60_VS_ARGN_WIDE4};
++static const uint32_t c2_60_vs_arg1[3] = {
++    C2_60_VS_ARG1_ORIG, C2_60_VS_ARG1_WIDE, C2_60_VS_ARG1_WIDE4};
++
++static int c2_60_vs_level_of(uint32_t word, const uint32_t *words)
++{
++    for (int i = 0; i < 3; i++)
++        if (word == words[i]) return i;
++    return -1;
++}
++
++/* The multiplier a clock needs: at least the clock over 100. */
++static int c2_60_vs_level(int percent)
++{
++    return percent <= 100 ? 0 : percent <= 200 ? 1 : 2;
++}
++
++/* Set VSync's timeout to a level. Only ever swaps between the known words,
++ * so a revision that does not match is left untouched. */
++static void c2_60_vsync_timeout(int level)
+ {
+     extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
+-    const uint32_t n_from = wide ? C2_60_VS_ARGN_ORIG : C2_60_VS_ARGN_WIDE;
+-    const uint32_t n_to   = wide ? C2_60_VS_ARGN_WIDE : C2_60_VS_ARGN_ORIG;
+-    const uint32_t o_from = wide ? C2_60_VS_ARG1_ORIG : C2_60_VS_ARG1_WIDE;
+-    const uint32_t o_to   = wide ? C2_60_VS_ARG1_WIDE : C2_60_VS_ARG1_ORIG;
+-    if (c2_60_read_ram_word(C2_60_VS_ARGN_PC) == n_from)
+-        psx_mod_write_code_word(C2_60_VS_ARGN_PC, n_to);
+-    if (c2_60_read_ram_word(C2_60_VS_ARG1_PC) == o_from)
+-        psx_mod_write_code_word(C2_60_VS_ARG1_PC, o_to);
+-    c2_60_vsync_wide =
+-        c2_60_read_ram_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE &&
+-        c2_60_read_ram_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE;
++    if (level < 0) level = 0;
++    if (level > 2) level = 2;
++    const uint32_t n = c2_60_read_ram_word(C2_60_VS_ARGN_PC);
++    const uint32_t o = c2_60_read_ram_word(C2_60_VS_ARG1_PC);
++    if (c2_60_vs_level_of(n, c2_60_vs_argn) >= 0 && n != c2_60_vs_argn[level])
++        psx_mod_write_code_word(C2_60_VS_ARGN_PC, c2_60_vs_argn[level]);
++    if (c2_60_vs_level_of(o, c2_60_vs_arg1) >= 0 && o != c2_60_vs_arg1[level])
++        psx_mod_write_code_word(C2_60_VS_ARG1_PC, c2_60_vs_arg1[level]);
++    const int ln = c2_60_vs_level_of(c2_60_read_ram_word(C2_60_VS_ARGN_PC),
++                                     c2_60_vs_argn);
++    const int lo = c2_60_vs_level_of(c2_60_read_ram_word(C2_60_VS_ARG1_PC),
++                                     c2_60_vs_arg1);
++    c2_60_vsync_wide = (ln == lo && ln > 0) ? ln : 0;
+ }
+ 
+ static void c2_60_set_cpu(int percent)
+@@ -467,9 +596,177 @@ static void c2_60_set_cpu(int percent)
+     psx_crash2_cpu_clock_set((uint32_t)percent);
+ }
+ 
++/* The CPU clock and the VSync timeout it needs, together. */
++static void c2_60_apply_clock(int percent)
++{
++    c2_60_set_cpu(percent);
++    c2_60_vsync_timeout(c2_60_vs_level(percent));
++}
++
++/* The clock with the gate open. Asked for 120, it is the fast clock at 60
++ * too: 120 Hz at 400% and 60 Hz at 200% give a frame the same instruction
++ * budget (282,240 x 4 = 564,480 x 2), so a step down that also lowered the
++ * clock would not give a frame that missed its field one more instruction -
++ * the scene would fall straight through 60 to 30. The v_wait skip keeps the
++ * higher clock cheap for the host whenever frames fit. */
++static int c2_60_gate_cpu(void)
++{
++    return (c2_120_want && c2_120_cpu_pct > c2_60_cpu_pct)
++        ? c2_120_cpu_pct : c2_60_cpu_pct;
++}
++
++/* Point every place libsnd's VBlank tick is called from at fn: the chained
++ * pointer, and a VSync callback slot for the SsStart2 form. Only places
++ * holding the tick or its stand-in are touched - anything else is not ours -
++ * and only in the VSync tick mode, where the tick really is per VBlank. */
++static void c2_120_snd_set(uint32_t fn)
++{
++    if (c2_60_peek(C2_120_SND_MODE) != 5u) return;
++    uint32_t v = c2_60_peek(C2_120_SND_FN);
++    if ((v == C2_120_SND_TICK || v == C2_120_SND_NOP) && v != fn)
++        c2_60_poke(C2_120_SND_FN, fn);
++    for (uint32_t i = 0; i < 8u; i++) {
++        const uint32_t slot = C2_120_VSYNC_CBS + i * 4u;
++        v = c2_60_peek(slot);
++        if ((v == C2_120_SND_TICK || v == C2_120_SND_NOP) && v != fn)
++            c2_60_poke(slot, fn);
++    }
++}
++
++/* The stand-in is referenced nowhere in the game, so wherever it is found -
++ * including in RAM a savestate brought back - it is ours to undo. */
++static void c2_120_snd_restore(void)
++{
++    if (c2_60_peek(C2_120_SND_FN) == C2_120_SND_NOP)
++        c2_60_poke(C2_120_SND_FN, C2_120_SND_TICK);
++    for (uint32_t i = 0; i < 8u; i++) {
++        const uint32_t slot = C2_120_VSYNC_CBS + i * 4u;
++        if (c2_60_peek(slot) == C2_120_SND_NOP)
++            c2_60_poke(slot, C2_120_SND_TICK);
++    }
++}
++
++static void c2_120_engage(void)
++{
++    interrupts_set_vblank_divisor(2u);
++    c2_120_on = 1;
++    c2_120_half = 0;
++    c2_120_fields = 0;
++    c2_120_last_fields = 0;
++    c2_120_snd_phase = 0;
++    c2_120_stalled = 0;
++    c2_120_quick = 0;
++    c2_120_engaged++;
++    c2_60_apply_clock(c2_120_cpu_pct);
++    c2_60_win_ms = 0;          /* each rate is judged on its own windows */
++}
++
++/* Back to NTSC fields. Also runs from the VBlank edge, so it changes only the
++ * period and data words; the clock and the code words follow on the next
++ * loop (the x4 timeout is right for 400% at 60 Hz too). */
++static void c2_120_drop(void)
++{
++    if (!c2_120_on) return;
++    interrupts_set_vblank_divisor(1u);
++    c2_120_snd_restore();
++    c2_120_on = 0;
++    c2_60_win_ms = 0;
++}
++
++/* A window failed at 120: 60 with the gate open, and 120 again later. */
++static void c2_120_fall_back(unsigned long long now)
++{
++    c2_120_drop();
++    c2_60_apply_clock(c2_60_gate_cpu());
++    c2_120_fallbacks++;
++    c2_120_good_ms = 0;
++    c2_60_host_bad = 0;
++    c2_60_hold_bad = 0;
++    c2_120_retry_at = now
++        + (C2_120_RETRY_MS << (c2_120_fails < 2 ? c2_120_fails : 2));
++    if (c2_120_fails < 16) c2_120_fails++;
++    if (c2_120_fails >= C2_120_GIVE_UP) c2_120_latched = 1;
++}
++
++/* A completed window's say on 120's penalty: a quiet one - a load, a 2D
++ * screen - is a new scene and clears it; a comfortable one at 120 counts
++ * towards forgiving past fallbacks. */
++static void c2_120_note_window(int verdict)
++{
++    if (verdict == C2_60_QUIET) {
++        c2_120_fails = 0;
++        c2_120_latched = 0;
++        c2_120_retry_at = 0;
++        c2_120_good_ms = 0;
++    } else if (verdict == C2_60_OK && c2_120_on &&
++               c2_60_hold_seen >= C2_60_HOLD_GOOD) {
++        c2_120_good_ms += C2_60_WINDOW_MS;
++        if (c2_120_good_ms >= C2_60_CLEAR_MS) {
++            c2_120_fails = 0;
++            c2_120_latched = 0;
++            c2_120_good_ms = 0;
++        }
++    }
++}
++
++/* Every VBlank edge, before the guest takes the interrupt: the music tick
++ * for this field, and the stall check. */
++static void c2_120_vblank_edge(void)
++{
++    if (!c2_120_on) return;
++    if (++c2_120_fields > C2_120_STALL_FIELDS) {
++        c2_120_drop();
++        c2_120_stalled = 1;
++        c2_120_quick = 0;
++        c2_120_stalls++;
++        return;
++    }
++    c2_120_snd_phase ^= 1u;
++    c2_120_snd_set(c2_120_snd_phase ? C2_120_SND_TICK : C2_120_SND_NOP);
++}
++
++PSX_MOD_CONSTRUCTOR(c2_120_register_vblank_edge)
++{
++    psx_set_vblank_edge_hook(c2_120_vblank_edge);
++}
++
++/* The last frame's length from the game's own stamps: [DB_NEXT]+12 is this
++ * frame's, [DB_CUR]+12 the previous one's. 0 if a pointer is not RAM. */
++static uint32_t c2_120_raw_ticks(void)
++{
++    const uint32_t cur = c2_60_peek(C2_60_DB_CUR);
++    const uint32_t next = c2_60_peek(C2_60_DB_CUR + 4u);
++    if (!c2_60_ram(cur + 12u) || !c2_60_ram(next + 12u)) return 0u;
++    return c2_60_peek(next + 12u) - c2_60_peek(cur + 12u);
++}
++
++/* Engage 120 if everything allows it; called with the gate open. */
++static void c2_120_consider(CPUState *cpu, unsigned long long now)
++{
++    extern int psx_netplay_active(void);
++    extern int psx_frame_interpolation_active(void);
++    if (!c2_120_want || c2_120_on || !c2_60_gate_open) return;
++    if (c2_120_latched || now < c2_120_retry_at) return;
++    if (c2_120_stalled && c2_120_quick < C2_120_REARM_LOOPS) return;
++    /* Unpaced scripts would run at four times their speed. */
++    if (!c2_60_gool_active || psx_netplay_active()) return;
++    if (psx_frame_interpolation_active()) {
++        if (!c2_120_interp_noted) {
++            c2_120_interp_noted = 1;
++            fprintf(stderr, "crash2 120fps: frame interpolation is on - "
++                            "staying at 60\n");
++        }
++        return;
++    }
++    c2_120_verified = c2_120_signature_ok(cpu) ? 1 : 0;
++    if (c2_120_verified != 1) return;
++    c2_120_engage();
++}
++
+ static void c2_60_close_gate(void)
+ {
+     extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
++    c2_120_drop();
+     if (c2_60_read_ram_word(C2_60_GATE_PC) == C2_60_GATE_OPEN)
+         psx_mod_write_code_word(C2_60_GATE_PC, C2_60_GATE_ORIG);
+     c2_60_gate_open = 0;
+@@ -515,9 +812,10 @@ int crash2_60fps_mode(void) { return c2_60_mode < 0 ? 0 : c2_60_mode; }
+ int crash2_60fps_verified(void) { return c2_60_verified; }
+ int crash2_60fps_cpu_percent(void) { return c2_60_cpu_now; }
+ int crash2_60fps_gate_open(void) { return c2_60_gate_open; }
+-/* Whether VSync's timeout is currently widened for the raised clock. With the
+- * gate open and the clock above 100 this must read 1; a 0 there means the
+- * iteration-counted timeout can expire before the VBlank it waits for. */
++/* How far VSync's timeout is widened for the raised clock: 0 not at all, 1
++ * twice (clocks up to 200%), 2 four times (above). With the gate open and
++ * the clock above 100 a 0 here means the iteration-counted timeout can
++ * expire before the VBlank it waits for. */
+ int crash2_60fps_vsync_wide(void) { return c2_60_vsync_wide; }
+ 
+ /* RAM was just replaced wholesale - a savestate, a rewind, a rollback.
+@@ -576,6 +874,19 @@ unsigned crash2_60fps_suspended(void) { return c2_60_suspended ? c2_60_timing_mo
+ unsigned long long crash2_60fps_open_count(void) { return c2_60_opened; }
+ unsigned long long crash2_60fps_backoff_count(void) { return c2_60_backoffs; }
+ 
++/* Native 120 FPS. target is what the setting asks for (60 or 120); field_hz
++ * what is running now - 120 only while engaged. A report with target 120
++ * and field_hz 60 answers with the counters: fallbacks are windows that
++ * failed at 120 (the machine or the scene), stalls loop-less stretches
++ * (loads - expected, and not a failure). */
++int crash2_60fps_target_fps(void) { return c2_120_want ? 120 : 60; }
++int crash2_60fps_field_hz(void) { return c2_120_on ? 120 : 60; }
++int crash2_60fps_fast_verified(void) { return c2_120_verified; }
++int crash2_60fps_fast_latched(void) { return c2_120_latched; }
++unsigned long long crash2_60fps_fast_engaged(void) { return c2_120_engaged; }
++unsigned long long crash2_60fps_fast_fallbacks(void) { return c2_120_fallbacks; }
++unsigned long long crash2_60fps_fast_stalls(void) { return c2_120_stalls; }
++
+ /* Live toggle for the debug server. Turning it off restores the original
+  * comparison and the original CPU clock in the same call, so an aborted
+  * experiment cannot leave a patched word behind. */
+@@ -592,6 +903,10 @@ void crash2_60fps_set_mode(int on)
+         c2_60_win_ms = 0;
+         c2_60_host_bad = 0;
+         c2_60_hold_bad = 0;
++        c2_120_fails = 0;
++        c2_120_latched = 0;
++        c2_120_retry_at = 0;
++        c2_120_stalled = 0;
+     }
+ }
+ 
+@@ -599,7 +914,28 @@ void crash2_60fps_set_cpu_percent(int percent)
+ {
+     if (percent < 100 || percent > C2_60_CPU_CAP) return;
+     c2_60_cpu_pct = percent;
+-    if (c2_60_gate_open) c2_60_set_cpu(percent);
++    if (c2_60_gate_open && !c2_120_on) c2_60_apply_clock(c2_60_gate_cpu());
++}
++
++/* The clock while 120 is engaged. */
++void crash2_60fps_set_fast_cpu_percent(int percent)
++{
++    if (percent < 100 || percent > C2_120_CPU_CAP) return;
++    c2_120_cpu_pct = percent;
++    if (c2_120_on) c2_60_apply_clock(percent);
++}
++
++/* 60 or 120. Switching to 60 drops the fast rate at once; switching to 120
++ * clears its penalty, as switching the mode on does. */
++void crash2_60fps_set_target_fps(int fps)
++{
++    c2_120_want = fps == 120;
++    c2_120_fails = 0;
++    c2_120_latched = 0;
++    c2_120_retry_at = 0;
++    c2_120_stalled = 0;
++    if (!c2_120_want && c2_120_on) c2_120_drop();
++    if (c2_60_gate_open && !c2_120_on) c2_60_apply_clock(c2_60_gate_cpu());
+ }
+ 
+ /* Judge one window. Two different things can go wrong, and they need different
+@@ -642,7 +978,10 @@ static int c2_60_window_verdict(unsigned long long now, unsigned long long vbl)
+     c2_60_win_loops = c2_60_win_one_field = 0;
+     c2_60_win_steps = 0;
+ 
+-    if (vblanks * 1000u < (unsigned long long)C2_60_MIN_VBLANK * span)
++    /* A window never spans a rate change: engaging or dropping 120 starts a
++     * new one. */
++    if (vblanks * 1000u <
++        (unsigned long long)C2_60_MIN_VBLANK * interrupts_vblank_divisor() * span)
+         return (c2_60_verdict = C2_60_FAIL_HOST);
+     /* Loads, 2D screens and the pause menu update a handful of times a second
+      * by design. Judging them on hold would be wrong, and counting them as
+@@ -919,12 +1258,44 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+     c2_60_last_guest_ticks = (unsigned)c2_60_read_ram_word(C2_60_TICKS);
+     c2_60_timing_mode = (unsigned)c2_60_read_ram_word(C2_60_TIMING);
+ 
++    /* Native 120: replace the quantizer's value before anything reads it -
++     * physics, 0x80019F08's scratchpad copy, and the script pacing just
++     * below. See C2_120_SND_FN. */
++    if (c2_120_on) {
++        const uint32_t raw = c2_120_raw_ticks();
++        c2_120_fields = 0;
++        if (raw != 0u && raw < C2_120_OVERRIDE_MAX) {
++            /* 1033.6 / 119.88 = 8.622 ticks a field; nearest. */
++            unsigned n = (unsigned)(((uint64_t)raw * 1000u + 4311u) / 8622u);
++            if (n == 0u) n = 1u;
++            c2_120_last_fields = n;
++            c2_120_half += C2_120_TICK_HALVES * n;
++            const uint32_t ticks = c2_120_half >> 1;
++            c2_120_half &= 1u;
++            c2_60_poke(c2_60_peek(C2_60_DB_CUR) + 20u, ticks);
++            c2_60_last_frame_ticks = ticks;
++        } else {
++            c2_120_last_fields = 0;    /* a long frame keeps the game's value */
++            c2_120_half = 0;
++        }
++    } else if (c2_120_stalled) {
++        const uint32_t raw = c2_120_raw_ticks();
++        c2_120_quick = (raw != 0u && raw < C2_120_QUICK_TICKS) ? c2_120_quick + 1u : 0u;
++    }
++
+     if (c2_60_mode < 0) {
+         const char *e = getenv("PSX_CRASH2_60FPS");
+         const char *p = getenv("PSX_CRASH2_60FPS_CPU_PCT");
+         const char *h = getenv("PSX_CRASH2_60FPS_HOLD_PCT");
+         const char *f = getenv("PSX_CRASH2_60FPS_FORCE_GATE");
++        const char *r = getenv("PSX_CRASH2_FPS");
++        const char *q = getenv("PSX_CRASH2_120FPS_CPU_PCT");
+         c2_60_mode = (e && *e == '1') ? 1 : 0;
++        c2_120_want = (r && atoi(r) == 120) ? 1 : 0;
++        if (q) {
++            int want = atoi(q);
++            if (want >= 100 && want <= C2_120_CPU_CAP) c2_120_cpu_pct = want;
++        }
+         c2_60_force_gate = (f && *f == '1') ? 1 : 0;
+         if (p) {
+             int want = atoi(p);
+@@ -941,6 +1312,15 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+     /* Before anything below consumes c2_60_restored, and in every mode: with
+      * the mode off it keeps every loop a script step. */
+     c2_60_gool_loop();
++    /* Outside the engaged state nothing of 120 may remain: a savestate made
++     * at 120 carries the stand-in in RAM, and a stall may have left the
++     * clock for this loop to settle. */
++    if (!c2_120_on) {
++        if (interrupts_vblank_divisor() != 1u) interrupts_set_vblank_divisor(1u);
++        c2_120_snd_restore();
++    } else if (interrupts_vblank_divisor() != 2u) {
++        interrupts_set_vblank_divisor(2u);   /* a reboot reset it */
++    }
+     if (c2_60_mode != 1) {
+         /* A slot saved at 60 carries the OPEN gate and the widened VSync in
+          * its RAM. Loaded with the mode off, they would run the game half-60
+@@ -951,8 +1331,10 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+             c2_60_restored = 0;
+             if (c2_60_signature_ok(cpu) &&
+                 (cpu->read_word(C2_60_GATE_PC) == C2_60_GATE_OPEN ||
+-                 cpu->read_word(C2_60_VS_ARGN_PC) == C2_60_VS_ARGN_WIDE ||
+-                 cpu->read_word(C2_60_VS_ARG1_PC) == C2_60_VS_ARG1_WIDE)) {
++                 c2_60_vs_level_of(cpu->read_word(C2_60_VS_ARGN_PC),
++                                   c2_60_vs_argn) > 0 ||
++                 c2_60_vs_level_of(cpu->read_word(C2_60_VS_ARG1_PC),
++                                   c2_60_vs_arg1) > 0)) {
+                 c2_60_close_gate();
+                 fprintf(stderr, "crash2 60fps: restored state carried the 60 FPS "
+                                 "patch with the mode off - original words put back\n");
+@@ -963,10 +1345,14 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+ 
+     const unsigned long long now = psx_host_mono_ms();
+     c2_60_win_loops++;
+-    if (c2_60_last_frame_ticks == 17u) c2_60_win_one_field++;
+-    /* The guest can revert the word itself by reloading its executable. */
+-    if (c2_60_gate_open && cpu->read_word(C2_60_GATE_PC) != C2_60_GATE_OPEN)
++    if (c2_120_on ? c2_120_last_fields == 1u : c2_60_last_frame_ticks == 17u)
++        c2_60_win_one_field++;
++    /* The guest can revert the word itself by reloading its executable -
++     * and 120 goes with the gate it stands on. */
++    if (c2_60_gate_open && cpu->read_word(C2_60_GATE_PC) != C2_60_GATE_OPEN) {
+         c2_60_gate_open = 0;
++        c2_120_drop();
++    }
+     /* After a restore the RAM words and this module's state are reconciled
+      * below: a restored ORIG word is caught by the line above and reopened,
+      * and a restored OPEN word is adopted by the open path. Clearing the flag
+@@ -981,11 +1367,17 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+                     cpu->read_word(C2_60_GATE_PC) == C2_60_GATE_OPEN ? "open" : "original",
+                     c2_60_gate_open ? "open" : "closed");
+     }
+-    /* ...which reverts VSync's timeout too, while the clock stays raised. */
+-    if (c2_60_cpu_now > 100 &&
+-        (cpu->read_word(C2_60_VS_ARGN_PC) != C2_60_VS_ARGN_WIDE ||
+-         cpu->read_word(C2_60_VS_ARG1_PC) != C2_60_VS_ARG1_WIDE))
+-        c2_60_vsync_timeout(1);
++    /* ...which reverts VSync's timeout too, while the clock stays raised. A
++     * stall that dropped 120 left the fast clock; settle it here. */
++    if (c2_60_gate_open && !c2_120_on && c2_60_cpu_now != c2_60_gate_cpu())
++        c2_60_apply_clock(c2_60_gate_cpu());
++    {
++        const int lvl = c2_60_vs_level(c2_60_cpu_now);
++        if (lvl > 0 &&
++            (cpu->read_word(C2_60_VS_ARGN_PC) != c2_60_vs_argn[lvl] ||
++             cpu->read_word(C2_60_VS_ARG1_PC) != c2_60_vs_arg1[lvl]))
++            c2_60_vsync_timeout(lvl);
++    }
+ 
+     const int verdict = c2_60_window_verdict(now, g_vblank_raise_count);
+ 
+@@ -1017,10 +1409,26 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+         /* "Prefer 60" is an explicit player choice. Keep reporting a host or
+          * cadence failure for diagnostics, but do not silently undo that
+          * choice by restoring the game's 30 Hz gate. */
++        /* At 120 a failed window steps down to 60 with the gate still open -
++         * under "Prefer 60" too, which promises 60, not 120. The host gets
++         * the same second chance it gets at 60. */
++        c2_120_note_window(verdict);
++        if (c2_120_on && verdict == C2_60_FAIL_HOST) {
++            c2_60_hold_bad = 0;
++            if (++c2_60_host_bad >= C2_60_HOST_STREAK)
++                c2_120_fall_back(now);
++            return;
++        }
++        if (c2_120_on && verdict == C2_60_FAIL_HOLD) {
++            c2_60_host_bad = 0;
++            c2_120_fall_back(now);
++            return;
++        }
+         if (c2_60_force_gate) {
+             c2_60_host_bad = 0;
+             c2_60_hold_bad = 0;
+             c2_60_good_ms = 0;
++            c2_120_consider(cpu, now);
+             return;
+         }
+         if (verdict == C2_60_FAIL_HOST) {
+@@ -1066,6 +1474,7 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+             c2_60_fails = 0;
+             c2_60_latched = 0;
+         }
++        c2_120_consider(cpu, now);
+         return;
+     }
+ 
+@@ -1077,6 +1486,7 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+         c2_60_latched = 0;
+         c2_60_retry_at = 0;
+     }
++    c2_120_note_window(verdict);
+     if (c2_60_latched) return;
+     if (now < c2_60_retry_at) return;
+ 
+@@ -1094,13 +1504,13 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+         extern void psx_mod_write_code_word(uint32_t address, uint32_t value);
+         c2_60_verified = 1;
+         psx_mod_write_code_word(C2_60_GATE_PC, C2_60_GATE_OPEN);
+-        c2_60_set_cpu(c2_60_cpu_pct);
+-        c2_60_vsync_timeout(c2_60_cpu_pct > 100);
++        c2_60_apply_clock(c2_60_gate_cpu());
+         c2_60_gate_open = 1;
+         c2_60_good_ms = 0;
+         c2_60_win_ms = 0;          /* do not judge the transition window */
+         c2_60_opened++;
+     }
++    c2_120_consider(cpu, now);
+ }
+ 
+ #endif /* CRASH2_60FPS_H */
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1264,6 +1264,20 @@ static int present_effective_swap_interval(void);
+ static int present_should_wall_pace(void);
+ static void apply_present_cadence(void);
+ 
++/* One guest field on the wall clock. g_frame_period_ms is NTSC's field;
++ * SCUS-94154's native 120 FPS halves the VBlank period while its 3D loop
++ * runs (crash2_60fps.h, interrupts_set_vblank_divisor), and the pacer has to
++ * follow or the game would run at half speed. */
++static double guest_field_period_ms(void) {
++    return g_frame_period_ms / (double)interrupts_vblank_divisor();
++}
++
++/* crash2_60fps.h does not engage 120 under frame interpolation: blending
++ * subdivides the stock field and would pace the guest at the wrong rate. */
++extern "C" int psx_frame_interpolation_active(void) {
++    return g_frame_interpolation;
++}
++
+ /* Map the configured tri-state fullscreen mode (g_fullscreen) to the SDL
+  * window-fullscreen flag: used both to open the window in that mode and to
+  * pick the hotkey's fullscreen target. */
+@@ -2664,6 +2678,9 @@ static int host_refresh_is_approx_60hz(void) {
+ static int present_vsync_owns_cadence(void) {
+     if (g_video_vsync == 0 || g_present_vsync_disabled)
+         return 0;
++    /* A ~60 Hz panel cannot clock a faster VBlank. */
++    if (interrupts_vblank_divisor() > 1u)
++        return 0;
+     if (g_frame_period_ms <= 0.0)
+         return 0;
+     if (g_frame_interpolation)
+@@ -6668,6 +6685,25 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     RuntimePerfFrameScope runtime_perf_frame_scope;
+     runtime_perf_diag_tick();
+ 
++    /* Native 120 FPS moves the VBlank rate while it is engaged; driver vsync
++     * cannot clock it, so the swap interval is re-derived on every change. */
++    {
++        static unsigned s_vblank_div_seen = 1u;
++        static bool s_vblank_div_noted = false;
++        const unsigned div = interrupts_vblank_divisor();
++        if (div != s_vblank_div_seen) {
++            s_vblank_div_seen = div;
++            apply_present_cadence();
++            if (div > 1u && !s_vblank_div_noted) {
++                s_vblank_div_noted = true;
++                std::printf("psxrecomp: VBlank at %.2f Hz (native %u FPS); "
++                            "wall-clock pacer %.4f ms/field\n",
++                            59.94 * (double)div, 60u * div,
++                            guest_field_period_ms());
++            }
++        }
++    }
++
+     /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
+      * than presents so turbo and skipped-frame modes still report game speed.
+      * Skip during netplay post-load barrier — admit is stalled and the window
+@@ -6689,7 +6725,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         } else if (frequency && now - s_fps_last_time >= frequency) {
+             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
+             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
+-            const double speed = fps / 59.94;
++            const double speed =
++                fps / (59.94 * (double)interrupts_vblank_divisor());
+             double display_fps = 0.0;
+             if (g_frame_interpolation && g_gl_active) {
+                 display_fps = g_frame_interpolation_fps > 0
+@@ -7129,7 +7166,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+             if (mult >= 2 && g_frame_period_ms > 0.0) {
+                 uint64_t perf_start = runtime_perf_section_begin();
+                 frame_pacer_wait(&s_frame_pacer,
+-                                 g_frame_period_ms / (double)mult);
++                                 guest_field_period_ms() / (double)mult);
+                 runtime_perf_section_end(perf_start,
+                                          &g_runtime_perf.pacer_ticks);
+                 latency_ring_mark(LAT_PACED);
+@@ -7164,7 +7201,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+             uint64_t perf_start = runtime_perf_section_begin();
+             frame_pacer_wait(
+                 &s_frame_pacer,
+-                g_frame_period_ms / (double)g_turbo_load_wall_multiplier);
++                guest_field_period_ms() / (double)g_turbo_load_wall_multiplier);
+             runtime_perf_section_end(
+                 perf_start, &g_runtime_perf.pacer_ticks);
+             latency_ring_mark(LAT_PACED);
+@@ -7228,7 +7265,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+         uint64_t perf_start = runtime_perf_section_begin();
+         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace())
+-            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
++            frame_pacer_wait(&s_frame_pacer, guest_field_period_ms());
+         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
+         latency_ring_mark(LAT_PACED);
+ 
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -56,6 +56,15 @@ extern unsigned long long psx_rewind_sync_captures(void);
+ /* GL renderer cost totals as a JSON object, or null (gpu_gl_renderer.c).
+  * Per-second rates of these are what tell a 5x frame's cost apart. */
+ extern int gl_renderer_cost_json(char *out, size_t cap);
++/* Native 120 FPS (crash2_60fps.h, C2_120_SND_FN): the rate the setting asks
++ * for, the field rate running now, and why they differ - fallbacks are
++ * windows that failed at 120, stalls loop-less stretches such as loads. */
++extern int      crash2_60fps_target_fps(void);
++extern int      crash2_60fps_field_hz(void);
++extern unsigned long long crash2_60fps_fast_engaged(void);
++extern unsigned long long crash2_60fps_fast_fallbacks(void);
++extern unsigned long long crash2_60fps_fast_stalls(void);
++extern int      crash2_60fps_fast_latched(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+ /* Assists, so a bug report shows whether they were on. They can change
+@@ -927,6 +936,12 @@ static void heartbeat_write(void) {
+         "  \"native_60fps_script_hz\":%u,\n"
+         "  \"native_60fps_physics_fields\":%llu,\n"
+         "  \"native_60fps_script_hooked\":%d,\n"
++        "  \"native_fps_target\":%d,\n"
++        "  \"native_fps_field_hz\":%d,\n"
++        "  \"native_120fps_engaged\":%llu,\n"
++        "  \"native_120fps_fallbacks\":%llu,\n"
++        "  \"native_120fps_stalls\":%llu,\n"
++        "  \"native_120fps_latched\":%d,\n"
+         "  \"rewind_async_captures\":%llu,\n"
+         "  \"rewind_sync_captures\":%llu,\n"
+         "  \"gl\":%s,\n"
+@@ -1010,6 +1025,12 @@ static void heartbeat_write(void) {
+         crash2_60fps_script_hz(),
+         crash2_60fps_physics_fields(),
+         crash2_60fps_script_hooked(),
++        crash2_60fps_target_fps(),
++        crash2_60fps_field_hz(),
++        crash2_60fps_fast_engaged(),
++        crash2_60fps_fast_fallbacks(),
++        crash2_60fps_fast_stalls(),
++        crash2_60fps_fast_latched(),
+         psx_rewind_async_captures(),
+         psx_rewind_sync_captures(),
+         gl_json,
+--- a/runtime/src/psx_rewind.c
++++ b/runtime/src/psx_rewind.c
+@@ -301,10 +301,14 @@ static int rewind_fmv_media_active(void)
+ 
+ static uint32_t rewind_capture_interval(void)
+ {
++    /* Counted in VBlanks. Native 120 FPS doubles them while it is engaged
++     * (interrupts_vblank_divisor), and the ring should still hold the same
++     * seconds of history, so the interval doubles with them. */
++    const uint32_t div = interrupts_vblank_divisor();
+     if (!rewind_fmv_media_active())
+-        return s_interval;
++        return s_interval * div;
+     /* FMV densifies toward s_fmv_interval but never sparser than the user pick. */
+-    return s_interval < s_fmv_interval ? s_interval : s_fmv_interval;
++    return (s_interval < s_fmv_interval ? s_interval : s_fmv_interval) * div;
+ }
+ 
+ static int resume_pc_ok(uint32_t pc)
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7952,6 +7952,14 @@ static void handle_frame_rates(int id, const char *json)
+      * near 60 too is the double-speed bug. */
+     const double script_s =
+         (double)(crash2_60fps_script_steps() - s_fr_base_script) / secs;
++    /* Native 120 FPS: what was asked for and what is running. The VBlank
++     * rate is twice NTSC's while it is engaged, so speed is measured
++     * against the rate in force. */
++    extern int crash2_60fps_target_fps(void);
++    extern int crash2_60fps_field_hz(void);
++    extern unsigned long long crash2_60fps_fast_fallbacks(void);
++    extern unsigned long long crash2_60fps_fast_stalls(void);
++    const double field_rate = 59.94 * (double)interrupts_vblank_divisor();
+ 
+     send_fmt("{\"id\":%d,\"ok\":true,\"seconds\":%.3f,"
+              "\"vblank_raise\":%.2f,\"vblank_deliver\":%.2f,"
+@@ -7964,6 +7972,8 @@ static void handle_frame_rates(int id, const char *json)
+              "\"native_60fps_one_field_pct\":%u,\"native_60fps_demo_mode\":%u,"
+              "\"native_60fps_verdict\":%d,"
+              "\"native_60fps_script_steps\":%.2f,\"native_60fps_script_hooked\":%d,"
++             "\"native_fps_target\":%d,\"native_fps_field_hz\":%d,"
++             "\"native_120fps_fallbacks\":%llu,\"native_120fps_stalls\":%llu,"
+              "\"speed\":%.3f,\"perf_samples\":%d,"
+              "\"frame_ms_p50\":%.3f,\"frame_ms_p95\":%.3f,"
+              "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
+@@ -7975,7 +7985,9 @@ static void handle_frame_rates(int id, const char *json)
+              crash2_60fps_hold_pct(), crash2_60fps_suspended(),
+              crash2_60fps_last_verdict(),
+              script_s, crash2_60fps_script_hooked(),
+-             raise_s / 59.94, psamples, p[0], p[1], p[2], (int)p[3]);
++             crash2_60fps_target_fps(), crash2_60fps_field_hz(),
++             crash2_60fps_fast_fallbacks(), crash2_60fps_fast_stalls(),
++             raise_s / field_rate, psamples, p[0], p[1], p[2], (int)p[3]);
+ }
+ 
+ /* The shipped SCUS-94154 native 60 FPS mode, live.
+@@ -7983,6 +7995,8 @@ static void handle_frame_rates(int id, const char *json)
+  *   crash2_60fps                      -> current state and engine frame time
+  *   crash2_60fps {"enabled":1|0}      -> open/close the 30 Hz gate
+  *   crash2_60fps {"cpu_percent":100..200}
++ *   crash2_60fps {"fps":60|120}        -> native 120 FPS (experimental)
++ *   crash2_60fps {"cpu_percent_120":100..400}  -> the clock while at 120
+  *
+  * Unlike the ablation probes below this one drives the same code path the
+  * launcher's setting does (crash2_60fps.h), so what is measured here is what
+@@ -8003,19 +8017,42 @@ static void handle_crash2_60fps(int id, const char *json)
+     extern int crash2_60fps_last_verdict(void);
+     extern int crash2_60fps_gate_open(void);
+     extern unsigned crash2_60fps_frame_ticks(void);
++    extern void crash2_60fps_set_target_fps(int fps);
++    extern void crash2_60fps_set_fast_cpu_percent(int percent);
++    extern int crash2_60fps_target_fps(void);
++    extern int crash2_60fps_field_hz(void);
++    extern unsigned long long crash2_60fps_fast_engaged(void);
++    extern unsigned long long crash2_60fps_fast_fallbacks(void);
++    extern unsigned long long crash2_60fps_fast_stalls(void);
++    extern int crash2_60fps_fast_verified(void);
+     int enabled = json_get_int(json, "enabled", -1);
+     int percent = json_get_int(json, "cpu_percent", -1);
++    int fps = json_get_int(json, "fps", -1);
++    int percent_120 = json_get_int(json, "cpu_percent_120", -1);
+     if (percent >= 0 && (percent < 100 || percent > 200)) {
+         send_err(id, "cpu_percent must be 100..200");
+         return;
+     }
++    if (percent_120 >= 0 && (percent_120 < 100 || percent_120 > 400)) {
++        send_err(id, "cpu_percent_120 must be 100..400");
++        return;
++    }
++    if (fps >= 0 && fps != 60 && fps != 120) {
++        send_err(id, "fps must be 60 or 120");
++        return;
++    }
+     if (percent >= 0) crash2_60fps_set_cpu_percent(percent);
++    if (percent_120 >= 0) crash2_60fps_set_fast_cpu_percent(percent_120);
++    if (fps >= 0) crash2_60fps_set_target_fps(fps);
+     if (enabled >= 0) crash2_60fps_set_mode(enabled);
+     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"verified\":%d,"
+              "\"gate_open\":%s,\"cpu_percent\":%d,\"loop_hz\":%u,"
+              "\"one_field_pct\":%u,\"demo_mode\":%u,\"verdict\":%d,"
+              "\"gate_opened\":%llu,\"backoffs\":%llu,"
+-             "\"gate_instruction\":\"0x%08X\",\"game_frame_ticks\":%u}",
++             "\"gate_instruction\":\"0x%08X\",\"game_frame_ticks\":%u,"
++             "\"fps_target\":%d,\"field_hz\":%d,\"fast_verified\":%d,"
++             "\"fast_engaged\":%llu,\"fast_fallbacks\":%llu,"
++             "\"fast_stalls\":%llu}",
+              id, crash2_60fps_mode() ? "true" : "false",
+              crash2_60fps_verified(),
+              crash2_60fps_gate_open() ? "true" : "false",
+@@ -8024,7 +8061,12 @@ static void handle_crash2_60fps(int id, const char *json)
+              crash2_60fps_last_verdict(),
+              (unsigned long long)crash2_60fps_open_count(),
+              (unsigned long long)crash2_60fps_backoff_count(),
+-             psx_read_word(0x8001685Cu), crash2_60fps_frame_ticks());
++             psx_read_word(0x8001685Cu), crash2_60fps_frame_ticks(),
++             crash2_60fps_target_fps(), crash2_60fps_field_hz(),
++             crash2_60fps_fast_verified(),
++             (unsigned long long)crash2_60fps_fast_engaged(),
++             (unsigned long long)crash2_60fps_fast_fallbacks(),
++             (unsigned long long)crash2_60fps_fast_stalls());
+ }
+ 
+ /* Developer-only, reversible SCUS-94154 frame-gate ablation. This does not

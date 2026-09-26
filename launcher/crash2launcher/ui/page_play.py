@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import recompprofile
-from ..config import Settings, active_diagnostics, diagnostic_label
+from ..config import RENDERER_LABELS, Settings, active_diagnostics, diagnostic_label
 from ..diagnostics import sixty_fps_sample, sixty_fps_summary
 from ..paths import Layout
 from ..runtime import GameSession, build_plan, observed_from_log
@@ -310,9 +310,8 @@ class PlayPage(PlayScene):
 
     # -- state -------------------------------------------------------------
     def refresh(self) -> None:
-        self.renderer_lbl.setText({"opengl": "OpenGL", "vulkan": "Vulkan",
-                                   "software": "Software"}.get(self.settings.renderer,
-                                                                self.settings.renderer))
+        self.renderer_lbl.setText(RENDERER_LABELS.get(self.settings.renderer,
+                                                      self.settings.renderer))
         self.slot_lbl.setText(f"{self.settings.quick_save_slot:02d}")
         self.input_lbl.setText("Keyboard + pad" if self.settings.merge_all_input else "Keyboard")
         running = self.session.running

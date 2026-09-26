@@ -22,7 +22,7 @@ _BENCH_WINDOW_RE = re.compile(r"\d+:\d+")
 # Every backend name the runtime knows about. Reference only - clamp()
 # validates against SELECTABLE_RENDERERS, so a settings file naming "vulkan"
 # IS rewritten to "opengl" rather than passed through.
-RENDERERS = ("opengl", "vulkan", "software")
+RENDERERS = ("opengl", "d3d12", "vulkan", "software")
 
 # What the launcher actually lets a player pick.
 #
@@ -34,7 +34,22 @@ RENDERERS = ("opengl", "vulkan", "software")
 # game.toml sets [video] offer_vulkan, which Crash 2's does not.
 #
 # It was selectable in the combo the whole time. Picking it was a crash.
-SELECTABLE_RENDERERS = ("opengl", "software")
+#
+# Direct3D 12 is the OpenGL renderer itself, compiled a second time against a
+# Direct3D 12 layer (runtime gpu_gl12.h), so everything OpenGL does - supersampling,
+# native widescreen, frame blending, bezels, post-processing - it does too. It
+# is labelled experimental until it has as many hours of play behind it as
+# OpenGL; if it cannot start, the runtime falls back to OpenGL on its own.
+SELECTABLE_RENDERERS = ("opengl", "d3d12", "software")
+RENDERER_LABELS = {
+    "opengl": "OpenGL",
+    "d3d12": "Direct3D 12 (experimental)",
+    "vulkan": "Vulkan",
+    "software": "Software",
+}
+# Renderers that are the hardware path: presentation features (frame blending,
+# post-processing, bezels, native widescreen) exist only on these.
+HARDWARE_RENDERERS = ("opengl", "d3d12")
 # 14:9 is the useful middle: it widens the field of view by ~1.17x instead of
 # 16:9's ~1.33x, so it reaches only about half as far past the edge Crash 2's
 # levels were actually authored to - which is where scenery pops in and out.
@@ -99,6 +114,29 @@ CHEAT_AKU_LEVELS = ("off", "keep_masks", "no_damage")
 # Snapshots are not free: one is taken every `interval` frames regardless of
 # whether the player ever rewinds, which is why "off" is a real performance
 # choice and not just a feature toggle.
+# Output post-processing (runtime gpu_postfx.h). The launcher's units are
+# percent; the runtime clamps to the same ranges. Neutral everywhere means the
+# chain does not run at all, so the defaults cost nothing.
+POSTFX_AA_MODES = ("off", "fxaa", "smaa")
+POSTFX_RANGES: dict[str, tuple[int, int, int]] = {
+    # field:                 (low, high, neutral)
+    "postfx_sharpen":         (0, 100, 0),
+    "postfx_brightness":      (-50, 50, 0),
+    "postfx_contrast":        (50, 150, 100),
+    "postfx_saturation":      (0, 200, 100),
+    "postfx_gamma":           (50, 200, 100),
+    "postfx_temperature":     (-100, 100, 0),
+    "postfx_bloom":           (0, 100, 0),
+    "postfx_bloom_threshold": (0, 100, 70),
+    "postfx_vignette":        (0, 100, 0),
+    "postfx_grain":           (0, 100, 0),
+}
+POSTFX_NEUTRAL: dict[str, Any] = {
+    "postfx_aa": "off",
+    **{name: neutral for name, (_, _, neutral) in POSTFX_RANGES.items()},
+    "postfx_dedither": False,
+}
+
 REWIND_LEVELS = {
     "off":   None,          # PSX_REWIND=0; no snapshots taken at all
     "short": (50, 15),      # the runtime's own default, ~12.5 s at 60 Hz
@@ -129,12 +167,25 @@ RECOMMENDED_SUPERSAMPLING_60FPS = 2
 # warning rather than a clamp because it is GPU-dependent and a fast card may
 # well hold 4x - the player can see the live frame rate on the Play page.
 SUPERSAMPLING_60FPS_WARN_ABOVE = 3
+# Native 120 FPS draws twice the frames of 60, so the renderer runs out at a
+# lower internal resolution. Not measured yet; one step below the 60 FPS
+# warning is the cautious reading of the same measurement.
+RECOMMENDED_SUPERSAMPLING_120FPS = 2
+SUPERSAMPLING_120FPS_WARN_ABOVE = 2
 
 
-def recommended_supersampling(native_60fps: bool) -> int:
+def recommended_supersampling(native_60fps: bool,
+                              native_120fps: bool = False) -> int:
     """The internal-resolution multiple to recommend for a given cadence."""
+    if native_60fps and native_120fps:
+        return RECOMMENDED_SUPERSAMPLING_120FPS
     return (RECOMMENDED_SUPERSAMPLING_60FPS if native_60fps
             else RECOMMENDED_SUPERSAMPLING)
+
+
+def native_120fps_active(settings: "Settings") -> bool:
+    """120 is a refinement of 60: it only applies with 60 FPS on."""
+    return bool(settings.native_60fps and settings.native_120fps)
 
 
 @dataclass
@@ -247,6 +298,25 @@ class Settings:
     # Catmull-Rom path already in the present shader.
     present_filter: str = "bicubic"   # plain | sharp | bicubic
     antialiasing: bool = False
+
+    # --- post-processing (PSX_POSTFX, runtime gpu_postfx.h) -----------------
+    # Runs on the finished picture at screen resolution, after the downsample
+    # filter; the game's own menus are part of the picture, the launcher's
+    # overlays and the pause menu are not. POSTFX_RANGES has the bounds.
+    postfx_aa: str = "off"              # off | fxaa | smaa
+    postfx_sharpen: int = 0
+    postfx_brightness: int = 0
+    postfx_contrast: int = 100
+    postfx_saturation: int = 100
+    postfx_gamma: int = 100
+    postfx_temperature: int = 0
+    postfx_bloom: int = 0
+    postfx_bloom_threshold: int = 70
+    postfx_vignette: int = 0
+    postfx_grain: int = 0
+    # Soften the checkerboard dither painted into the game's textures. Applied
+    # where textures are sampled, so it also works with the chain above off.
+    postfx_dedither: bool = False
     geometry_correction: bool = False
     perspective_texturing: bool = False
 
@@ -280,6 +350,12 @@ class Settings:
     # frame time (17 ticks instead of 34). The launcher always pairs this with
     # 200% virtual PS1 CPU and Prefer 60; there are no separate tuning controls.
     native_60fps: bool = False
+    # Native 120 FPS (experimental), on top of native_60fps: the same open
+    # frame gate at twice the field rate (crash2_60fps.h). Physics runs every
+    # 120 Hz field, scripts keep the game's 30 Hz step and the music keeps
+    # its tempo. The runtime steps down to 60 by itself when a scene cannot
+    # hold 120. Frame interpolation is not used with it.
+    native_120fps: bool = False
     # SCUS-94154 assists. Opt-in, and they can change saved progression.
     cheat_infinite_lives: bool = False
     # "off", "keep_masks" or "no_damage". Two levels rather than two separate
@@ -448,6 +524,15 @@ class Settings:
             self.crt_filter = "raw"
         if self.present_filter not in ("plain", "sharp", "bicubic"):
             self.present_filter = "bicubic"
+        if self.postfx_aa not in POSTFX_AA_MODES:
+            self.postfx_aa = "off"
+        for name, (low, high, neutral) in POSTFX_RANGES.items():
+            try:
+                value = int(getattr(self, name))
+            except (TypeError, ValueError):
+                value = neutral
+            setattr(self, name, max(low, min(high, value)))
+        self.postfx_dedither = bool(self.postfx_dedither)
         if self.scaling_mode not in SCALING_MODES:
             self.scaling_mode = "letterbox"
         # Cropping more than a quarter of the frame is a mistake, not a setting.
@@ -617,6 +702,16 @@ def reset_diagnostics(settings: Settings) -> Settings:
 # Gameplay settings only - never diagnostics, so applying a preset can never
 # switch on something that degrades the game.
 # --------------------------------------------------------------------------
+# The enhanced presets add SMAA, which cleans the edges bicubic downsampling
+# leaves, and light contrast-adaptive sharpening to win back the crispness the
+# same downsample softens. Colour, bloom, vignette and grain stay neutral:
+# they are taste, not repair.
+POSTFX_ENHANCED: dict[str, Any] = {
+    **POSTFX_NEUTRAL,
+    "postfx_aa": "smaa",
+    "postfx_sharpen": 35,
+}
+
 PRESETS: dict[str, dict[str, Any]] = {
     "Authentic": {
         "supersampling": 1,
@@ -636,6 +731,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "overscan_bottom": 0,
         "geometry_correction": False,
         "perspective_texturing": False,
+        **POSTFX_NEUTRAL,
     },
     # A mild widescreen that fills the screen without throwing picture away.
     #
@@ -669,6 +765,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         # geometry pop-in and seam lines.
         "geometry_correction": False,
         "perspective_texturing": False,
+        **POSTFX_ENHANCED,
     },
     "Performance": {
         "supersampling": 2,
@@ -689,6 +786,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "overscan_bottom": 12,
         "geometry_correction": False,
         "perspective_texturing": False,
+        **POSTFX_NEUTRAL,
     },
     # The real widescreen hack: squash the GTE projection and stretch the
     # present, which genuinely widens the field of view. Kept because a wider
@@ -725,6 +823,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "overscan_bottom": 12,
         "geometry_correction": False,
         "perspective_texturing": False,
+        **POSTFX_ENHANCED,
     },
     "Widescreen (wider view)": {
         "supersampling": RECOMMENDED_SUPERSAMPLING,
@@ -745,6 +844,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "overscan_bottom": 0,
         "geometry_correction": False,
         "perspective_texturing": False,
+        **POSTFX_ENHANCED,
     },
 }
 
@@ -765,6 +865,24 @@ PRESET_NOTES: dict[str, str] = {
                                 "levels end at the 4:3 edge, so scenery can "
                                 "appear and vanish at the frame border."),
 }
+
+
+def postfx_string(settings: Settings) -> str:
+    """PSX_POSTFX for the runtime: only what differs from neutral.
+
+    "" when nothing is set, in which case the variable is not passed and the
+    runtime's chain does not run.
+    """
+    parts = []
+    if settings.postfx_aa != "off":
+        parts.append("aa=%s" % settings.postfx_aa)
+    for name, (_, _, neutral) in POSTFX_RANGES.items():
+        value = int(getattr(settings, name))
+        if value != neutral:
+            parts.append("%s=%d" % (name[len("postfx_"):], value))
+    if settings.postfx_dedither:
+        parts.append("dedither=1")
+    return ";".join(parts)
 
 
 def apply_preset(settings: Settings, name: str) -> Settings:

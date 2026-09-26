@@ -2813,3 +2813,150 @@ directions are not offered as sources, because the runtime ignores them as
 buttons whenever the pad presents as analog. And the deadzone is written to
 settings.toml, not input.ini: the runtime applies settings.toml's value over
 input.ini's right after reading it.
+
+## 60 FPS, part 17: what grows with the square of the internal scale
+
+Goal: 5x internal resolution holding 60. Part 10 measured 5x missing a third of
+its presents while the game itself kept up, and frame_perf at 5x put the scene
+at 13.8 ms of GPU time in a 16.7 ms frame. On an RTX 5070, 5x is 5120x2560 -
+13 Mpx, small as plain fill at 60 Hz - so the miss points at work done at
+full-surface size per event, or at the CPU waiting for the GPU, both of which
+grow with S squared. None of it had a release-build counter.
+
+**Counters (patch 0038).** `PSX_GPU_PERF=1` (the launcher's performance
+diagnostic sets it) enables the GL timer queries in release builds, and the
+heartbeat gains a `gl` object: presents and swap time, batches and batch
+breaks by reason, stencil rebuilds and their pixels, synchronous readbacks,
+skipped ones and their wait, hold copies, pack pixels, and GPU scene/present
+time. `tuning/scripts/scale_bench.py --seconds 20 --label 5x` turns a window
+of it into per-second rates and a verdict, appended to
+`tuning/runs/scale_bench.jsonl`.
+
+**Fixes (patch 0039).**
+
+- Mask stencil rebuilds were full-surface: every mask-check-on edge after
+  unmasked draws blitted and redrew all 1024S x 512S and every native-wide
+  surface - 13 Mpx twice per surface at 5x for a 320x240 band. They now cover
+  only the rect the invalidating batches drew (one pixel of guard), and the
+  same rows on the wide surfaces.
+- Guest VRAM reads (GP0 C0h, DMA from VRAM) went through a synchronous
+  `glReadPixels` whenever any pixel had been drawn since the last readback,
+  paying the whole frame's GPU time on the emulation thread. VRAM is now
+  tracked GPU-dirty per 64x64 tile; a read that touches no GPU-written tile
+  is served from the CPU copy. `gl.sync_skips` counts them.
+- Opt-in for A/B only: `PSX_GL_SEMI_BATCH=1` lets consecutive semi-transparent
+  prims share a draw.
+
+Not changed: the hold-last copy per present is window-sized, not S-sized.
+
+**Status: not measured in play yet.** Run `scale_bench.py` at 1x, 3x and 5x
+with 60 FPS on. Until those numbers exist the launcher keeps recommending 2x
+at 60 and warning above 3x.
+
+## Post-processing (part 18)
+
+Patch 0040. A chain on the finished picture at output resolution, after the
+present filter and bezel, before the OSD and menus: SMAA 1x or FXAA, CAS
+sharpening, bloom (5-level dual-filter chain in RGBA16F, normalised by level
+count - at 100% it washed the picture out before that), then brightness,
+contrast, saturation, gamma, temperature, vignette, grain and an 8-bit output
+dither. It hooks the three draws of the game image into the window (VRAM and
+hold-last presents, frame blending, the CPU/FMV path) and works top row first,
+the orientation SMAA's tables assume and the one D3D12 uses. With nothing set
+the renderer draws exactly as before.
+
+Texture dedither is a separate `TEX_FS` pass: with nearest sampling, a texel
+within 2.5/31 of its neighbours' mean, whose opposite neighbours agree, is
+pulled halfway to it - the checkerboard painted into texture art, not the
+output. The renderer itself draws in true colour and never had the PS1 dither
+matrix.
+
+Launcher: Settings > Video > Post-processing, a reset button, Enhanced preset
+= SMAA + CAS 35, Authentic = off. The pause menu's POST FX row switches it
+for the session, for an A/B by eye. Checked offline on the target driver:
+every program compiles, neutral settings reproduce the input exactly.
+
+## Direct3D 12 (part 19)
+
+Patch 0041. Not a second renderer: `gpu_gl_renderer.c` and `gpu_gl_postfx.c`
+are compiled a second time with every GL call redirected to a GL-subset layer
+on Direct3D 12 (`gpu_gl12.cpp`), so batching, mask, semi-transparency, the
+wide compositor, interpolation, hold-last and post-processing are the same
+code on both APIs and stay that way. Row r of a GL surface is row r of the
+D3D12 resource (vertex shaders negate y); framebuffer 0 is an offscreen
+texture flipped into a flip-discard swap chain. GLSL is matched by hash to
+hand-written HLSL, compiled once by `d3dcompiler_47` and cached. An unknown
+GLSL source refuses to start rather than draw wrong, and
+`tuning/tests/gl12_shaders_check.py` catches it first.
+
+Launcher: renderer "Direct3D 12 (experimental)". If it cannot start, the
+window is recreated for OpenGL and the game runs there.
+
+Parity (`tuning/renderer_parity`, both compilations driven with one PS1
+command stream): read-back VRAM bit-identical to OpenGL at 1x-5x; every
+present path (4:3, letterbox + bezel, CPU/FMV, hold-last, native-wide, blank)
+byte-identical; async readback equal to sync; SMAA/FXAA/CAS/dedither
+identical, bloom and grade within 1/255; the debug layer reports nothing.
+Recording costs about 0.5 ms per 1500 prims against 0.25 ms on GL in a hidden
+window. That timing is noisy and is not a verdict on play.
+
+## 120 FPS, part 20: the same gate at twice the field rate
+
+Patch 0042, experimental and opt-in (launcher: "120 FPS (experimental)" under
+60 FPS game updates; env `PSX_CRASH2_FPS=120`).
+
+**Feasibility, from the executable.**
+
+- The quantizer rounds any frame under 19 ticks up to 17. A 120 Hz field is
+  8.62 ticks, so left alone every field would be simulated as a 60 Hz one -
+  double speed.
+- `VSync(n >= 2)` appears only outside the 3D loop: VSync(60)/(20) at
+  0x80034AC4, VSync(20) at 0x80035444, VSync(5) x4 at 0x80036164. The loop
+  itself uses VSync(0). The library calls are VSync(-1) timeouts.
+- Music: the plan assumed libsnd's tick sat in libetc's VSync callback table.
+  It does not. `SsSetTickMode(1)` becomes mode 5 (VSync ticks) on NTSC, and
+  `SsStart(1)` takes the root-counter-3 path. That chains the tick behind the
+  VBlank handler (0x80054E74 calls the displaced handler, then
+  `[0x8005EFE0]`). libsnd's own half-rate wrapper (0x80054EB4) cannot be used
+  there, because it calls `[0x8005EFE0]` itself.
+
+**Design.** VBlank at 120 Hz while the loop turns
+(`interrupts_set_vblank_divisor`). At the top of each loop `[DB_CUR]+20` is
+replaced by the frame's length in fields (from the game's own stamps) times
+8.5 ticks, carried as half-ticks: 8 and 9 alternately, 17 a pair, the 60 Hz
+timeline. The VBlank edge alternates `[0x8005EFE0]` between the tick and an
+unreferenced empty function (0x80016EFC), so music keeps its tempo. Twelve
+fields without a loop (a load) drop VBlank back to NTSC from the edge itself.
+Scripts need nothing: the 0036 pacing accumulates ticks and steps every
+fourth field. The clock is 400% with VSync's timeout widened x4. A window that
+fails at 120 steps down to 60 with the gate open, then retries after 10 s,
+20 s and 40 s.
+
+**The simulator's catch.** `tuning/native120_sim` drives `crash2_60fps.h`
+with a model of VBlank, root counter 2, the frame end and libsnd's chain,
+running over the real executable. It found a design error before anything
+shipped. Stepping down to 60 restored 60's 200% clock, but 120 at 400% and 60
+at 200% give a frame the same instruction budget (282,240 x 4 = 564,480 x 2).
+So a step-down could never rescue a scene that missed its field: it fell
+through to 30. With 120 asked for, the clock now stays at 400% at 60 too.
+
+Modelled results (all checks pass):
+
+| Case | Result |
+|---|---|
+| Engaged at 120 | 120 loops/s, ticks 8..9, physics 1020 ticks/s (17 x 60, the stock timeline), music 60 ticks/s, scripts 30 steps/s |
+| A 330 ms loop-less stretch | NTSC after 12 fields, tempo intact, re-armed after 4 quick loops |
+| A scene of 375k cycles | Steps down to 60 and holds it on 17-tick frames. Retries after 10 s and falls back again. The gate never closes. |
+| Three-field frames | 25/26 ticks, 25.5 on average |
+| Mode off | Every word, the clock and the VBlank rate restored |
+
+**Not verifiable offline:**
+
+- Physics on 8/9-tick steps. Fixed-point truncation happens twice as often.
+- Any per-loop logic that is not tick-scaled. It would run twice as fast as
+  at 60, where it looked right.
+- Pacing on a real 120/144 Hz panel.
+
+To test: the Play page says "120 FPS: holding" or why it stepped down. On the
+debug-tools build, run
+`gameplay_smoke.py --scenario tuning/scenarios/native120_hold.json`.

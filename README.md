@@ -65,6 +65,21 @@ the list and still works in the game. Names are positions: A is the bottom
 face button on every pad, Cross on a PlayStation controller. The stick deadzone
 is set there too.
 
+## Video
+
+**Settings > Video** sets internal resolution, aspect and output, and has a
+**Post-processing** card: anti-aliasing (FXAA or SMAA), sharpening, colour
+controls, bloom, vignette, film grain, and *Smooth dithered art*, which
+softens the checkerboard dithering painted into many textures. The Authentic
+preset leaves all of it off; Enhanced turns on SMAA and light sharpening. The
+Home menu's **POST FX** row switches it on and off while you play, so you can
+compare.
+
+The renderer is OpenGL by default. **Direct3D 12 (experimental)** draws the
+same picture through Direct3D 12 - the same renderer built for the other
+API - for systems whose OpenGL driver misbehaves. If it cannot start, the log
+says so and the game runs on OpenGL.
+
 ## Mods
 
 The **Mods** page lists what is installed, switches individual features on and
@@ -109,6 +124,15 @@ time inside the frame.
 
 If something behaves strangely, turn it off and see whether the problem goes
 away - that is a useful thing to report. It changes timing, not saved data.
+
+**120 FPS (experimental)** sits under the 60 FPS switch and needs it on. It
+runs the game loop at 120: physics every 120 Hz refresh, while scripted
+animation and music keep their normal speed. It is only worth it on a 120 Hz
+or faster display. It runs the emulated processor at 400% and turns frame
+interpolation off. When a scene cannot hold 120 it steps down to 60 by
+itself and tries again later, and the Play page says which it is doing. How
+the physics behaves at 120 across whole levels has not been verified - if
+something moves or collides strangely, compare with it off.
 
 The same page offers **Keep 99 lives** and a **Damage** setting with three
 positions, all off by default:

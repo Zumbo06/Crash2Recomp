@@ -19,7 +19,8 @@ SETTING_KEYS = (
     "window_width", "window_height", "supersampling", "vsync",
     "frame_interpolation", "frame_interpolation_fps", "frame_blend",
     "audio_latency_ms", "audio_hq", "developer_mode", "fast_loading",
-    "native_60fps",
+    "native_60fps", "native_120fps",
+    "postfx_aa", "postfx_sharpen", "postfx_bloom", "postfx_dedither",
     # Assists can change saved progression, so a report that cannot show
     # whether they were on cannot tell "the game broke my save" from "I had
     # assists enabled".
@@ -50,9 +51,19 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   # profile (recompprofile.py) and needs rebuilding.
                   "native_60fps_script_hz", "native_60fps_script_hooked",
                   "native_60fps_physics_fields",
+                  # Native 120 FPS: what the setting asks for, the field
+                  # rate actually running, and why they differ - fallbacks
+                  # are windows that failed at 120, stalls loads.
+                  "native_fps_target", "native_fps_field_hz",
+                  "native_120fps_engaged", "native_120fps_fallbacks",
+                  "native_120fps_stalls", "native_120fps_latched",
                   # Rewind captures by path: sync ones stalled on the GPU
                   # (the periodic dip in the 1% lows before patch 0037).
                   "rewind_async_captures", "rewind_sync_captures",
+                  # GL renderer cost totals (patch 0038): swap / sync waits and
+                  # full-surface work, the numbers behind a FAIL_HOST verdict.
+                  # Counters and the internal scale only - nothing private.
+                  "gl",
                   "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",
@@ -98,9 +109,18 @@ def sixty_fps_sample(heartbeat_path: Path) -> dict | None:
               "native_60fps_one_field_pct", "native_60fps_backoffs",
               "native_60fps_cpu_now", "native_60fps_vsync_wide",
               "native_60fps_script_hz", "native_60fps_script_hooked",
-              "game_frame_ticks")
+              "game_frame_ticks", "native_fps_target", "native_fps_field_hz",
+              "native_120fps_fallbacks", "native_120fps_latched")
     return {key: source[key] for key in wanted
             if isinstance(source.get(key), int)}
+
+
+def _rate_label(sample: dict) -> str:
+    """"120 FPS" while the runtime is at 120, otherwise "60 FPS"."""
+    if (sample.get("native_fps_target") == 120
+            and sample.get("native_fps_field_hz") == 120):
+        return "120 FPS"
+    return "60 FPS"
 
 
 def sixty_fps_summary(sample: dict | None) -> tuple[str, str] | None:
@@ -125,15 +145,29 @@ def sixty_fps_summary(sample: dict | None) -> tuple[str, str] | None:
                 "60 FPS: the CPU clock is raised but VSync's timeout was not "
                 "widened to match. Please report this with the Log page's "
                 "diagnostic export.")
+    label = _rate_label(sample)
+    # Asked for 120 and running 60: the runtime stepped down by itself.
+    if (sample.get("native_fps_target") == 120
+            and sample.get("native_fps_field_hz") == 60):
+        if sample.get("native_120fps_latched") == 1:
+            return ("Warn",
+                    "120 FPS: this scene kept missing 120, so it stays at 60 "
+                    "until the next load or menu.")
+        fallbacks = sample.get("native_120fps_fallbacks", 0)
+        if isinstance(fallbacks, int) and fallbacks > 0:
+            return ("Warn",
+                    "120 FPS: stepped down to 60 for now and retries by "
+                    "itself. If it keeps happening, lower Internal "
+                    "resolution on the Video page.")
     if verdict == VERDICT_FAIL_HOST:
         return ("Warn",
-                "60 FPS: this machine is behind on DRAWING the frames. Lower "
-                "Internal resolution on the Video page - the game itself is "
-                "keeping up.")
+                f"{label}: this machine is behind on DRAWING the frames. "
+                "Lower Internal resolution on the Video page - the game "
+                "itself is keeping up.")
     if verdict == VERDICT_FAIL_HOLD:
         note = "" if held is None else f" - {held}% of frames fitted"
         return ("Warn",
-                f"60 FPS: some frames in this scene need longer than one "
+                f"{label}: some frames in this scene need longer than one "
                 f"refresh{note}. Internal resolution will not change this.")
     if verdict == VERDICT_OK:
         note = "" if held is None else f" ({held}% of frames)"
@@ -144,7 +178,7 @@ def sixty_fps_summary(sample: dict | None) -> tuple[str, str] | None:
             hz = sample.get("native_60fps_script_hz")
             if isinstance(hz, int) and hz > 0:
                 scripts = f", game logic at {hz}/s"
-        return ("Ok", f"60 FPS: holding{note}{scripts}.")
+        return ("Ok", f"{label}: holding{note}{scripts}.")
     return None
 
 

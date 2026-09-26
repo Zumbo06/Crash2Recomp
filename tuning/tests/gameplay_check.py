@@ -161,9 +161,10 @@ class Native60ScenarioTests(unittest.TestCase):
         module.run(client, {**self.BASE, "name": "on", "native_60fps": True,
                             "cpu_percent": 130}, timeout=1)
         sets = [args for name, args in calls if name == "crash2_60fps"]
-        self.assertEqual(sets[0], {"enabled": 1, "cpu_percent": 130})
-        # Restored no matter how the route ended.
-        self.assertEqual(sets[-1], {"enabled": 0})
+        self.assertEqual(sets[0], {"enabled": 1, "cpu_percent": 130,
+                                   "fps": 60, "cpu_percent_120": 400})
+        # Restored no matter how the route ended - 120 included.
+        self.assertEqual(sets[-1], {"enabled": 0, "fps": 60})
 
     def test_engine_frame_time_is_asserted_not_just_the_loop_rate(self):
         # 60 loops a second while the engine still scales motion by two fields
@@ -213,13 +214,85 @@ class Native60ScenarioTests(unittest.TestCase):
         sets = [args for name, args in calls if name == "crash2_cheats" and args]
         self.assertEqual(sets[0], {"lives": 0, "aku": 0})
 
+    FAST = {**MODERN, "native_fps_target": 120, "native_fps_field_hz": 120,
+            "native_120fps_fallbacks": 0, "native_120fps_stalls": 0}
+
+    def test_120_needs_60(self):
+        with self.assertRaises(ValueError):
+            module.validate_scenario({**self.BASE, "native_120fps": True})
+        module.validate_scenario({**self.BASE, "native_60fps": True,
+                                  "native_120fps": True,
+                                  "expected_game_frame_ticks": 8})
+
+    def test_a_runtime_without_120_is_refused(self):
+        client, _ = self._client({**self.MODERN, "game_loop_steps": 59,
+                                  "speed": 1.0, "game_frame_ticks": 17})
+        with self.assertRaises(RuntimeError) as caught:
+            module.run(client, {**self.BASE, "name": "old",
+                                "native_60fps": True,
+                                "native_120fps": True}, timeout=1)
+        self.assertIn("native 120", str(caught.exception))
+
+    def test_120_is_set_and_always_restored(self):
+        client, calls = self._client({**self.FAST, "game_loop_steps": 119,
+                                      "speed": 1.0, "game_frame_ticks": 9})
+        module.run(client, {**self.BASE, "name": "fast", "native_60fps": True,
+                            "native_120fps": True, "cpu_percent": 200,
+                            "cpu_percent_120": 300}, timeout=1)
+        sets = [args for name, args in calls if name == "crash2_60fps"]
+        self.assertEqual(sets[0], {"enabled": 1, "cpu_percent": 200,
+                                   "fps": 120, "cpu_percent_120": 300})
+        self.assertEqual(sets[-1], {"enabled": 0, "fps": 60})
+
+    def test_holding_120_passes(self):
+        client, _ = self._client({**self.FAST, "game_loop_steps": 119.5,
+                                  "speed": 0.99, "game_frame_ticks": 8,
+                                  "native_60fps_one_field_pct": 96,
+                                  "native_60fps_script_steps": 29.9,
+                                  "native_60fps_script_hooked": 1})
+        result = module.run(client, {**self.BASE, "name": "holds",
+                                     "native_60fps": True,
+                                     "native_120fps": True,
+                                     "expected_game_loop_hz": [110, 122],
+                                     "expected_field_hz": 120,
+                                     "expected_script_hz": [27, 33],
+                                     "min_one_field_pct": 90,
+                                     "min_speed": 0.95,
+                                     "max_fast_fallbacks": 0}, timeout=1)
+        self.assertTrue(result["passed"], result["failures"])
+
+    def test_stepping_down_to_60_fails_a_120_route(self):
+        # Asked for 120, stepped down: a loop rate near 60 at full speed is a
+        # perfectly good 60 FPS run, and exactly what a 120 scenario rejects.
+        rates = {**self.FAST, "game_loop_steps": 59.8, "speed": 1.0,
+                 "game_frame_ticks": 17, "native_fps_field_hz": 60}
+        client, _ = self._client(rates)
+        result = module.run(client, {**self.BASE, "name": "down",
+                                     "native_60fps": True,
+                                     "native_120fps": True,
+                                     "expected_field_hz": 120}, timeout=1)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failures"][0]["field_hz"], 60)
+
+    def test_fast_fallbacks_are_counted_over_the_route_only(self):
+        client, _ = self._client({**self.FAST, "game_loop_steps": 119,
+                                  "speed": 1.0, "game_frame_ticks": 9,
+                                  "native_120fps_fallbacks": 3})
+        result = module.run(client, {**self.BASE, "name": "quiet",
+                                     "native_60fps": True,
+                                     "native_120fps": True,
+                                     "max_fast_fallbacks": 0}, timeout=1)
+        self.assertTrue(result["passed"], result["failures"])
+
     def test_scenario_rejects_impossible_frame_time(self):
         # 200 is the shipping clock since the cap was raised (NOTES part 11);
         # the first value past C2_60_CPU_CAP is what must be refused.
         for bad in ({"expected_game_frame_ticks": 20}, {"cpu_percent": 201},
                     {"min_speed": 2}, {"min_one_field_pct": 101},
                     {"cheat_aku": 3}, {"cheat_aku": -1},
-                    {"expected_script_hz": [40, 20]}, {"expected_script_hz": [27]}):
+                    {"expected_script_hz": [40, 20]}, {"expected_script_hz": [27]},
+                    {"cpu_percent_120": 401}, {"cpu_percent_120": 99},
+                    {"expected_field_hz": 90}, {"expected_game_frame_ticks": 10}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 module.validate_scenario({**self.BASE, **bad})
 

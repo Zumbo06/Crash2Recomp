@@ -1,0 +1,26 @@
+{
+  "name": "native120-holds-120",
+  "require_game_loop": true,
+  "native_60fps": true,
+  "native_120fps": true,
+  "cpu_percent": 200,
+  "cpu_percent_120": 400,
+  "expected_game_loop_hz": [
+    110,
+    122
+  ],
+  "expected_field_hz": 120,
+  "expected_script_hz": [
+    27,
+    33
+  ],
+  "min_one_field_pct": 90,
+  "min_speed": 0.95,
+  "max_fast_fallbacks": 0,
+  "steps": [
+    {
+      "frames": 600,
+      "buttons": "0xFFFF"
+    }
+  ]
+}

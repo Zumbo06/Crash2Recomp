@@ -32,14 +32,20 @@ from ..config import (
     ASPECTS,
     MAX_SUPERSAMPLING,
     OUTPUT_RESOLUTIONS,
+    POSTFX_NEUTRAL,
+    POSTFX_RANGES,
     PRESET_NOTES,
     PRESETS,
     RECOMMENDED_SUPERSAMPLING_60FPS,
+    RECOMMENDED_SUPERSAMPLING_120FPS,
+    RENDERER_LABELS,
     SELECTABLE_RENDERERS,
     SUPERSAMPLING_60FPS_WARN_ABOVE,
+    SUPERSAMPLING_120FPS_WARN_ABOVE,
     Settings,
     apply_preset,
     matching_preset,
+    native_120fps_active,
 )
 from .common import card, dim, heading, row, section, warn
 from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
@@ -214,6 +220,20 @@ def _native_resolution() -> tuple[int, int] | None:
     return None
 
 
+POSTFX_AA_ITEMS = [
+    ("Off", "off"),
+    ("FXAA - fastest, slightly soft", "fxaa"),
+    ("SMAA - sharper edges", "smaa"),
+]
+
+
+def _postfx_label(name: str, value: int) -> str:
+    """How a post-processing slider reads: signed for offsets, else percent."""
+    if name in ("postfx_brightness", "postfx_temperature"):
+        return "%+d" % value if value else "0"
+    return "%d%%" % value
+
+
 class SettingsPage(QWidget):
     changed = Signal()
 
@@ -309,10 +329,16 @@ class SettingsPage(QWidget):
 
     # -- sections ----------------------------------------------------------
     def _display_page(self) -> QWidget:
-        self.renderer = QComboBox()
-        self.renderer.addItems(SELECTABLE_RENDERERS)
-        self.renderer.setCurrentText(self.settings.renderer)
-        self.renderer.currentTextChanged.connect(self._on_renderer)
+        self.renderer = self._combo(
+            [(RENDERER_LABELS.get(r, r), r) for r in SELECTABLE_RENDERERS],
+            self.settings.renderer, self._on_renderer)
+        self.renderer.setToolTip(
+            "OpenGL is the default and the most tested.\n\n"
+            "Direct3D 12 is the same renderer running on Direct3D 12 - every "
+            "feature works the same way. Try it if OpenGL stutters or misbehaves "
+            "on your driver. If it cannot start, the game falls back to OpenGL "
+            "by itself.\n\n"
+            "Software is the reference rasterizer: slow, native resolution only.")
 
         self.scale = QComboBox()
         for n in range(1, MAX_SUPERSAMPLING + 1):
@@ -428,6 +454,7 @@ class SettingsPage(QWidget):
                 row("CRT filter", self.crt),
                 self.aa,
             ),
+            self._postfx_card(),
             card(
                 section("Framing"),
                 row("Zoom", self.present_zoom),
@@ -621,6 +648,10 @@ class SettingsPage(QWidget):
         self.native_60fps.setChecked(self.settings.native_60fps)
         self.native_60fps.toggled.connect(self._on_native_60fps)
 
+        self.native_120fps = QCheckBox("120 FPS (experimental)")
+        self.native_120fps.setChecked(self.settings.native_120fps)
+        self.native_120fps.toggled.connect(self._on_native_120fps)
+
 
         self.cheat_infinite_lives = QCheckBox("Keep 99 lives")
         self.cheat_infinite_lives.setChecked(self.settings.cheat_infinite_lives)
@@ -663,6 +694,14 @@ class SettingsPage(QWidget):
                     "timing across the whole game are not yet validated. It "
                     "runs the emulated PS1 CPU at 200%; your physical CPU is "
                     "not overclocked. Relaunch to apply."),
+                self.native_120fps,
+                dim("Runs the game's own loop at 120 on top of 60 FPS: "
+                    "physics every 120 Hz refresh, game logic and music at "
+                    "their normal speed. Worth it only on a 120 Hz or "
+                    "faster display. It steps down to 60 by itself when a "
+                    "scene cannot hold 120, uses 400% virtual PS1 CPU, and "
+                    "turns frame interpolation off. Experimental - physics "
+                    "at 120 has not been validated across the game."),
                 dim("Keep native level-code compilation on, below. With it off "
                     "every level function runs interpreted and almost nothing "
                     "will hold 60."),
@@ -697,6 +736,81 @@ class SettingsPage(QWidget):
             ),
         )
 
+    def _postfx_card(self) -> QWidget:
+        self._postfx_values: dict[str, QLabel] = {}
+        self.postfx_aa = self._combo(POSTFX_AA_ITEMS, self.settings.postfx_aa,
+                                     self._on_postfx_aa)
+        self.postfx_dedither = QCheckBox("Smooth dithered textures")
+        self.postfx_dedither.setChecked(self.settings.postfx_dedither)
+        self.postfx_dedither.toggled.connect(self._on_postfx_dedither)
+        reset = QPushButton("Reset post-processing")
+        reset.clicked.connect(self._reset_postfx)
+        return card(
+            section("Post-processing"),
+            dim("Applied to the finished picture at your screen's resolution, "
+                "after the downsample filter. The pause menu (POST FX) turns "
+                "it off and on in-game for a before/after comparison. "
+                "Everything at its default costs nothing."),
+            row("Edge smoothing", self.postfx_aa),
+            row("Sharpening", self._postfx_slider("postfx_sharpen")),
+            row("Brightness", self._postfx_slider("postfx_brightness")),
+            row("Contrast", self._postfx_slider("postfx_contrast")),
+            row("Saturation", self._postfx_slider("postfx_saturation")),
+            row("Gamma", self._postfx_slider("postfx_gamma")),
+            row("Colour temperature", self._postfx_slider("postfx_temperature")),
+            row("Bloom", self._postfx_slider("postfx_bloom")),
+            row("Bloom threshold", self._postfx_slider("postfx_bloom_threshold")),
+            row("Vignette", self._postfx_slider("postfx_vignette")),
+            row("Film grain", self._postfx_slider("postfx_grain")),
+            self.postfx_dedither,
+            dim("PS1 artists often painted a checkerboard dither into "
+                "textures to hide 15-bit colour banding on a CRT. This "
+                "softens it where "
+                "neighbouring texels differ by a shade or two and leaves real "
+                "detail - edges, lines, text - alone. The renderer already "
+                "draws shading in full colour, without the PS1's own dither."),
+            reset,
+        )
+
+    def _postfx_slider(self, name: str) -> QWidget:
+        low, high, _neutral = POSTFX_RANGES[name]
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(low, high)
+        slider.setValue(int(getattr(self.settings, name)))
+        value = QLabel()
+        value.setMinimumWidth(44)
+        value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        value.setText(_postfx_label(name, slider.value()))
+        slider.valueChanged.connect(
+            lambda v, n=name, lbl=value: self._on_postfx_value(n, v, lbl))
+        setattr(self, name, slider)
+        self._postfx_values[name] = value
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(slider, 1)
+        lay.addWidget(value)
+        return box
+
+    def _on_postfx_value(self, name: str, value: int, label: QLabel) -> None:
+        label.setText(_postfx_label(name, value))
+        setattr(self.settings, name, value)
+        self._touch(debounce=True)
+
+    def _on_postfx_aa(self, index: int) -> None:
+        self.settings.postfx_aa = self.postfx_aa.itemData(index)
+        self._touch()
+
+    def _on_postfx_dedither(self, on: bool) -> None:
+        self.settings.postfx_dedither = on
+        self._touch()
+
+    def _reset_postfx(self) -> None:
+        for name, value in POSTFX_NEUTRAL.items():
+            setattr(self.settings, name, value)
+        self._rebuild_from_settings()
+        self._touch()
+
     # -- helpers -----------------------------------------------------------
     def _combo(self, items, current, handler) -> QComboBox:
         box = QComboBox()
@@ -727,10 +841,20 @@ class SettingsPage(QWidget):
             "" if windowed
             else "Fullscreen always uses the desktop resolution.")
 
-        on = self.settings.frame_interpolation
+        fast = native_120fps_active(self.settings)
+        self.interp.setEnabled(not fast)
+        self.interp.setToolTip(
+            "Not used with 120 FPS game updates." if fast else "")
+        on = self.settings.frame_interpolation and not fast
         self.interp_fps.setEnabled(on)
         self.interp_fps.setToolTip(
             "" if on else "Enable frame interpolation to choose a target.")
+
+        # 120 refines 60; it cannot apply on its own.
+        sixty = self.settings.native_60fps
+        self.native_120fps.setEnabled(sixty)
+        self.native_120fps.setToolTip(
+            "" if sixty else "Turn on 60 FPS game updates first.")
 
     def _refresh_preset_label(self) -> None:
         name = matching_preset(self.settings)
@@ -755,7 +879,9 @@ class SettingsPage(QWidget):
         self.pad_bindings.refresh()
         self.pad_deadzone.setValue(self.settings.pad_deadzone)
         self._refresh_scale_warning()
-        self.renderer.setCurrentText(self.settings.renderer)
+        idx = self.renderer.findData(self.settings.renderer)
+        if idx >= 0:
+            self.renderer.setCurrentIndex(idx)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
         self.aspect.setCurrentText(self.settings.aspect)
         for box, value in (
@@ -770,6 +896,7 @@ class SettingsPage(QWidget):
             (self.vsync, self.settings.vsync),
             (self.interp_fps, self.settings.frame_interpolation_fps),
             (self.cheat_aku_aku, self.settings.cheat_aku_aku),
+            (self.postfx_aa, self.settings.postfx_aa),
         ):
             idx = box.findData(value)
             if idx >= 0:
@@ -779,7 +906,11 @@ class SettingsPage(QWidget):
         self.persp.setChecked(self.settings.perspective_texturing)
         self.interp.setChecked(self.settings.frame_interpolation)
         self.native_60fps.setChecked(self.settings.native_60fps)
+        self.native_120fps.setChecked(self.settings.native_120fps)
         self.cheat_infinite_lives.setChecked(self.settings.cheat_infinite_lives)
+        for name in POSTFX_RANGES:
+            getattr(self, name).setValue(int(getattr(self.settings, name)))
+        self.postfx_dedither.setChecked(self.settings.postfx_dedither)
         self._loading = False
         self._sync_dependent_controls()
         self._refresh_preset_label()
@@ -798,8 +929,8 @@ class SettingsPage(QWidget):
         self.changed.emit()
 
     # -- handlers ----------------------------------------------------------
-    def _on_renderer(self, value: str) -> None:
-        self.settings.renderer = value
+    def _on_renderer(self, index: int) -> None:
+        self.settings.renderer = self.renderer.itemData(index)
         self._touch()
 
     def _refresh_scale_warning(self) -> None:
@@ -813,10 +944,19 @@ class SettingsPage(QWidget):
         """
         if not hasattr(self, "scale_warning"):
             return
+        fast = native_120fps_active(self.settings)
+        limit = (SUPERSAMPLING_120FPS_WARN_ABOVE if fast
+                 else SUPERSAMPLING_60FPS_WARN_ABOVE)
         too_high = (self.settings.native_60fps
-                    and self.settings.supersampling
-                    > SUPERSAMPLING_60FPS_WARN_ABOVE)
-        if too_high:
+                    and self.settings.supersampling > limit)
+        if too_high and fast:
+            self.scale_warning.setText(
+                "<b>At 120 FPS this is likely to cost you frames.</b> "
+                "The renderer draws twice as many frames as at 60, and "
+                "when it cannot keep up the game steps down to 60. Try "
+                "%dx, and watch the readout on the Play page."
+                % RECOMMENDED_SUPERSAMPLING_120FPS)
+        elif too_high:
             self.scale_warning.setText(
                 "<b>At 60 FPS this is likely to cost you frames.</b> "
                 "%dx was measured missing about a third of its presents while "
@@ -933,6 +1073,11 @@ class SettingsPage(QWidget):
 
     def _on_native_60fps(self, on: bool) -> None:
         self.settings.native_60fps = on
+        self._refresh_scale_warning()
+        self._touch()
+
+    def _on_native_120fps(self, on: bool) -> None:
+        self.settings.native_120fps = on
         self._refresh_scale_warning()
         self._touch()
 

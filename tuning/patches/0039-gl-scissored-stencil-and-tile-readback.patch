@@ -1,0 +1,394 @@
+GL renderer: stop paying the internal scale squared for mask rebuilds and reads.
+
+Two things the GL backend did at full-surface size, or while waiting for the
+GPU, independent of how much of the frame actually needed it. Both cost
+grows with the internal scale S squared, which is the shape of the one 5x
+measurement on record (60 FPS: 2,580 presents for 3,823 VBlanks at 5x, clean
+at 2x; frame_perf at 5x: scene GPU 13.8 ms of a 16.7 ms frame).
+
+1. Mask stencil rebuild, scissored.
+   Opaque and dual-source textured batches without set-mask skip their
+   stencil encoding (alpha is exact; the stencil copy is only needed once the
+   game turns mask CHECKING on). When it does, rebuild_mask_stencils
+   re-derived the stencil from alpha over the whole 1024S x 512S surface and
+   again over every native-wide surface: a blit plus a full-screen stencil
+   draw, per surface, per E6h check-on edge. At 5x that is 13 Mpx twice per
+   surface, for a drawn band of 320x240 (1.9 Mpx at 5x).
+   Now each such batch adds its vertex bbox (one pixel of guard, clipped to
+   the draw area it is scissored to) to s_stencil_dirty, and the rebuild
+   blits and redraws only that rect on the hr surface, and the same rows at
+   full width on the wide surfaces (the mirror moves X - the backdrop stretch
+   can reach any column - but never Y, and uses the same Y scissor). An unset
+   rect with the stencil invalid still means everything, as before.
+
+2. Guest VRAM reads wait for the GPU only when they need to.
+   glb_vram_transfer_out (GP0 C0h / DMA from VRAM) and glb_vram_read went
+   through ensure_cpu whenever ANY pixel had been drawn by the GPU since the
+   last readback: flush, pack, and a synchronous glReadPixels that waits for
+   everything queued - the frame's GPU time, paid on the emulation thread.
+   s_gpu_dirty is now backed by a 16x8 map of 64x64-pixel tiles, marked by
+   every GPU write to canonical VRAM (prims, fills incl. wrapped segments,
+   copies; one pixel of guard) and cleared with it. A read whose rect
+   (wrapping like the PS1) touches no GPU-written tile is served from s_vram,
+   which is exact there because CPU uploads land in it first; otherwise it
+   reads back exactly as before. Whole-VRAM consumers (display render,
+   screenshots, 24-bit scanout, shutdown) are unchanged. The heartbeat's
+   gl.sync_skips counts the reads that no longer wait.
+
+Also, opt-in for A/B only: PSX_GL_SEMI_BATCH=1 lets consecutive dual-source
+semi-transparent textured prims (modes 0/1/3, mask check off) share one draw
+instead of one draw each. Fixed-function blending inside a draw is applied in
+primitive order and each fragment chooses opaque vs blended itself, so only
+opaque/semi interleaving needs the split, which the batch key already makes.
+Default off until gl.semi_isolated and a visual check justify it.
+
+Not changed: the hold-last copy of the drawable on every present is window
+sized (2560x1440 = 3.7 Mpx), not scaled by S.
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -455,6 +455,63 @@ static GLint s_uStencilSrc = -1;
+ 
+ static uint32_t     *s_conv = NULL;        /* RGBA8 staging for uploads      */
+ static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
++/* ...and where: GPU-written 64x64-pixel tiles not yet read back into s_vram,
++ * bit tx of s_gd_rows[ty]. A guest VRAM read that touches none of them is
++ * already correct in s_vram and must not wait for the GPU (glb_vram_transfer_
++ * out / glb_vram_read). Whole-VRAM consumers keep using s_gpu_dirty. */
++#define GD_TILE 64
++static uint16_t      s_gd_rows[VRAM_H / GD_TILE];
++
++static void gpu_clean(void) {
++    s_gpu_dirty = 0;
++    memset(s_gd_rows, 0, sizeof(s_gd_rows));
++}
++
++/* Inclusive native rect, one pixel of guard on every side (GL coverage rules
++ * differ from the PS1's by a pixel on edges; wide lines straddle). */
++static void gd_mark(int x0, int y0, int x1, int y1) {
++    x0--; y0--; x1++; y1++;
++    if (x0 < 0) x0 = 0;
++    if (y0 < 0) y0 = 0;
++    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
++    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
++    if (x0 > x1 || y0 > y1) return;
++    const uint32_t hi = (1u << (x1 / GD_TILE + 1)) - 1u;
++    const uint32_t lo = (1u << (x0 / GD_TILE)) - 1u;
++    const uint16_t bits = (uint16_t)(hi & ~lo);
++    for (int ty = y0 / GD_TILE; ty <= y1 / GD_TILE; ty++)
++        s_gd_rows[ty] |= bits;
++}
++
++static void gpu_dirty_rect(int x0, int y0, int x1, int y1) {
++    s_gpu_dirty = 1;
++    gd_mark(x0, y0, x1, y1);
++}
++
++static int gd_test_one(int x0, int y0, int x1, int y1) {
++    const uint32_t hi = (1u << (x1 / GD_TILE + 1)) - 1u;
++    const uint32_t lo = (1u << (x0 / GD_TILE)) - 1u;
++    const uint16_t bits = (uint16_t)(hi & ~lo);
++    for (int ty = y0 / GD_TILE; ty <= y1 / GD_TILE; ty++)
++        if (s_gd_rows[ty] & bits) return 1;
++    return 0;
++}
++
++/* Does a guest read of w x h at (x, y) - wrapping at the VRAM edges like the
++ * PS1 and sw_vram_transfer_out - touch a GPU-written tile? */
++static int gd_test(int x, int y, int w, int h) {
++    if (!s_gpu_dirty) return 0;
++    if (w <= 0 || h <= 0) return 0;
++    if (w >= VRAM_W || h >= VRAM_H) return 1;
++    x &= VRAM_W - 1; y &= VRAM_H - 1;
++    const int w1 = (x + w > VRAM_W) ? VRAM_W - x : w, w2 = w - w1;
++    const int h1 = (y + h > VRAM_H) ? VRAM_H - y : h, h2 = h - h1;
++    if (gd_test_one(x, y, x + w1 - 1, y + h1 - 1)) return 1;
++    if (w2 && gd_test_one(0, y, w2 - 1, y + h1 - 1)) return 1;
++    if (h2 && gd_test_one(x, 0, x + w1 - 1, h2 - 1)) return 1;
++    if (w2 && h2 && gd_test_one(0, 0, w2 - 1, h2 - 1)) return 1;
++    return 0;
++}
+ 
+ /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
+ typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
+@@ -506,6 +563,9 @@ static int s_tex_filter = 0;
+ /* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
+  * duplicate stencil copy current is deferred until mask checking is requested. */
+ static int s_stencil_valid = 1;
++/* Where it is stale while !s_stencil_valid (native px); the rebuild covers only
++ * this. Unset with !s_stencil_valid means "everywhere". */
++static DirtyRect s_stencil_dirty;
+ 
+ /* ---- release cost counters (heartbeat "gl") ------------------------------
+  * frame_perf answers "where did this frame go" only in a debug-tools build,
+@@ -1442,20 +1502,31 @@ static void flush_cpu_upload(void) {
+     if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
+ }
+ 
+-/* Recreate one target's stencil mask from its authoritative alpha channel.
+- * Sampling an attached render target is undefined, so copy color to the shared
+- * scratch texture first. Wide targets never exceed the 1024-pixel VRAM width. */
+-static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h) {
++/* Recreate one target's stencil mask from its authoritative alpha channel,
++ * inside [rx, rx+rw) x [ry, ry+rh) of the target (hr pixels). Sampling an
++ * attached render target is undefined, so the region's color is copied to the
++ * shared scratch texture first, at the same coordinates. Wide targets never
++ * exceed the 1024-pixel VRAM width. */
++static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h,
++                                   int rx, int ry, int rw, int rh) {
++    if (rx < 0) { rw += rx; rx = 0; }
++    if (ry < 0) { rh += ry; ry = 0; }
++    if (rx + rw > target_w) rw = target_w - rx;
++    if (ry + rh > target_h) rh = target_h - ry;
++    if (rw <= 0 || rh <= 0) return;
+     s_gc.stencil_rebuilds++;
+-    s_gc.stencil_px += (uint64_t)target_w * (uint64_t)target_h;
++    s_gc.stencil_px += (uint64_t)rw * (uint64_t)rh;
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, target_fbo);
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
+-    p_glBlitFramebuffer(0, 0, target_w, target_h, 0, 0, target_w, target_h,
++    glDisable(GL_SCISSOR_TEST);
++    p_glBlitFramebuffer(rx, ry, rx + rw, ry + rh, rx, ry, rx + rw, ry + rh,
+                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ 
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, target_fbo);
+     glViewport(0, 0, target_w, target_h);
+-    glDisable(GL_SCISSOR_TEST);
++    /* The clear and the full-screen triangle both stay inside the region. */
++    glEnable(GL_SCISSOR_TEST);
++    glScissor(rx, ry, rw, rh);
+     glDisable(GL_BLEND);
+     glEnable(GL_STENCIL_TEST);
+     glStencilMask(0x01);
+@@ -1472,19 +1543,38 @@ static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h
+     glDrawArrays(GL_TRIANGLES, 0, 3);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+     glDisable(GL_STENCIL_TEST);
++    glDisable(GL_SCISSOR_TEST);
+     p_glBindVertexArray(0);
+     p_glUseProgram(0);
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+ }
+ 
++/* Rebuild only where the stencil can be stale: the union of the batches that
++ * skipped their stencil encoding since the last rebuild (s_stencil_dirty,
++ * native px). It used to be the whole 1024S x 512S surface plus every
++ * native-wide surface, each time the game switched mask checking on after
++ * such a batch - at 5x, 13 Mpx blitted and 13 Mpx stencil-drawn per surface,
++ * possibly several times a frame, when the drawn band is 320x240. The wide
++ * surfaces get the same rows at full width: the mirror only shifts or
++ * stretches X (the backdrop stretch can reach any column), never Y, and its Y
++ * scissor is the same draw area. */
+ static void rebuild_mask_stencils(void) {
+     if (s_stencil_valid || !s_raster_ok) return;
+-    int hw = VRAM_W * s_scale, hh = VRAM_H * s_scale;
+-    rebuild_target_stencil(s_hr_fbo, hw, hh);
++    const int S = s_scale;
++    int x0 = 0, y0 = 0, x1 = VRAM_W - 1, y1 = VRAM_H - 1;
++    if (s_stencil_dirty.set) {
++        x0 = s_stencil_dirty.x0; y0 = s_stencil_dirty.y0;
++        x1 = s_stencil_dirty.x1; y1 = s_stencil_dirty.y1;
++    }
++    const int hw = VRAM_W * S, hh = VRAM_H * S;
++    rebuild_target_stencil(s_hr_fbo, hw, hh,
++                           x0 * S, y0 * S, (x1 - x0 + 1) * S, (y1 - y0 + 1) * S);
+     for (int i = 0; i < WIDE_MAX_SURF; i++) {
+         if (s_wide_fbo[i])
+-            rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_scale, hh);
++            rebuild_target_stencil(s_wide_fbo[i], g_wide_w * S, hh,
++                                   0, y0 * S, g_wide_w * S, (y1 - y0 + 1) * S);
+     }
++    rect_clear(&s_stencil_dirty);
+     s_stencil_valid = 1;
+ }
+ 
+@@ -1550,7 +1640,7 @@ static void ensure_cpu(void) {
+     /* Dual-raster / netplay: CPU VRAM is written on every GP0 (or pure SW).
+      * Never glReadPixels — that forked peer snaps/resim. */
+     if (s_cpu_auth_dual || psx_netplay_active()) {
+-        s_gpu_dirty = 0;
++        gpu_clean();
+         return;
+     }
+     flush_flat_batch();
+@@ -1563,7 +1653,7 @@ static void ensure_cpu(void) {
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+     s_gc.sync_reads++;
+     s_gc.sync_us += gc_now_us() - t0;
+-    s_gpu_dirty = 0;
++    gpu_clean();
+     coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+ }
+ 
+@@ -1676,7 +1766,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
+     rect_add(&s_pack_dirty, x0, y0, x1, y1);
+     /* Dual-raster keeps CPU current via SW writes — do not mark GPU-ahead. */
+     if (!s_cpu_auth_dual)
+-        s_gpu_dirty = 1;
++        gpu_dirty_rect(x0, y0, x1, y1);
+     coh_record(GL_COH_DRAW, x0, y0, x1, y1);
+ }
+ 
+@@ -1852,6 +1942,27 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
+  * blended per the PSX mode. Cross-prim order is kept by isolating semi prims to
+  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
+  * whose two passes do not self-overlap. */
++/* The open textured batch skipped its stencil encoding: record where. Its
++ * vertex bbox, widened a pixel for sub-pixel positions and clipped to the draw
++ * area (hr_begin scissors every batch to it). */
++static void stencil_invalidate_batch(int nverts) {
++    s_stencil_valid = 0;
++    if (nverts <= 0) return;
++    float fx0 = s_tb[0], fx1 = s_tb[0], fy0 = s_tb[1], fy1 = s_tb[1];
++    for (int i = 1; i < nverts; i++) {
++        const float x = s_tb[i * TEXV], y = s_tb[i * TEXV + 1];
++        if (x < fx0) fx0 = x; if (x > fx1) fx1 = x;
++        if (y < fy0) fy0 = y; if (y > fy1) fy1 = y;
++    }
++    int x0 = (int)floorf(fx0) - 1, x1 = (int)ceilf(fx1) + 1;
++    int y0 = (int)floorf(fy0) - 1, y1 = (int)ceilf(fy1) + 1;
++    if (x0 < s_area_x1) x0 = s_area_x1;
++    if (y0 < s_area_y1) y0 = s_area_y1;
++    if (x1 > s_area_x2) x1 = s_area_x2;
++    if (y1 > s_area_y2) y1 = s_area_y2;
++    rect_add(&s_stencil_dirty, x0, y0, x1, y1);
++}
++
+ static void tex_batch_draw_passes(int nverts, int semi) {
+     p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+     if (semi < 0) {
+@@ -1868,7 +1979,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+         } else if (!s_tb_mask) {
+             /* Alpha is already exact; defer its duplicate stencil encoding
+              * until a later GP0(E6h) actually enables destination masking. */
+-            s_stencil_valid = 0;
++            stencil_invalidate_batch(nverts);
+         }
+     } else if (!s_mask_check && semi == 4) {
+         /* Modes 0/1/3 can select opaque-vs-semi behavior per fragment with
+@@ -1881,7 +1992,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+         if (s_tb_mask) mask_stencil(1); else glDisable(GL_STENCIL_TEST);
+         p_glUniform1i(s_uSemipass, 0);
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+-        if (!s_tb_mask) s_stencil_valid = 0;
++        if (!s_tb_mask) stencil_invalidate_batch(nverts);
+     } else {
+         glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
+         mask_stencil(s_tb_mask);
+@@ -2108,6 +2219,15 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
+  * implementation for GL/VK/SW, see gpu_uv.h. */
+ #include "gpu_uv.h"
+ 
++static int semi_batch_enabled(void) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *e = getenv("PSX_GL_SEMI_BATCH");
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    return enabled;
++}
++
+ /* Textured triangle. Always two passes split by the per-texel STP bit so the
+  * stencil (mask) write value is constant within each pass; the semi pass is
+  * also where PS1 blending applies. lim = uv sampling bounds (see
+@@ -2168,8 +2288,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+          * mis-orders against neighbouring opaque geometry. Isolate EVERY
+          * semi-transparent textured prim: drain the open batch, draw this
+          * prim alone (composited fully before the next), let opaque prims
+-         * keep batching. Cost is one draw per semi prim. */
+-        int isolate = (semi >= 0);
++         * keep batching. Cost is one draw per semi prim.
++         *
++         * PSX_GL_SEMI_BATCH=1 (A/B, default off) lets CONSECUTIVE dual-source
++         * semi prims share one draw. Blending inside a draw is applied in
++         * primitive order and each fragment picks opaque-vs-blend itself, so
++         * only opaque/semi interleaving needs the split, and the batch key
++         * already splits there (-1 vs 4). Off until the heartbeat's
++         * semi_isolated count and a visual check say it is worth it. */
++        int isolate = (semi >= 0) && !(batch_semi == 4 && semi_batch_enabled());
+         int reason = -1;
+         if (s_tb_n > 0) {
+             if (isolate) reason = 0;
+@@ -2340,8 +2467,12 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
+     if (w2 && h2) fill_segment(0, 0, w2, h2, r, g, b);
+     glDisable(GL_SCISSOR_TEST);
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+-    if (!s_cpu_auth_dual)
+-        s_gpu_dirty = 1;
++    if (!s_cpu_auth_dual) {
++        gpu_dirty_rect(x, y, x + w1 - 1, y + h1 - 1);
++        if (w2)       gd_mark(0, y, w2 - 1, y + h1 - 1);
++        if (h2)       gd_mark(x, 0, x + w1 - 1, h2 - 1);
++        if (w2 && h2) gd_mark(0, 0, w2 - 1, h2 - 1);
++    }
+     coh_record(GL_COH_FILL, x, y, x + w - 1, y + h - 1);
+ }
+ 
+@@ -2399,7 +2530,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+ 
+     rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
+     if (!s_cpu_auth_dual)
+-        s_gpu_dirty = 1;
++        gpu_dirty_rect(dx, dy, dx + w - 1, dy + h - 1);
+     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
+     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+ }
+@@ -2675,7 +2806,19 @@ static void glb_vram_write(int x,int y,uint16_t px){
+     /* Point pokes are never MDEC frames — always stage to FBO. */
+     up_add(x & (VRAM_W-1), y & (VRAM_H-1), x & (VRAM_W-1), y & (VRAM_H-1));
+ }
+-static uint16_t glb_vram_read(int x,int y){ ensure_cpu(); return sw_vram_read(x,y); }
++/* Guest reads. Only a read that touches GPU-drawn pixels waits for the GPU;
++ * anything else is already exact in s_vram (CPU uploads land there first). At
++ * a high internal scale that wait is the whole queued frame's GPU time, paid
++ * on the emulation thread. */
++static void ensure_cpu_rect(int x, int y, int w, int h) {
++    if (!s_raster_ok || !s_gpu_dirty) return;
++    if (!s_cpu_auth_dual && !gd_test(x, y, w, h)) {
++        s_gc.sync_skips++;
++        return;
++    }
++    ensure_cpu();
++}
++static uint16_t glb_vram_read(int x,int y){ ensure_cpu_rect(x, y, 1, 1); return sw_vram_read(x,y); }
+ static void glb_vram_transfer_in(int x,int y,int w,int h,const uint16_t *d){
+     sw_vram_transfer_in(x,y,w,h,d);
+     depth24_upload_policy();
+@@ -2699,7 +2842,7 @@ static void glb_vram_transfer_in(int x,int y,int w,int h,const uint16_t *d){
+     up_add_transfer(x, y, w, h);   /* exact touched rects, incl. per-pixel wrap */
+     coh_record(GL_COH_UPLOAD, x, y, x+w-1, y+h-1);
+ }
+-static void glb_vram_transfer_out(int x,int y,int w,int h,uint16_t *d){ ensure_cpu(); sw_vram_transfer_out(x,y,w,h,d); }
++static void glb_vram_transfer_out(int x,int y,int w,int h,uint16_t *d){ ensure_cpu_rect(x, y, w, h); sw_vram_transfer_out(x,y,w,h,d); }
+ 
+ /* ---- context init / present -------------------------------------------- */
+ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear) {
+@@ -3165,8 +3308,9 @@ static int init_gpu_raster(void) {
+     rect_clear(&s_pack_dirty);
+     s_up_nrects = 0;
+     up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+-    s_gpu_dirty = 0;
++    gpu_clean();
+     s_stencil_valid = 1;
++    rect_clear(&s_stencil_dirty);
+     for (int i = 0; i < PRES_ROWS; i++) s_present_dirty[i] = ~0ull;
+     s_last_present_path = -1;
+ 
+@@ -3433,13 +3577,13 @@ void gl_renderer_restage_vram_after_savestate(void) {
+     }
+     /* Dual-raster: CPU is authority after snap; FBO is cosmetics only. */
+     if (s_cpu_auth_dual)
+-        s_gpu_dirty = 0;
++        gpu_clean();
+ }
+ 
+ void gl_renderer_set_cpu_auth_dual(int on) {
+     s_cpu_auth_dual = on ? 1 : 0;
+     if (s_cpu_auth_dual)
+-        s_gpu_dirty = 0;
++        gpu_clean();
+ }
+ 
+ int gl_renderer_cpu_auth_dual(void) {

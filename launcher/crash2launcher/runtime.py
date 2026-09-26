@@ -139,6 +139,14 @@ def _build_env(settings: Settings) -> dict[str, str]:
         # alternating between one and two fields report "ok", and the Play
         # page would then tell the player it was holding 60 while it was not.
         env["PSX_CRASH2_60FPS_FORCE_GATE"] = "1"
+        # Native 120 FPS (experimental): the same gate at twice the field
+        # rate. Twice the frames in the same guest second need twice the
+        # headroom, so the virtual CPU runs at 400% while 120 is engaged
+        # (still emulation only). FORCE_GATE keeps 60 guaranteed; the
+        # runtime still steps 120 down to 60 when a scene cannot hold it.
+        if config.native_120fps_active(settings):
+            env["PSX_CRASH2_FPS"] = "120"
+            env["PSX_CRASH2_120FPS_CPU_PCT"] = "400"
 
     # Rewind. The runtime defaults this ON (psx_rewind.c rewind_wanted only
     # disables on PSX_REWIND=0) and takes a snapshot every interval frames
@@ -180,7 +188,11 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # against itself. native_60fps is what actually fixes that mismatch - it
     # makes the game produce a new image every VBlank - and it is a real
     # simulation change, which this setting is not.
-    if settings.frame_interpolation and settings.renderer == "opengl":
+    # Not with native 120 FPS: blending subdivides the stock field, and the
+    # runtime refuses to engage 120 under it.
+    if (settings.frame_interpolation
+            and settings.renderer in config.HARDWARE_RENDERERS
+            and not config.native_120fps_active(settings)):
         env["PSX_FRAME_INTERPOLATION"] = "1"
         # Only 0 (follow host) or >= 90 is accepted; clamp() already enforced it.
         if settings.frame_interpolation_fps:
@@ -237,6 +249,10 @@ def _build_env(settings: Settings) -> dict[str, str]:
         if settings.perf_diag:
             env["PSX_RUNTIME_PERF_DIAG"] = "1"
             env["PSX_RUNTIME_PERF_DIAG_MS"] = str(settings.perf_diag_interval_ms)
+            # GPU timer queries for the heartbeat's "gl" object, which
+            # tuning/scripts/scale_bench.py reads. Off otherwise: a driver may
+            # serialise submission while it collects them.
+            env["PSX_GPU_PERF"] = "1"
             if settings.perf_bench_window:
                 env["PSX_BENCH_WINDOW"] = settings.perf_bench_window
 
@@ -247,6 +263,11 @@ def _build_env(settings: Settings) -> dict[str, str]:
 
     # How the internal buffer is resampled down to the window.
     env["PSX_PRESENT_FILTER"] = settings.present_filter
+    # Post-processing (runtime gpu_postfx.h). Absent when every effect is
+    # neutral, which is also how the runtime knows to skip the chain.
+    postfx = config.postfx_string(settings)
+    if postfx:
+        env["PSX_POSTFX"] = postfx
 
     # Pan & Scan. Only emitted when actually dialled, so an untouched setting
     # leaves the historical letterbox/fill rects byte-identical.
@@ -472,6 +493,21 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
     )
 
 
+# Runtime log lines observed_from_log reads. These went missing in 5aaf407
+# while the function still used them, so every game log line raised NameError
+# in the Play page's output handler and the "what the runtime did" line never
+# filled in.
+# "psxrecomp: GL GPU pipeline ready (internal scale 5x, ...)"
+_SCALE_RE = re.compile(r"internal scale\s+(\d+)x")
+# "psxrecomp: widescreen 16:9 (GTE X-squash + stretched present; ...)"
+_WIDESCREEN_RE = re.compile(r"widescreen\s+(\d+:\d+)")
+# "psxrecomp: presentation fit = fill"
+_FIT_RE = re.compile(r"presentation fit = (\S+)")
+# "psxrecomp: overlay autocompile enabled (gcc); ..."
+_OVERLAY_RE = re.compile(r"overlay autocompile enabled \((\w+)\)")
+# "GL temporal frame blending enabled: 240.0 presents/s ..."
+_BLEND_RE = re.compile(r"frame blending enabled:\s*([\d.]+)\s*presents/s")
+
 
 def observed_from_log(line: str) -> tuple[str, str] | None:
     """Pull a (label, value) the runtime reports about itself.
@@ -498,6 +534,15 @@ def observed_from_log(line: str) -> tuple[str, str] | None:
         return ("Presents/s", m.group(1))
     if "overlay gaps -> interpreter" in line:
         return ("Overlay tier", "interpreter (slow)")
+    # Which graphics API actually came up. Direct3D 12 falls back to OpenGL on
+    # its own when it cannot start, and that is only visible here. The failure
+    # has its own label: the OpenGL line that follows it must not erase it.
+    if "Direct3D 12 renderer failed to start" in line:
+        return ("Direct3D 12", "failed - using OpenGL")
+    if "Direct3D 12 context created" in line:
+        return ("Renderer", "Direct3D 12")
+    if "OpenGL context created" in line:
+        return ("Renderer", "OpenGL")
     return None
 
 

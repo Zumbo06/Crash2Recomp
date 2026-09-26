@@ -20,6 +20,15 @@ moving platforms, scripted timers - advanced over the route. It must be ~30 at
 30 AND at 60 FPS (crash2_60fps.h, C2_60_GOOL_UPDATE): a loop rate near 60 with
 this near 60 too is the double-speed bug the script pacing exists to prevent.
 
+"native_120fps": true (with "native_60fps") asks for native 120 FPS, the same
+gate at twice the field rate (crash2_60fps.h, C2_120_SND_FN); "cpu_percent_120"
+is the clock while it is engaged (default 400). Route segments are still
+consumed per guest VBlank, and VBlanks come twice as fast at 120, so a route
+needs twice the frames for the same seconds. "expected_field_hz" (60 or 120)
+asserts the field rate running at the end - 60 with 120 asked for means the
+runtime stepped down - and "max_fast_fallbacks" how many windows failed at
+120 during the route. game_frame_ticks reads 8 or 9 at 120.
+
 A scenario can also drive the assists with "cheat_lives" (bool) and "cheat_aku"
 (0 off, 1 keep masks, 2 no damage). Both are set before the route and cleared
 afterwards whatever the outcome, so a scenario can never inherit the previous
@@ -95,10 +104,23 @@ def validate_scenario(scenario: dict) -> list[tuple[int, int]]:
     # 200% - impossible to express in a scenario.
     if not isinstance(percent, int) or not 100 <= percent <= 200:
         raise ValueError("cpu_percent must be 100..200")
+    fast = scenario.get("native_120fps", False)
+    if fast and not scenario.get("native_60fps"):
+        raise ValueError("native_120fps needs native_60fps: 120 is the same "
+                         "open gate at twice the field rate")
+    percent_120 = scenario.get("cpu_percent_120", 400)
+    # Mirrors C2_120_CPU_CAP in crash2_60fps.h.
+    if not isinstance(percent_120, int) or not 100 <= percent_120 <= 400:
+        raise ValueError("cpu_percent_120 must be 100..400")
+    field_hz = scenario.get("expected_field_hz")
+    if field_hz is not None and field_hz not in (60, 120):
+        raise ValueError("expected_field_hz must be 60 or 120")
     ticks = scenario.get("expected_game_frame_ticks")
-    if ticks is not None and ticks not in (17, 34, 51):
-        raise ValueError("expected_game_frame_ticks must be 17, 34 or 51 "
-                         "- func_80016F04 emits nothing else below 53")
+    # 8 and 9 are native 120's one-field frames (crash2_60fps.h rewrites the
+    # quantizer's value); the quantizer itself emits 17, 34 or 51 below 53.
+    if ticks is not None and ticks not in (8, 9, 17, 34, 51):
+        raise ValueError("expected_game_frame_ticks must be 8, 9, 17, 34 or "
+                         "51 - nothing else is emitted below 53")
     speed = scenario.get("min_speed")
     if speed is not None and not 0.0 < float(speed) <= 1.0:
         raise ValueError("min_speed must be a fraction of real time, 0..1")
@@ -143,6 +165,11 @@ def run(client: DebugClient, scenario: dict, timeout: float) -> dict:
                 f"the running game does not report {field!r}: it predates the "
                 "60 FPS sustain guard. Rebuild with _build/build_clang.ps1 "
                 "(close the game first - it holds its own .exe) and relaunch.")
+    if scenario.get("native_120fps") and "native_fps_field_hz" not in probe:
+        raise RuntimeError(
+            "the running game does not report 'native_fps_field_hz': it "
+            "predates native 120 FPS. Rebuild with _build/build_clang.ps1 "
+            "(close the game first) and relaunch.")
     if scenario.get("expected_script_hz") and "native_60fps_script_steps" not in probe:
         raise RuntimeError(
             "the running game does not report 'native_60fps_script_steps': it "
@@ -159,7 +186,9 @@ def run(client: DebugClient, scenario: dict, timeout: float) -> dict:
     # 30 Hz has to say so to the runtime, or it inherits whatever the previous
     # run left behind and measures the wrong thing.
     client.call("crash2_60fps", enabled=1 if scenario.get("native_60fps") else 0,
-                cpu_percent=scenario.get("cpu_percent", 125))
+                cpu_percent=scenario.get("cpu_percent", 125),
+                fps=120 if scenario.get("native_120fps") else 60,
+                cpu_percent_120=scenario.get("cpu_percent_120", 400))
     client.call("crash2_cheats",
                 lives=1 if scenario.get("cheat_lives") else 0,
                 aku=scenario.get("cheat_aku", 0))
@@ -167,7 +196,7 @@ def run(client: DebugClient, scenario: dict, timeout: float) -> dict:
         return _run_route(client, scenario, route, timeout)
     finally:
         client.call("crash2_cheats", lives=0, aku=0)
-        client.call("crash2_60fps", enabled=0)
+        client.call("crash2_60fps", enabled=0, fps=60)
 
 
 def _run_route(client: DebugClient, scenario: dict, route: list[tuple[int, int]],
@@ -193,7 +222,9 @@ def _run_route(client: DebugClient, scenario: dict, route: list[tuple[int, int]]
     client.call("input_route_clear")
     for frames, buttons in route:
         client.call("input_route_append", frames=frames, buttons=buttons)
-    backoffs_before = client.call("frame_rates").get("native_60fps_backoffs", 0)
+    before_rates = client.call("frame_rates")
+    backoffs_before = before_rates.get("native_60fps_backoffs", 0)
+    fast_fallbacks_before = before_rates.get("native_120fps_fallbacks", 0)
     client.call("frame_rates", reset=1)
     start = client.call("input_route_start")["start_frame"]
     deadline = time.monotonic() + timeout
@@ -279,6 +310,24 @@ def _run_route(client: DebugClient, scenario: dict, route: list[tuple[int, int]]
                              "max_backoffs": max_backoffs,
                              "note": "the runtime could not hold 60 here and "
                                      "fell back to the game's own 30 Hz lock"})
+    expected_field_hz = scenario.get("expected_field_hz")
+    if (expected_field_hz is not None
+            and rates.get("native_fps_field_hz") != expected_field_hz):
+        failures.append({"field_hz": rates.get("native_fps_field_hz"),
+                         "expected": expected_field_hz,
+                         "fast_fallbacks": rates.get("native_120fps_fallbacks"),
+                         "fast_stalls": rates.get("native_120fps_stalls"),
+                         "note": "120 was asked for and the runtime is at 60: "
+                                 "a fallback means a window failed at 120, a "
+                                 "stall a loop-less stretch"})
+    max_fast = scenario.get("max_fast_fallbacks")
+    if max_fast is not None:
+        fast = rates.get("native_120fps_fallbacks", 0) - fast_fallbacks_before
+        if fast > max_fast:
+            failures.append({"fast_fallbacks": fast,
+                             "max_fast_fallbacks": max_fast,
+                             "note": "a window failed at 120 and the runtime "
+                                     "stepped down to 60"})
     for check in scenario.get("assert_ram", []):
         address = _ram_address(check["addr"], len(bytes.fromhex(check["hex"])))
         wanted = bytes.fromhex(check["hex"])
