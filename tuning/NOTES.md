@@ -2960,3 +2960,149 @@ Modelled results (all checks pass):
 To test: the Play page says "120 FPS: holding" or why it stepped down. On the
 debug-tools build, run
 `gameplay_smoke.py --scenario tuning/scenarios/native120_hold.json`.
+
+## 120 FPS, part 21: slow motion, and a POST FX switch that froze the menu
+
+Two reports after part 20. Direct3D 12 worked. Native 120 ran "in slow
+motion, even though the FPS is 100+". The pause menu's POST FX row "does not
+work".
+
+**Slow motion.** The heartbeat was overwritten by a later 60 FPS session, but
+the freeze dumps keep a ring of 100 ms samples. Cycles per VBlank give the
+rate in force, and guest cycles per wall second give the speed:
+
+| Session | VBlank | VBlanks / wall s | Speed |
+|---|---|---|---|
+| 15:41 | 120 Hz (280,690 cyc) | 79-90 | 0.66-0.75x |
+| 15:42 | 120 Hz | 68-78 | 0.57-0.65x |
+| 15:44 | 120 Hz | 90-96 (one second 125) | 0.75-0.80x |
+| later, 60 FPS | 60 Hz | 60-62 | 1.00x |
+
+The host could not keep 120, and 120 never let go. The host check fired, but
+under the launcher's forced gate ("Prefer 60") the branch that handles it ran
+on every loop, not only on the loop that completes a window. It cleared the
+host streak each time, so the streak never reached two. Patch 0043:
+
+- A loop that completes no window returns before any branch.
+- At 120, one slow window steps down: missing 120 costs slow motion, not
+  dropped frames.
+- A host step-down backs off 10 s doubling to 160 s. A load does not reset
+  this (a new scene does not make the machine faster); ten comfortable
+  seconds at 120 do.
+- `native_120fps_host_fallbacks` reports host step-downs, and the Play page
+  now says which kind happened.
+
+`tuning/native120_sim` gained a host model (wall time per field). Against a
+host that manages ~91 fields a second it shows 1.0 s of slow motion at 0.76x,
+then 60 at full speed, a retry after 10 s that steps down at once, the next
+after 20 s. The old code would have stayed at 0.76x indefinitely.
+
+**The other half of the slowness was the build, not the runtime.** The run
+report said `autocompile_degraded`: "overlay autocompile failed 3 consecutive
+runs (last exit 1)". Choosing Direct3D 12 makes the launcher write
+`renderer = "d3d12"` into game.toml. The recompiler binary that
+`compile_overlays.py` runs for `--overlay-config-hash` dated from 21 Sep, so
+it rejected the file. The pre-flight probes pass with an OpenGL game.toml,
+and the same command succeeds from a shell, which is why this looked like an
+environment problem at first.
+
+Every Direct3D 12 session therefore ran uncompiled code interpreted,
+including the VSync page (0x8004A000) that the 60/120 mode patches. That was
+~1,950 interpreted dispatches per VBlank, against ~240 on 24 Sep.
+`_build/build_recompiler.ps1` fixes it: the codegen hash is still `3d2b5a19`
+and the config hash is the same for either renderer, so the existing cache
+stays valid. The missing shard was built straight away.
+
+The rule from part 8 widens: a change to the game.toml schema
+(`recompiler/src/config_loader.*`) also needs `build_recompiler.ps1`. The
+recompiler parses game.toml every time the game compiles level code.
+
+**POST FX.** The pause loop redraws the window from the drawable captured at
+the last live present. The switch called `gl_renderer_invalidate_present()`,
+which drops that capture, so from then on the pause loop presented nothing.
+The menu stopped updating until it was closed, and neither the value nor the
+picture changed. Now:
+
+- The switch only flips the setting.
+- With post-processing configured, the image always passes through the
+  chain's input target, even with the switch off, where it is copied through
+  unchanged.
+- The hold-last redraw re-runs the chain from that pre-effect image, so the
+  paused frame shows the switch at once. The texture dedither belongs to
+  drawing the scene and follows on resume.
+
+Also: the dedither only ever ran with nearest texture sampling. With the
+launcher's default bilinear filtering it did nothing, so with the reporter's
+FXAA + dedither at 5x the switch would have shown almost no difference even
+working. Each bilinear tap is now smoothed as well.
+
+The parity harness gained `PARITY_FILTER=1` and a paused-toggle step:
+
+- VRAM is bit-identical between GL and D3D12 with bilinear + dedither.
+- With the switch off, the paused frame differs from "on" in every pixel.
+- Switched back on, it matches the first frame to the 1/255 output dither.
+
+To test:
+
+1. Choose Direct3D 12 and play a minute. The run report should no longer say
+   `autocompile_degraded`.
+2. Try 120. It either holds, or drops to 60 within a second or two and says
+   why on the Play page.
+3. In the Home menu, POST FX OFF/ON changes the paused picture.
+
+## 120 FPS, part 22: host-bound at 2x, and a profiler to say why
+
+Report: "can't keep 120, drops to 60 at 2x" (Direct3D 12, FXAA + dedither).
+
+| Heartbeat | Value |
+|---|---|
+| Engages | 5 |
+| Fallbacks | 4, all host |
+| `autocompile_degraded` | 0 (0043's recompiler rebuild worked) |
+
+So the machine could not produce 120 fields a second. It was no longer the
+compile problem.
+
+Per field the game does ~1M PS1 cycles of work: 0.9M at 60/200%, 1.04M at
+120/400% in stock-equivalent terms. Almost all of that is instruction work,
+not waiting. At 120, emulation, GPU emulation, recording and present share
+one 8.3 ms slot on one thread.
+
+Patch 0044 does three things.
+
+**Fewer draws and cheaper recording.**
+
+- Semi-transparent batching is now on by default. It is byte-identical in
+  the parity harness, including overlapping same-mode prims and interleaved
+  modes.
+- The Direct3D 12 command list now skips re-binding state that has not
+  changed.
+
+Recording on the parity bench, ms per frame:
+
+| API | Before | After |
+|---|---|---|
+| Direct3D 12 | 0.59-0.65 | 0.39-0.42 |
+| OpenGL | 0.31 | 0.26 |
+
+**Fairer host check at 120.**
+
+- Below 108 fields/s the runtime steps down at once.
+- Between 108 and 114, one hitchy second no longer costs 10 s at 60; a second
+  slow window is needed.
+- The rate reached is reported as `native_120fps_fail_hz`, and the Play page
+  quotes it.
+
+**A sampling profiler** (`host_profiler.c`).
+
+- 120 FPS profiles its first 20 s engaged into `psx_host_profile.json`.
+- `tuning/scripts/host_profile.py` names every address from the executable's
+  symbols and splits time into emulate/present/pace.
+- The next 120 session will show exactly what the host spends its 8.3 ms on,
+  which is what any further 120 work should be aimed at.
+- The renderer part was profiled offline with the parity harness
+  (`PARITY_PROFILE=1`). That profile found the per-draw driver cost the
+  Direct3D 12 cache now removes.
+
+Launcher: explanations cut to a line each across Settings, Play, Mods,
+Advanced and Setup.

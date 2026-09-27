@@ -59,9 +59,7 @@ class AdvancedPage(QWidget):
 
         lay.addWidget(heading(
             "Advanced",
-            "Diagnostics for investigating problems. These change how the game "
-            "behaves and some of them make it worse - they are not quality "
-            "settings.",
+            "Tools for investigating problems. Some make the game run worse.",
         ))
         lay.addWidget(self._banner())
         lay.addWidget(self._audio_card())
@@ -78,9 +76,9 @@ class AdvancedPage(QWidget):
         lay = frame.layout()
 
         text = QLabel(
-            "<b>These are measurement tools, not settings.</b><br>"
-            "Leave them off for normal play. If audio or video behaves oddly, "
-            "check here first - an enabled diagnostic is the most likely cause."
+            "<b>Measurement tools, not settings.</b><br>Leave them off for "
+            "normal play; one left on is the usual cause of odd audio or "
+            "video."
         )
         text.setWordWrap(True)
         text.setTextFormat(Qt.TextFormat.RichText)
@@ -162,19 +160,16 @@ class AdvancedPage(QWidget):
             section("Capture / debug server"),
             row("Debug server port", self.debug_port),
             dim(
-                "Serves the sound, video and CPU state over TCP so a capture "
-                "tool can read it while the game runs. Use 4370 unless you "
-                "have a reason not to."
+                "Lets a capture tool read the game's state over TCP. Use "
+                "4370."
             ),
             self.build_lbl,
             self.perf_diag,
             dim(DIAGNOSTIC_SETTINGS["perf_diag"]),
             row("Report every", self.perf_diag_interval_ms),
             row("Benchmark window", self.perf_bench_window),
-            dim("Frame range as start:end. Adds one [BENCH] summary line for "
-                "exactly that range - the same measurement either side of a "
-                "change is how you tell whether it helped. Leave empty for "
-                "continuous reporting only."),
+            dim("Frame range as start:end for one [BENCH] summary line. "
+                "Leave empty for continuous reporting."),
             self.voice_alloc_trace,
             dim(DIAGNOSTIC_SETTINGS["voice_alloc_trace"]),
             self.overlay_interpreter,
@@ -206,8 +201,7 @@ class AdvancedPage(QWidget):
         # port silently swaps which binary runs. Say so rather than surprise.
         if self.settings.debug_port:
             set_status(self.build_lbl, "Warn",
-                       "Runs the debugtools build instead of the release "
-                       "build, which is slower. Set the port to Off for "
+                       "Uses the slower debug build. Set the port to Off for "
                        "normal play.")
         else:
             set_status(self.build_lbl, "", "Release build will be used.")

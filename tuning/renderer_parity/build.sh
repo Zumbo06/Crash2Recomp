@@ -31,6 +31,7 @@ $CC $FLAGS -c "$R/src/gpu_hw_dispatch.c" -o dispatch.o
 $CC $FLAGS -c "$R/src/gpu_sw_renderer.c" -o sw_renderer.o
 $CC $FLAGS -c "$R/src/frame_interpolation.c" -o frame_interp.o
 $CC $FLAGS -c "$R/src/gpu_vram_dirty.c" -o vram_dirty.o
+$CC $FLAGS -c "$R/src/host_profiler.c" -o host_profiler.o
 $CXX $FLAGS -std=c++17 -c "$R/src/gpu_gl12.cpp" -o gl12.o
 $CC $FLAGS -c "$HERE/parity.c" -o parity.o
 $CC $FLAGS -c "$HERE/stubs.c" -o stubs.o

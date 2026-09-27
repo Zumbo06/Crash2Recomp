@@ -23,7 +23,7 @@ overlay_backend = "auto"
 overlay_autocompile_cmd = "\"C:\\Python313\\python.exe\" \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\psxrecomp-src\\tools\\compile_overlays.py\" --captures \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\build-clang\\overlay_captures.json\" --game-toml \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\game.toml\" --recompiler \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\build-recompiler\\psxrecomp-game.exe\" --runtime-include \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\psxrecomp\\runtime\\include\" --out-dir \"C:\\Users\\yhgoz\\Desktop\\Crash2_Rcomp\\_build\\Crash2Recomp\\build-clang\\cache\""
 
 [video]
-renderer = "opengl"
+renderer = "d3d12"
 supersampling = 2
 aspect_ratio = "4:3"
 

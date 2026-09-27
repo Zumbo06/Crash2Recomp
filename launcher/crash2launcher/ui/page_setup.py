@@ -118,9 +118,8 @@ class SetupPage(QWidget):
 
         lay.addWidget(heading(
             "Setup",
-            "This launcher contains no game data. Point it at a disc image you "
-            "own and it will build the game on this machine - nothing is "
-            "uploaded, and your disc is only ever read.",
+            "No game data included. Choose a disc image you own and the game "
+            "is built on this PC. Nothing is uploaded.",
         ))
         lay.addWidget(self._disc_card())
         lay.addWidget(self._build_card())
@@ -157,8 +156,8 @@ class SetupPage(QWidget):
         return card(
             section("1.  Your disc"),
             picker,
-            dim("A .cue sheet with its .bin track alongside it. The image is "
-                "checked for complete tracks, whole sectors and the boot serial."),
+            dim("A .cue with its .bin alongside. It's checked before "
+                "building."),
             self.summary,
             self.hash_bar,
         )
@@ -192,9 +191,8 @@ class SetupPage(QWidget):
             self._disc_ok = True
             set_status(
                 self.summary, "Warn",
-                "CHD selected. The build accepts it, but this page cannot "
-                "check the tracks or read the boot serial - only .cue images "
-                "can be verified here.")
+                "CHD selected. It will build, but only .cue images can be "
+                "checked here.")
             self.steps.set_state("verify", DONE, "not verified (CHD)")
             self._refresh()
             return
@@ -293,8 +291,7 @@ class SetupPage(QWidget):
 
         return card(
             section("2.  Build"),
-            dim("Translates the game to C and compiles it. This takes several "
-                "minutes the first time and only needs doing once."),
+            dim("Translates and compiles the game. Takes a few minutes, once."),
             self.steps,
             buttons,
             self.build_bar,

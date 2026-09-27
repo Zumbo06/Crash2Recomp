@@ -83,6 +83,19 @@ static int s_netplay, s_interp;
 int psx_netplay_active(void) { return s_netplay; }
 int psx_selfcheck_enabled(void) { return 0; }
 int psx_frame_interpolation_active(void) { return s_interp; }
+/* host_profiler.h: 120 starts and pauses it; nothing to sample here. */
+static int s_prof_starts, s_prof_pauses;
+void host_profiler_attach(void) {}
+void host_profiler_phase(int phase) { (void)phase; }
+int host_profiler_start(const char *tag, unsigned seconds)
+{
+    (void)tag; (void)seconds;
+    s_prof_starts++;
+    return 1;
+}
+void host_profiler_pause(void) { s_prof_pauses++; }
+void host_profiler_finish(void) {}
+
 static PSXModFunctionEntryCallback s_gool_entry;
 int psx_mod_register_function_entry_plugin(const char *id, uint32_t address,
                                            PSXModFunctionEntryCallback cb)
@@ -106,7 +119,11 @@ int psx_mod_register_function_entry_plugin(const char *id, uint32_t address,
 static CPUState cpu;
 static uint64_t t;             /* guest cycles */
 static uint64_t last_vb;       /* guest cycle of the last VBlank edge */
-static double host_speed = 1.0;  /* wall seconds per guest second */
+/* The host. Each field costs it host_field_ms of wall time to emulate and
+ * draw; when that is longer than the field itself, guest time - and the whole
+ * game - falls behind the wall clock (slow motion). 0 keeps up at any rate. */
+static double host_field_ms = 0.0;
+static double wall_ms;         /* host wall clock at the last VBlank edge */
 static unsigned long long music_ticks, vblanks, loops, phys_ticks;
 static unsigned last_db20;
 static int fails;
@@ -122,7 +139,7 @@ static void sync_clock(void)
     const uint64_t ticks = t / CYC_PER_TICK;
     psx_write_word(TICKS, (uint32_t)ticks);
     psx_cycle_count = t;
-    s_host_ms = (uint64_t)((double)t / CPU_HZ * 1000.0 * host_speed);
+    s_host_ms = (uint64_t)(wall_ms + (double)(t - last_vb) / CPU_HZ * 1000.0);
 }
 
 static uint64_t period(void) { return VBLANK_NTSC / s_div; }
@@ -131,8 +148,10 @@ static uint64_t period(void) { return VBLANK_NTSC / s_div; }
 static void run_to(uint64_t until)
 {
     while (last_vb + period() <= until) {
+        const double field_ms = (double)period() / CPU_HZ * 1000.0;
         last_vb += period();
         t = last_vb;
+        wall_ms += host_field_ms > field_ms ? host_field_ms : field_ms;
         sync_clock();
         g_vblank_raise_count++;
         vblanks++;
@@ -369,6 +388,86 @@ int main(int argc, char **argv)
     measure(5.0, heavy);
     check(crash2_60fps_field_hz() == 60 && crash2_60fps_gate_open(),
           "forced gate: 120 -> 60, gate open");
+
+    printf("7b. a host too slow for 120 steps down within a second or two -\n"
+           "    with the gate forced, as the launcher always runs it\n");
+    {
+        /* The field report that found this: 68-96 VBlanks a second at 120,
+         * the game at 0.57-0.80 of its speed, and 120 never let go, because
+         * the forced-gate branch cleared the host streak between windows. */
+        crash2_60fps_set_target_fps(120);
+        for (int i = 0; i < 400 && s_div != 2; i++) game_loop(busy);
+        check(s_div == 2, "engaged at 120 under the forced gate");
+        const unsigned long long hf0 = crash2_60fps_fast_host_fallbacks();
+        host_field_ms = 11.0;      /* ~91 fields a second at 120; fine at 60 */
+        const double w0 = wall_ms;
+        const uint64_t g0 = t;
+        while (s_div == 2 && wall_ms - w0 < 10000.0) game_loop(busy);
+        const double slow_s = (wall_ms - w0) / 1000.0;
+        const double speed = ((double)(t - g0) / CPU_HZ) / slow_s;
+        printf("  [slow motion lasted %.2f s at %.2fx before stepping down]\n", slow_s, speed);
+        check(s_div == 1, "stepped down to 60");
+        check(slow_s < 2.2, "after at most about two seconds of slow motion");
+        check(crash2_60fps_fast_host_fallbacks() == hf0 + 1, "counted as a host fallback");
+        check(crash2_60fps_gate_open(), "the gate stays open");
+        const double w1 = wall_ms;
+        const uint64_t g1 = t;
+        while (wall_ms - w1 < 4000.0) game_loop(busy);
+        check(near(((double)(t - g1) / CPU_HZ) / ((wall_ms - w1) / 1000.0), 1.0, 0.01),
+              "and 60 runs at full speed on the same host");
+        /* A load forgives a scene, not a machine: the retry keeps its wait. */
+        for (int i = 0; i < 12; i++) game_loop(busy + 30u * 564480u);
+        const double w2 = wall_ms;
+        while (s_div == 1 && wall_ms - w2 < 3000.0) game_loop(busy);
+        check(s_div == 1, "a quiet window does not bring 120 straight back");
+        while (s_div == 1 && wall_ms - w1 < 12000.0) game_loop(busy);
+        check(s_div == 2, "120 is retried after 10 s");
+        while (s_div == 2 && wall_ms - w1 < 16000.0) game_loop(busy);
+        check(s_div == 1 && crash2_60fps_fast_host_fallbacks() == hf0 + 2,
+              "and steps down again at once");
+        /* A faster host - lower resolution, say - is found by the backed-off
+         * retry (20 s now) and then holds. */
+        host_field_ms = 0.0;
+        const double w3 = wall_ms;
+        while (s_div == 1 && wall_ms - w3 < 25000.0) game_loop(busy);
+        check(s_div == 2, "the next retry, 20 s later, engages");
+        Window wh = measure(12.0, busy);
+        check(s_div == 2 && near(wh.loop_hz, 119.88, 0.5), "and holds 120");
+        check(c2_120_host_fails == 0, "ten comfortable seconds forgive the host");
+    }
+
+    printf("7c. a host just short of 120 gets a second window; one hitch does not\n"
+           "    step down\n");
+    {
+        crash2_60fps_set_target_fps(120);        /* clears the host back-off */
+        host_field_ms = 0.0;
+        for (int i = 0; i < 2000 && s_div != 2; i++) game_loop(busy);
+        check(s_div == 2, "engaged");
+        measure(2.0, busy);
+        const unsigned long long hf0 = crash2_60fps_fast_host_fallbacks();
+        /* One slow second at ~112 fields a second (93%), then full speed. */
+        host_field_ms = 8.9;
+        const double w0 = wall_ms;
+        while (wall_ms - w0 < 1000.0) game_loop(busy);
+        host_field_ms = 0.0;
+        const double w1 = wall_ms;
+        while (wall_ms - w1 < 3000.0) game_loop(busy);
+        check(s_div == 2 && crash2_60fps_fast_host_fallbacks() == hf0,
+              "a single slow second just short of 120 does not step down");
+        /* Sustained: the second slow window steps down. */
+        host_field_ms = 8.9;
+        const double w2 = wall_ms;
+        while (s_div == 2 && wall_ms - w2 < 6000.0) game_loop(busy);
+        const double took = (wall_ms - w2) / 1000.0;
+        printf("  [stepped down after %.2f s at ~112 fields a second]\n", took);
+        check(s_div == 1 && took > 1.5 && took < 3.3,
+              "a sustained 93% steps down after the second window");
+        check(crash2_60fps_fast_fail_hz() >= 108 && crash2_60fps_fast_fail_hz() <= 114,
+              "and reports the rate it managed");
+        host_field_ms = 0.0;
+        check(s_prof_starts > 0 && s_prof_pauses > 0,
+              "the host profiler follows 120 on and off");
+    }
     c2_60_force_gate = 0;
 
     printf("8. a savestate carrying the stand-in is repaired; mode off undoes it all\n");

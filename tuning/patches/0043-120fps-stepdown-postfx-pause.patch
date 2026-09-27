@@ -1,0 +1,451 @@
+Native 120 FPS steps down instead of running slow; the pause menu's POST FX
+switch works on the paused frame; texture dedither also under bilinear.
+
+120 FPS in slow motion. Reported as "slow motion, even though the FPS is
+100+". The session's heartbeat ring confirms it: 120 Hz VBlank (282k cycles
+a field) at 68-96 VBlanks a wall second - the whole game, music included, at
+0.57-0.80 of its speed - and 120 never let go. The host check fired, but under
+the launcher's forced gate ("Prefer 60") the branch that handles it ran on
+every loop, not only on the loop that completes a window, and cleared the
+host streak each time; the streak never reached two. Now:
+  - a PENDING verdict (no window completed) returns before any branch, so
+    streaks count windows again, forced gate or not;
+  - at 120 one slow window steps down (C2_120_HOST_STREAK 1): the cost of
+    missing 120 is slow motion, not dropped frames;
+  - a host step-down backs off on its own schedule, 10 s doubling to 160 s,
+    which a load does not reset (a new scene does not make the machine
+    faster); ten comfortable seconds at 120 do. Scene (hold) step-downs keep
+    their rules. native_120fps_host_fallbacks reports the host ones.
+Modelled in tuning/native120_sim with a host that manages ~91 fields a second:
+1.0 s of slow motion at 0.76x, then 60 at full speed on the same host, a
+retry after 10 s that steps down at once, the next after 20 s.
+
+The other half of that session's slowness was not in this tree:
+autocompile_degraded - "overlay autocompile failed 3 consecutive runs (last
+exit 1)". Choosing Direct3D 12 makes the launcher write renderer = "d3d12"
+into game.toml, and the recompiler binary compile_overlays.py runs predated
+patch 0041, so its --overlay-config-hash rejected the file. Every session on
+Direct3D 12 ran uncompiled code interpreted - including the VSync page the
+60/120 mode patches, ~1,950 interpreted dispatches a VBlank against ~240 on
+24 Sep. _build/build_recompiler.ps1 rebuilds it from this tree (codegen hash
+still 3d2b5a19, same cache).
+
+POST FX in the pause menu looked dead. The pause loop redraws the window from
+the drawable captured at the last live present (hold-last). The switch called
+gl_renderer_invalidate_present(), which drops that capture - so from then on
+the pause loop presented nothing: the menu stopped updating until it was
+closed, and neither the new value nor the picture changed. Now the switch
+only flips the setting, and:
+  - with post-processing configured the image always goes through the
+    chain's input target, even switched off, where glpfx_end copies it
+    through unchanged (neutral settings);
+  - the hold-last redraw re-runs the chain from that input - the image as it
+    was before any effect - over the rect it last covered, with whatever is
+    switched on now. So the paused frame shows the switch at once. The
+    texture dedither is part of drawing the scene and follows on resume.
+
+Texture dedither applied only to nearest sampling; with bilinear texture
+filtering (the launcher default) it did nothing. Each bilinear tap is now
+smoothed as the nearest texel is (transparent taps skipped). TEX_FS and its
+HLSL twin changed together; gpu_gl12_shaders.h regenerated.
+
+Checked with tuning/renderer_parity (new PARITY_FILTER=1 and a paused-toggle
+step): VRAM bit-identical GL vs Direct3D 12 with bilinear + dedither; the
+paused frame with POST FX off differs in every pixel from on (a visible
+grade), and on again matches it to the 1/255 output dither; no post-FX and
+SMAA/CAS runs byte-identical across APIs.
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -353,7 +353,17 @@
+  * C2_120_RETRY_MS (doubling); only a failure at 60 closes the gate. Netplay
+  * and frame interpolation never engage it, and demo playback closes the
+  * gate as before. Every word is checked (c2_120_signature_ok) on top of the
+- * 60 FPS anchors, and everything reverts with the gate. */
++ * 60 FPS anchors, and everything reverts with the gate.
++ *
++ * The host is judged harder at 120 than at 60, because what it costs is
++ * worse: a machine that cannot emulate and draw 120 fields a second does not
++ * drop frames, it runs the whole game - music included - in slow motion. One
++ * failed window steps down (C2_120_HOST_STREAK), and since that is about the
++ * machine rather than the scene, a load does not forgive it: the retry keeps
++ * backing off, to C2_120_HOST_RETRY_MAX, until ten comfortable seconds at 120
++ * say otherwise. Measured on the first build, which kept 120 regardless: 68 to
++ * 96 VBlanks a second at 5x internal resolution with level code interpreted -
++ * the game at 0.57-0.80 of its speed. */
+ #define C2_120_SND_FN        0x8005EFE0u  /* libsnd tick, called per VBlank */
+ #define C2_120_SND_MODE      0x8005EFD8u  /* libsnd tick mode; 5 = VSync */
+ #define C2_120_SND_TICK      0x80054F04u
+@@ -368,6 +378,8 @@
+ #define C2_120_CPU_CAP       400
+ #define C2_120_RETRY_MS      10000u       /* 10s, 20s, then 40s */
+ #define C2_120_GIVE_UP       3            /* ...then 60 until a quiet window */
++#define C2_120_HOST_STREAK   1u           /* one slow window steps down */
++#define C2_120_HOST_RETRY_MAX 160000u     /* host: 10s doubling to 160s */
+ 
+ static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
+ static int c2_60_cpu_pct = 200;        /* what the setting asked for */
+@@ -450,6 +462,9 @@ static int c2_120_stalled;              /* dropped by a loop-less stretch */
+ static unsigned c2_120_quick;           /* quick loops since */
+ static int c2_120_fails, c2_120_latched;
+ static unsigned long long c2_120_retry_at, c2_120_good_ms;
++/* Host-caused step-downs, kept apart: a load forgives a scene, not a machine. */
++static int c2_120_host_fails;
++static unsigned long long c2_120_host_retry_at, c2_120_host_fallbacks;
+ static unsigned long long c2_120_engaged, c2_120_fallbacks, c2_120_stalls;
+ static int c2_120_interp_noted;
+ 
+@@ -673,8 +688,9 @@ static void c2_120_drop(void)
+     c2_60_win_ms = 0;
+ }
+ 
+-/* A window failed at 120: 60 with the gate open, and 120 again later. */
+-static void c2_120_fall_back(unsigned long long now)
++/* A window failed at 120: 60 with the gate open, and 120 again later. A
++ * host failure backs off on its own schedule, which loads do not reset. */
++static void c2_120_fall_back(unsigned long long now, int host)
+ {
+     c2_120_drop();
+     c2_60_apply_clock(c2_60_gate_cpu());
+@@ -682,6 +698,15 @@ static void c2_120_fall_back(unsigned long long now)
+     c2_120_good_ms = 0;
+     c2_60_host_bad = 0;
+     c2_60_hold_bad = 0;
++    if (host) {
++        unsigned long long wait =
++            (unsigned long long)C2_120_RETRY_MS << (c2_120_host_fails < 5 ? c2_120_host_fails : 5);
++        if (wait > C2_120_HOST_RETRY_MAX) wait = C2_120_HOST_RETRY_MAX;
++        c2_120_host_retry_at = now + wait;
++        if (c2_120_host_fails < 16) c2_120_host_fails++;
++        c2_120_host_fallbacks++;
++        return;
++    }
+     c2_120_retry_at = now
+         + (C2_120_RETRY_MS << (c2_120_fails < 2 ? c2_120_fails : 2));
+     if (c2_120_fails < 16) c2_120_fails++;
+@@ -689,8 +714,8 @@ static void c2_120_fall_back(unsigned long long now)
+ }
+ 
+ /* A completed window's say on 120's penalty: a quiet one - a load, a 2D
+- * screen - is a new scene and clears it; a comfortable one at 120 counts
+- * towards forgiving past fallbacks. */
++ * screen - is a new scene and clears the scene's; a comfortable one at 120
++ * counts towards forgiving both. */
+ static void c2_120_note_window(int verdict)
+ {
+     if (verdict == C2_60_QUIET) {
+@@ -704,6 +729,7 @@ static void c2_120_note_window(int verdict)
+         if (c2_120_good_ms >= C2_60_CLEAR_MS) {
+             c2_120_fails = 0;
+             c2_120_latched = 0;
++            c2_120_host_fails = 0;
+             c2_120_good_ms = 0;
+         }
+     }
+@@ -746,7 +772,8 @@ static void c2_120_consider(CPUState *cpu, unsigned long long now)
+     extern int psx_netplay_active(void);
+     extern int psx_frame_interpolation_active(void);
+     if (!c2_120_want || c2_120_on || !c2_60_gate_open) return;
+-    if (c2_120_latched || now < c2_120_retry_at) return;
++    if (c2_120_latched || now < c2_120_retry_at || now < c2_120_host_retry_at)
++        return;
+     if (c2_120_stalled && c2_120_quick < C2_120_REARM_LOOPS) return;
+     /* Unpaced scripts would run at four times their speed. */
+     if (!c2_60_gool_active || psx_netplay_active()) return;
+@@ -886,6 +913,10 @@ int crash2_60fps_fast_latched(void) { return c2_120_latched; }
+ unsigned long long crash2_60fps_fast_engaged(void) { return c2_120_engaged; }
+ unsigned long long crash2_60fps_fast_fallbacks(void) { return c2_120_fallbacks; }
+ unsigned long long crash2_60fps_fast_stalls(void) { return c2_120_stalls; }
++/* The fallbacks that were the machine (emulation or drawing too slow for 120),
++ * as opposed to a scene whose frames do not fit a 120 Hz field. The first is
++ * answered by lowering internal resolution; the second is not. */
++unsigned long long crash2_60fps_fast_host_fallbacks(void) { return c2_120_host_fallbacks; }
+ 
+ /* Live toggle for the debug server. Turning it off restores the original
+  * comparison and the original CPU clock in the same call, so an aborted
+@@ -906,6 +937,8 @@ void crash2_60fps_set_mode(int on)
+         c2_120_fails = 0;
+         c2_120_latched = 0;
+         c2_120_retry_at = 0;
++        c2_120_host_fails = 0;
++        c2_120_host_retry_at = 0;
+         c2_120_stalled = 0;
+     }
+ }
+@@ -933,6 +966,8 @@ void crash2_60fps_set_target_fps(int fps)
+     c2_120_fails = 0;
+     c2_120_latched = 0;
+     c2_120_retry_at = 0;
++    c2_120_host_fails = 0;
++    c2_120_host_retry_at = 0;
+     c2_120_stalled = 0;
+     if (!c2_120_want && c2_120_on) c2_120_drop();
+     if (c2_60_gate_open && !c2_120_on) c2_60_apply_clock(c2_60_gate_cpu());
+@@ -1406,24 +1441,32 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+     c2_60_suspended = 0;
+ 
+     if (c2_60_gate_open) {
+-        /* "Prefer 60" is an explicit player choice. Keep reporting a host or
+-         * cadence failure for diagnostics, but do not silently undo that
+-         * choice by restoring the game's 30 Hz gate. */
++        /* Between windows there is nothing to judge. This has to come first:
++         * the "Prefer 60" branch below clears the failure streaks, and it
++         * used to run on these loops too - every loop but the one that closed
++         * a window - so under the launcher's forced gate a host that could not
++         * keep 120 never stepped down and the game ran in slow motion. */
++        if (verdict == C2_60_PENDING) {
++            c2_120_consider(cpu, now);
++            return;
++        }
+         /* At 120 a failed window steps down to 60 with the gate still open -
+-         * under "Prefer 60" too, which promises 60, not 120. The host gets
+-         * the same second chance it gets at 60. */
++         * under "Prefer 60" too, which promises 60, not 120. */
+         c2_120_note_window(verdict);
+         if (c2_120_on && verdict == C2_60_FAIL_HOST) {
+             c2_60_hold_bad = 0;
+-            if (++c2_60_host_bad >= C2_60_HOST_STREAK)
+-                c2_120_fall_back(now);
++            if (++c2_60_host_bad >= C2_120_HOST_STREAK)
++                c2_120_fall_back(now, 1);
+             return;
+         }
+         if (c2_120_on && verdict == C2_60_FAIL_HOLD) {
+             c2_60_host_bad = 0;
+-            c2_120_fall_back(now);
++            c2_120_fall_back(now, 0);
+             return;
+         }
++        /* "Prefer 60" is an explicit player choice. Keep reporting a host or
++         * cadence failure for diagnostics, but do not silently undo that
++         * choice by restoring the game's 30 Hz gate. */
+         if (c2_60_force_gate) {
+             c2_60_host_bad = 0;
+             c2_60_hold_bad = 0;
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6382,9 +6382,16 @@ static void pause_menu_adjust(int delta) {
+         break;
+     case PSX_PAUSE_ROW_POSTFX:
+         /* The launcher's post-processing, on or off for this session - a
+-         * before/after comparison without relaunching. */
++         * before/after comparison without relaunching. The paused frame shows
++         * it at once: the pause loop's hold-last redraw re-runs the output
++         * chain on the pre-effect image (gpu_gl_renderer.c). The texture
++         * dedither is part of drawing the scene, so it follows on resume.
++         *
++         * Not gl_renderer_invalidate_present(), which this used to call: that
++         * drops the held frame, and with it every redraw the pause loop makes -
++         * the menu itself stopped updating until it was closed, so the switch
++         * looked dead. */
+         postfx_set_enabled(!postfx_enabled());
+-        gl_renderer_invalidate_present();   /* no-op off GL */
+         break;
+     case PSX_PAUSE_ROW_LIVES:
+         crash2_cheat_set_lives(!crash2_cheat_lives_enabled());
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -386,11 +386,25 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh);
+  * and the OSD / menus after, so neither is post-processed. */
+ static int    s_pfx_bypass = 0;   /* redrawing an already post-processed image */
+ static GLuint s_pfx_fbo_now = 0;  /* target of the image draw in progress      */
++/* Where the chain last wrote, and for which drawable size. While the game is
++ * paused the window is redrawn from the drawable captured at the last live
++ * present, which carries that moment's effects; the chain's input still holds
++ * the image from before them, so the pause loop re-runs the chain over this
++ * rect and the menu's POST FX switch shows on the paused frame at once. */
++static int s_pfx_last_valid = 0;
++static int s_pfx_last_lx, s_pfx_last_ly, s_pfx_last_lw, s_pfx_last_lh;
++static int s_pfx_last_ww, s_pfx_last_wh;
+ 
+ static void image_target_begin(int lx, int ly, int lw, int lh) {
+     s_pfx_fbo_now = 0;
+-    if (!s_pfx_bypass && postfx_active())
++    /* Configured, not merely on: switched off for the session the image still
++     * goes through (glpfx_end copies it unchanged), so the input always holds
++     * the newest pre-effect frame for the paused redraw. */
++    if (!s_pfx_bypass && postfx_chain_wanted(postfx_settings())) {
+         s_pfx_fbo_now = (GLuint)glpfx_begin(lw, lh);
++        /* Drawn direct after all: there is no newer input to replay. */
++        if (!s_pfx_fbo_now) s_pfx_last_valid = 0;
++    }
+     if (s_pfx_fbo_now) {
+         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_pfx_fbo_now);
+         glViewport(0, 0, lw, lh);
+@@ -411,6 +425,10 @@ static void image_target_end(int lx, int ly, int lw, int lh) {
+     if (!s_pfx_fbo_now) return;
+     glpfx_end(lx, ly, lw, lh);
+     s_pfx_fbo_now = 0;
++    s_pfx_last_valid = 1;
++    s_pfx_last_lx = lx; s_pfx_last_ly = ly;
++    s_pfx_last_lw = lw; s_pfx_last_lh = lh;
++    SDL_GL_GetDrawableSize(s_win, &s_pfx_last_ww, &s_pfx_last_wh);
+ }
+ 
+ static int           s_raster_ok = 0;      /* full GPU pipeline available */
+@@ -1316,7 +1334,17 @@ static const char *TEX_FS =
+     "    float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
+     "    float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
+     "    float opac = w00 + w10 + w01 + w11;\n"
+-    "    rgb = (col5(c00)*w00 + col5(c10)*w10 + col5(c01)*w01 + col5(c11)*w11) / opac;\n"
++    "    vec3 k00 = col5(c00), k10 = col5(c10), k01 = col5(c01), k11 = col5(c11);\n"
++    "    /* Smooth each tap: bilinear only blends across texel borders, so at a\n"
++    "     * raised internal resolution the dither shows in every texel's interior\n"
++    "     * as plainly as with nearest sampling. Transparent taps weigh nothing. */\n"
++    "    if (u_dedither != 0) {\n"
++    "      k00 = dedither(iu, iv, k00);\n"
++    "      if (c10 != 0) k10 = dedither(iu + sx, iv, k10);\n"
++    "      if (c01 != 0) k01 = dedither(iu, iv + sy, k01);\n"
++    "      if (c11 != 0) k11 = dedither(iu + sx, iv + sy, k11);\n"
++    "    }\n"
++    "    rgb = (k00*w00 + k10*w10 + k01*w01 + k11*w11) / opac;\n"
+     "    float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10\n"
+     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
+     "    stp = stpf >= 0.5 ? 1 : 0;\n"
+@@ -4914,6 +4942,14 @@ int gl_renderer_present_hold_last(void) {
+         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
+                             0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0);
+         s_pfx_bypass = 0;
++        /* ...instead, redraw the game image from the chain's input, as it was
++         * before any effect, with whatever is switched on NOW - the pause
++         * menu's POST FX switch. Only for the drawable it was captured at: a
++         * resize while paused moves the rect. */
++        if (s_pfx_last_valid && postfx_chain_wanted(postfx_settings()) &&
++            ww == s_pfx_last_ww && wh == s_pfx_last_wh &&
++            s_hold_tw == ww && s_hold_th == wh)
++            glpfx_end(s_pfx_last_lx, s_pfx_last_ly, s_pfx_last_lw, s_pfx_last_lh);
+     } else {
+         present_rect_cropped(ww, wh, s_hold_force_4_3, &lx, &ly, &lw, &lh);
+         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
+--- a/runtime/src/gpu_gl_postfx.c
++++ b/runtime/src/gpu_gl_postfx.c
+@@ -634,7 +634,14 @@ static void draw(void) {
+ static GLint U(int prog, const char *name) { return f_GetUniformLocation(s_prog[prog], name); }
+ 
+ void glpfx_end(int lx, int ly, int lw, int lh) {
+-    const PostFxSettings *s = postfx_settings();
++    /* Switched off for the session (pause menu), the image still comes
++     * through here - so the input keeps the newest frame for a paused redraw -
++     * and leaves unchanged: the neutral set makes every pass a no-op and the
++     * composite a plain copy. */
++    static PostFxSettings neutral;
++    static int neutral_ready;
++    if (!neutral_ready) { postfx_parse(NULL, &neutral); neutral_ready = 1; }
++    const PostFxSettings *s = postfx_active() ? postfx_settings() : &neutral;
+     if (s_state <= 0 || !s_in.fbo) return;
+     const int w = s_w, h = s_h;
+     const float rw = 1.0f / (float)w, rh = 1.0f / (float)h;
+--- a/runtime/include/gpu_gl_postfx.h
++++ b/runtime/include/gpu_gl_postfx.h
+@@ -19,6 +19,11 @@ extern "C" {
+ #endif
+ 
+ unsigned glpfx_begin(int lw, int lh);
++/* Runs the chain from the input target into the window. It only reads the
++ * input, so calling it again later - the pause menu's redraw of a held frame
++ * - replays the chain on the same image with whatever is switched on now.
++ * With post-processing switched off for the session it copies the input
++ * through unchanged. */
+ void     glpfx_end(int lx, int ly, int lw, int lh);
+ /* Drop every GL object (context teardown). Safe to call when never used. */
+ void     glpfx_shutdown(void);
+--- a/runtime/src/gl12_hlsl/TEX_FS.hlsl
++++ b/runtime/src/gl12_hlsl/TEX_FS.hlsl
+@@ -91,7 +91,14 @@ PSOut main(PSIn i) {
+         float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;
+         float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;
+         float opac = w00 + w10 + w01 + w11;
+-        rgb = (col5(c00) * w00 + col5(c10) * w10 + col5(c01) * w01 + col5(c11) * w11) / opac;
++        float3 k00 = col5(c00), k10 = col5(c10), k01 = col5(c01), k11 = col5(c11);
++        if (u_dedither != 0) {
++            k00 = dedither(iu, iv, k00);
++            if (c10 != 0) k10 = dedither(iu + sx, iv, k10);
++            if (c01 != 0) k01 = dedither(iu, iv + sy, k01);
++            if (c11 != 0) k11 = dedither(iu + sx, iv + sy, k11);
++        }
++        rgb = (k00 * w00 + k10 * w10 + k01 * w01 + k11 * w11) / opac;
+         float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10
+                     + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;
+         stp = stpf >= 0.5 ? 1 : 0;
+--- a/runtime/src/gpu_gl12_shaders.h
++++ b/runtime/src/gpu_gl12_shaders.h
+@@ -208,7 +208,7 @@ static const Gl12ShaderDef GL12_SHADERS[] = {
+         "    o.pos.y = -o.pos.y;\n"
+         "    return o;\n"
+         "}\n" },
+-    { "TEX_FS", 0x68193c235db9de84ull, 1,
++    { "TEX_FS", 0x6af8c867c985336full, 1,
+         "// HLSL translation of gpu_gl_renderer.c TEX_FS (see gpu_gl12.h).\n"
+         "cbuffer PSU : register(b1) {\n"
+         "    int  u_semipass;\n"
+@@ -302,7 +302,14 @@ static const Gl12ShaderDef GL12_SHADERS[] = {
+         "        float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
+         "        float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
+         "        float opac = w00 + w10 + w01 + w11;\n"
+-        "        rgb = (col5(c00) * w00 + col5(c10) * w10 + col5(c01) * w01 + col5(c11) * w11) / opac;\n"
++        "        float3 k00 = col5(c00), k10 = col5(c10), k01 = col5(c01), k11 = col5(c11);\n"
++        "        if (u_dedither != 0) {\n"
++        "            k00 = dedither(iu, iv, k00);\n"
++        "            if (c10 != 0) k10 = dedither(iu + sx, iv, k10);\n"
++        "            if (c01 != 0) k01 = dedither(iu, iv + sy, k01);\n"
++        "            if (c11 != 0) k11 = dedither(iu + sx, iv + sy, k11);\n"
++        "        }\n"
++        "        rgb = (k00 * w00 + k10 * w10 + k01 * w01 + k11 * w11) / opac;\n"
+         "        float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10\n"
+         "                    + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
+         "        stp = stpf >= 0.5 ? 1 : 0;\n"
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -64,6 +64,8 @@ extern int      crash2_60fps_field_hz(void);
+ extern unsigned long long crash2_60fps_fast_engaged(void);
+ extern unsigned long long crash2_60fps_fast_fallbacks(void);
+ extern unsigned long long crash2_60fps_fast_stalls(void);
++/* ...of those fallbacks, the ones where the machine was too slow for 120. */
++extern unsigned long long crash2_60fps_fast_host_fallbacks(void);
+ extern int      crash2_60fps_fast_latched(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+@@ -941,6 +943,7 @@ static void heartbeat_write(void) {
+         "  \"native_120fps_engaged\":%llu,\n"
+         "  \"native_120fps_fallbacks\":%llu,\n"
+         "  \"native_120fps_stalls\":%llu,\n"
++        "  \"native_120fps_host_fallbacks\":%llu,\n"
+         "  \"native_120fps_latched\":%d,\n"
+         "  \"rewind_async_captures\":%llu,\n"
+         "  \"rewind_sync_captures\":%llu,\n"
+@@ -1030,6 +1033,7 @@ static void heartbeat_write(void) {
+         crash2_60fps_fast_engaged(),
+         crash2_60fps_fast_fallbacks(),
+         crash2_60fps_fast_stalls(),
++        crash2_60fps_fast_host_fallbacks(),
+         crash2_60fps_fast_latched(),
+         psx_rewind_async_captures(),
+         psx_rewind_sync_captures(),
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -7959,6 +7959,7 @@ static void handle_frame_rates(int id, const char *json)
+     extern int crash2_60fps_field_hz(void);
+     extern unsigned long long crash2_60fps_fast_fallbacks(void);
+     extern unsigned long long crash2_60fps_fast_stalls(void);
++    extern unsigned long long crash2_60fps_fast_host_fallbacks(void);
+     const double field_rate = 59.94 * (double)interrupts_vblank_divisor();
+ 
+     send_fmt("{\"id\":%d,\"ok\":true,\"seconds\":%.3f,"
+@@ -7974,6 +7975,7 @@ static void handle_frame_rates(int id, const char *json)
+              "\"native_60fps_script_steps\":%.2f,\"native_60fps_script_hooked\":%d,"
+              "\"native_fps_target\":%d,\"native_fps_field_hz\":%d,"
+              "\"native_120fps_fallbacks\":%llu,\"native_120fps_stalls\":%llu,"
++             "\"native_120fps_host_fallbacks\":%llu,"
+              "\"speed\":%.3f,\"perf_samples\":%d,"
+              "\"frame_ms_p50\":%.3f,\"frame_ms_p95\":%.3f,"
+              "\"frame_ms_p99\":%.3f,\"over_budget\":%d}",
+@@ -7987,6 +7989,7 @@ static void handle_frame_rates(int id, const char *json)
+              script_s, crash2_60fps_script_hooked(),
+              crash2_60fps_target_fps(), crash2_60fps_field_hz(),
+              crash2_60fps_fast_fallbacks(), crash2_60fps_fast_stalls(),
++             crash2_60fps_fast_host_fallbacks(),
+              raise_s / field_rate, psamples, p[0], p[1], p[2], (int)p[3]);
+ }
+ 

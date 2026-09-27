@@ -131,8 +131,8 @@ class ModsPage(QWidget):
 
         self._lay.addWidget(heading(
             "Mods",
-            "Enhancements and add-ons. These change how the game runs, so if "
-            "something misbehaves, switch the newest one off first."))
+            "Enhancements and add-ons. If something misbehaves, turn off the "
+            "newest one first."))
 
         self.problem_lbl = warn("")
         self.problem_lbl.setVisible(False)
@@ -142,9 +142,8 @@ class ModsPage(QWidget):
             self._lay.addWidget(card(
                 section("Packages that could not be read"),
                 *[warn(text) for text in self._scan_problems],
-                dim("The runtime rejects every mod when a package directory "
-                    "disagrees with its manifest, so these are worth fixing "
-                    "even if you do not want the package."),
+                dim("A package that doesn't match its manifest blocks all "
+                    "mods, so fix or remove it."),
                 tone="warn",
             ))
 
@@ -153,8 +152,7 @@ class ModsPage(QWidget):
                 section("Nothing installed"),
                 dim("No mod packages were found in:"),
                 dim(str(self.layout_.mod_packages)),
-                dim("Built-in enhancements are installed automatically once "
-                    "the game has been built."),
+                dim("Built-in enhancements appear once the game is built."),
             ))
         else:
             for package in self.packages:
@@ -305,9 +303,8 @@ class ModsPage(QWidget):
         button.clicked.connect(self._install)
         return card(
             section("Add a mod"),
-            dim("Mod packages are .psxmod files. They are checked before "
-                "anything is written - an archive with an unexpected layout "
-                "is refused rather than half-installed."),
+            dim("Mods are .psxmod files. Each is checked before it's "
+                "installed."),
             button,
             dim(f"Installed to: {self.layout_.mod_packages}"),
         )

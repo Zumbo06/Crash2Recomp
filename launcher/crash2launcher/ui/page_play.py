@@ -179,7 +179,8 @@ class PlayPage(PlayScene):
         self.slot_lbl = QLabel()
         self.input_lbl = QLabel()
         self.input_lbl.setToolTip("Configured input mode. Controller connection is detected by the game.")
-        self.renderer_lbl.setToolTip("Requested renderer; session details show values reported by the runtime.")
+        self.renderer_lbl.setToolTip("Requested renderer. Session details "
+                                     "show what actually ran.")
         for i, (name, value) in enumerate((
             ("Version", self.version_lbl), ("Renderer", self.renderer_lbl),
             ("Save slot", self.slot_lbl), ("Input", self.input_lbl),
@@ -252,8 +253,8 @@ class PlayPage(PlayScene):
             stat_row("Performance", self.perf_lbl),
             self.sixty_lbl,
             stat_row("Runtime reports", self.observed_lbl),
-            dim("These are what the runtime actually did, which can differ from "
-                "what was requested - the renderer clamps values it cannot honour."),
+            dim("What the game actually used; it can differ from what you "
+                "picked."),
         )
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -352,8 +353,8 @@ class PlayPage(PlayScene):
                     # before the script-pacing profile existed.
                     self._set_readiness(
                         "Rebuild recommended",
-                        "This build predates the 60 FPS speed fix - rebuild "
-                        "it in Setup, or play at 30 FPS until then.", "Warn")
+                        "Built before the 60 FPS fix. Rebuild in Setup, or "
+                        "play at 30 FPS.", "Warn")
                 else:
                     self._set_readiness("Ready to play", "Game build found · Settings apply on launch")
         self.notice.setVisible(bool(self.notice.text()))

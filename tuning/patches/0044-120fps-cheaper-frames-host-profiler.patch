@@ -1,0 +1,880 @@
+Native 120 FPS: cheaper frames, a fairer host check, and a profiler that
+says where the time goes.
+
+Reported: 120 FPS "can't keep 120 and drops to 60" at 2x internal resolution
+on Direct3D 12. The session's heartbeat: 5 engages, 4 fallbacks, all four
+host fallbacks - the machine could not produce 120 fields a second - with
+level-code compilation working again (0043). Frames at 120 are bound by the
+emulation thread: the game does ~1M PS1 cycles of work per field (0.9M at 60,
+where 400% clock changes nothing in stock-equivalent terms), and emulation,
+GPU emulation, recording and present share one 8.3 ms slot.
+
+Renderer (both APIs):
+  - PSX_GL_SEMI_BATCH on by default. Consecutive dual-source semi prims
+    (batch key 4: no mask check, not mode 2) share one draw. Checked
+    byte-identical to isolated draws in tuning/renderer_parity - overlapping
+    prims of one mode, modes 0/1/3 interleaved with an opaque prim between -
+    on GL and Direct3D 12, 1x-3x, nearest and bilinear, with and without
+    post-processing. Halves the draws of a semi-heavy frame; recording -20%.
+    PSX_GL_SEMI_BATCH=0 isolates again.
+
+Direct3D 12 (gpu_gl12.cpp): the command list remembers what it has bound -
+pipeline state, render target, viewport/scissor, the SRV table (reused while
+the same four views are bound, keyed by an SRV-slot generation so a rewritten
+slot misses), the sampler table, both constant buffers (per-program content
+versions from one global counter, moved only when a uniform write changes
+bytes), topology, blend factor, stencil ref - and a draw sets only what
+changed. Reset per command list and after the flip. Resource transitions are
+still checked on every draw. Recording on the parity bench: 0.59-0.65 ms ->
+0.39-0.42 ms a frame together with the batching (GL 0.31 -> 0.26); VRAM
+bit-identical to GL and the debug layer silent in 12 configurations.
+
+crash2_60fps.h: the host check at 120 has two tiers. A window under
+C2_120_HOST_FAR_HZ (108, 90%) steps down at once - that is slow motion anyone
+sees; one just short of 114 gets a second window, since a single hitch (a
+shader, a level-code DLL being published) can cost one. The rate of the
+window that stepped down is kept (native_120fps_fail_hz), so the Play page can
+say how many of the 120 the machine reached.
+
+host_profiler.c (new): a sampling profiler for the emulation thread. A helper
+thread suspends it ~500 times a second, reads the instruction pointer and
+resumes it - no locks while it is suspended - tagged with what the thread was
+doing (emulating, presenting, pacing; main.cpp marks them). 120 FPS profiles
+its first 20 s engaged and writes psx_host_profile.json next to the
+heartbeat; PSX_HOST_PROFILE=1 profiles a whole session, =0 never.
+tuning/scripts/host_profile.py names the addresses from the executable's own
+symbol table and splits the time by function and phase. The next 120 session
+therefore reports exactly what stands between this machine and 120.
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -78,6 +78,7 @@
+ #include <string.h>
+ 
+ #include "mod_plugins.h"
++#include "host_profiler.h"
+ 
+ #define C2_60_LOOP_PC    0x80011848u
+ #define C2_60_GATE_PC    0x8001685Cu
+@@ -357,9 +358,11 @@
+  *
+  * The host is judged harder at 120 than at 60, because what it costs is
+  * worse: a machine that cannot emulate and draw 120 fields a second does not
+- * drop frames, it runs the whole game - music included - in slow motion. One
+- * failed window steps down (C2_120_HOST_STREAK), and since that is about the
+- * machine rather than the scene, a load does not forgive it: the retry keeps
++ * drop frames, it runs the whole game - music included - in slow motion. A
++ * window far behind (under C2_120_HOST_FAR_HZ) steps down at once; one just
++ * short gets a second window, since a single hitch - a shader, a level-code
++ * DLL being published - can cost one. That is about the machine rather than
++ * the scene, so a load does not forgive it: the retry keeps
+  * backing off, to C2_120_HOST_RETRY_MAX, until ten comfortable seconds at 120
+  * say otherwise. Measured on the first build, which kept 120 regardless: 68 to
+  * 96 VBlanks a second at 5x internal resolution with level code interpreted -
+@@ -378,7 +381,8 @@
+ #define C2_120_CPU_CAP       400
+ #define C2_120_RETRY_MS      10000u       /* 10s, 20s, then 40s */
+ #define C2_120_GIVE_UP       3            /* ...then 60 until a quiet window */
+-#define C2_120_HOST_STREAK   1u           /* one slow window steps down */
++#define C2_120_HOST_FAR_HZ   108u         /* under 90% of 120: step down now */
++#define C2_120_PROFILE_S     20u          /* host_profiler.h, seconds at 120 */
+ #define C2_120_HOST_RETRY_MAX 160000u     /* host: 10s doubling to 160s */
+ 
+ static int c2_60_mode = -1;            /* -1 not read yet, 0 off, 1 on */
+@@ -436,6 +440,9 @@ static unsigned long long c2_60_win_ms, c2_60_win_vbl, c2_60_good_ms;
+ static unsigned long long c2_60_retry_at;
+ static unsigned c2_60_win_loops, c2_60_win_one_field;
+ static unsigned c2_60_loop_hz, c2_60_hold_seen;
++/* VBlanks per second over the last window, and at 120 the rate of the last
++ * window that stepped down for the host: how far short the machine was. */
++static unsigned c2_60_vbl_hz, c2_120_fail_hz;
+ /* Latched at the moment of the back-off. c2_60_hold_seen is the CURRENT
+  * window, and once the gate has closed every frame is two fields, so it reads
+  * 0 and says nothing about why. These say what the failing window actually
+@@ -674,6 +681,9 @@ static void c2_120_engage(void)
+     c2_120_engaged++;
+     c2_60_apply_clock(c2_120_cpu_pct);
+     c2_60_win_ms = 0;          /* each rate is judged on its own windows */
++    /* The one mode that runs out of host time by design: profile where the
++     * time goes, for its first seconds engaged (psx_host_profile.json). */
++    host_profiler_start("native120", C2_120_PROFILE_S);
+ }
+ 
+ /* Back to NTSC fields. Also runs from the VBlank edge, so it changes only the
+@@ -686,6 +696,7 @@ static void c2_120_drop(void)
+     c2_120_snd_restore();
+     c2_120_on = 0;
+     c2_60_win_ms = 0;
++    host_profiler_pause();
+ }
+ 
+ /* A window failed at 120: 60 with the gate open, and 120 again later. A
+@@ -699,6 +710,7 @@ static void c2_120_fall_back(unsigned long long now, int host)
+     c2_60_host_bad = 0;
+     c2_60_hold_bad = 0;
+     if (host) {
++        c2_120_fail_hz = c2_60_vbl_hz;
+         unsigned long long wait =
+             (unsigned long long)C2_120_RETRY_MS << (c2_120_host_fails < 5 ? c2_120_host_fails : 5);
+         if (wait > C2_120_HOST_RETRY_MAX) wait = C2_120_HOST_RETRY_MAX;
+@@ -917,6 +929,9 @@ unsigned long long crash2_60fps_fast_stalls(void) { return c2_120_stalls; }
+  * as opposed to a scene whose frames do not fit a 120 Hz field. The first is
+  * answered by lowering internal resolution; the second is not. */
+ unsigned long long crash2_60fps_fast_host_fallbacks(void) { return c2_120_host_fallbacks; }
++/* VBlanks per second of the last window that stepped down for the host -
++ * 0 if none has: how many of the 120 fields a second this machine managed. */
++unsigned crash2_60fps_fast_fail_hz(void) { return c2_120_fail_hz; }
+ 
+ /* Live toggle for the debug server. Turning it off restores the original
+  * comparison and the original CPU clock in the same call, so an aborted
+@@ -1006,6 +1021,7 @@ static int c2_60_window_verdict(unsigned long long now, unsigned long long vbl)
+     const unsigned long long vblanks = vbl - c2_60_win_vbl;
+     const unsigned loops = c2_60_win_loops, one_field = c2_60_win_one_field;
+     c2_60_loop_hz = (unsigned)((unsigned long long)loops * 1000u / span);
++    c2_60_vbl_hz = (unsigned)(vblanks * 1000u / span);
+     c2_60_hold_seen = loops ? (unsigned)((unsigned long long)one_field * 100u / loops) : 0u;
+     c2_60_script_hz = (unsigned)((unsigned long long)c2_60_win_steps * 1000u / span);
+     c2_60_win_ms = now;
+@@ -1455,7 +1471,7 @@ static void crash2_60fps(CPUState *cpu, uint32_t pc)
+         c2_120_note_window(verdict);
+         if (c2_120_on && verdict == C2_60_FAIL_HOST) {
+             c2_60_hold_bad = 0;
+-            if (++c2_60_host_bad >= C2_120_HOST_STREAK)
++            if (++c2_60_host_bad >= (c2_60_vbl_hz < C2_120_HOST_FAR_HZ ? 1u : 2u))
+                 c2_120_fall_back(now, 1);
+             return;
+         }
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -41,6 +41,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
+ #include "gpu_render.h"
+ #include "gpu_gl_renderer.h"
+ #include "gpu_postfx.h"
++#include "host_profiler.h"
+ /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
+ #define STBI_NO_STDIO
+ #include "../third_party/stb_image.h"
+@@ -2780,6 +2781,7 @@ static void netplay_soft_exit(const char *origin) {
+ }
+ 
+ static void shutdown_runtime(void) {
++    host_profiler_finish();
+     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
+      * off-thread JIT worker here; the worker no longer exists.) */
+     psx_netplay_shutdown();
+@@ -6588,6 +6590,7 @@ static void pause_menu_mouse_click(int mx, int my, int button) {
+ }
+ 
+ static void pause_menu_host_pause_loop(void) {
++    host_profiler_phase(HP_OTHER);
+     while (pause_menu_open) {
+         SDL_Event ev;
+         while (SDL_PollEvent(&ev)) {
+@@ -6640,6 +6643,7 @@ static void pause_menu_host_pause_loop(void) {
+         rewind_pause_present();
+         SDL_Delay(8);
+     }
++    host_profiler_phase(HP_PRESENT);
+     /* Swallow the closing press so it does not bleed into the guest pad. */
+     savestate_input_guard_arm();
+ }
+@@ -6656,6 +6660,12 @@ struct NetplayVblankEpilogue {
+ /* Called from gpu_vblank_tick() at each simulated vblank. */
+ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     NetplayVblankEpilogue ep{};
++    /* Host profile (host_profiler.h): all of this is presenting, bar the
++     * pacer's wait below; back to emulating when it returns. */
++    struct HostPhaseScope {
++        HostPhaseScope() { host_profiler_phase(HP_PRESENT); }
++        ~HostPhaseScope() { host_profiler_phase(HP_EMULATE); }
++    } host_phase_scope;
+     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
+      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
+      * next tick has a live native chain under its dispatch again. */
+@@ -7271,8 +7281,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+      * resim. */
+     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+         uint64_t perf_start = runtime_perf_section_begin();
+-        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace())
++        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
++            host_profiler_phase(HP_PACE);
+             frame_pacer_wait(&s_frame_pacer, guest_field_period_ms());
++            host_profiler_phase(HP_PRESENT);
++        }
+         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
+         latency_ring_mark(LAT_PACED);
+ 
+@@ -13620,6 +13633,10 @@ session_reboot:
+ #endif
+         /* Heartbeat always on — see freeze_heartbeat.c rationale. */
+         freeze_heartbeat_start("psx-runtime");
++        /* The sampling profiler samples THIS thread; it only runs when
++         * something starts it (native 120 FPS, or PSX_HOST_PROFILE=1). */
++        host_profiler_attach();
++        std::atexit(host_profiler_finish);
+     } else {
+ #ifndef PSX_NO_DEBUG_TOOLS
+         (void)debug_port;
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -66,6 +66,7 @@ extern unsigned long long crash2_60fps_fast_fallbacks(void);
+ extern unsigned long long crash2_60fps_fast_stalls(void);
+ /* ...of those fallbacks, the ones where the machine was too slow for 120. */
+ extern unsigned long long crash2_60fps_fast_host_fallbacks(void);
++extern unsigned crash2_60fps_fast_fail_hz(void);
+ extern int      crash2_60fps_fast_latched(void);
+ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+                                    sampled on the emulation thread */
+@@ -944,6 +945,7 @@ static void heartbeat_write(void) {
+         "  \"native_120fps_fallbacks\":%llu,\n"
+         "  \"native_120fps_stalls\":%llu,\n"
+         "  \"native_120fps_host_fallbacks\":%llu,\n"
++        "  \"native_120fps_fail_hz\":%u,\n"
+         "  \"native_120fps_latched\":%d,\n"
+         "  \"rewind_async_captures\":%llu,\n"
+         "  \"rewind_sync_captures\":%llu,\n"
+@@ -1034,6 +1036,7 @@ static void heartbeat_write(void) {
+         crash2_60fps_fast_fallbacks(),
+         crash2_60fps_fast_stalls(),
+         crash2_60fps_fast_host_fallbacks(),
++        crash2_60fps_fast_fail_hz(),
+         crash2_60fps_fast_latched(),
+         psx_rewind_async_captures(),
+         psx_rewind_sync_captures(),
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -298,6 +298,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/traps.c
+     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
+     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
++    ${PSXRECOMP_ROOT}/runtime/src/host_profiler.c
+     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/nd_intro_ot.c
+--- a/runtime/src/gpu_gl12.cpp
++++ b/runtime/src/gpu_gl12.cpp
+@@ -203,11 +203,16 @@ struct Program {
+     std::string log;
+     std::vector<Uni> unis;
+     std::vector<uint8_t> vcb, pcb;
++    /* Content versions of vcb/pcb, from one global counter so a program
++     * re-created at the same address never matches an old binding. */
++    uint64_t vcb_ver = 0, pcb_ver = 0;
+     int slot_unit[4] = {0, 0, 0, 0};
+     unsigned slot_used = 0;
+     uint32_t id = 0;
+ };
+ 
++uint64_t g_cb_ver = 0;
++
+ struct Query {
+     int slot0 = -1, slot1 = -1;   /* timestamp slots in the heap */
+     unsigned target = 0;
+@@ -321,6 +326,32 @@ struct Dev {
+ 
+     ID3D12RootSignature *root = nullptr;
+ 
++    /* What the open command list already has bound, so draw() only sets
++     * what changed: a PS1 frame is hundreds of small draws that mostly
++     * share targets, tables, constants and pipeline state, and every one
++     * re-set cost a driver call. Reset by open_list (a new list binds
++     * nothing) and by the only other binder, the flip in SwapWindow. */
++    struct Bound {
++        ID3D12PipelineState *pso = nullptr;
++        SIZE_T rtv = 0, dsv = 0;
++        bool target = false;
++        D3D12_VIEWPORT vp{};
++        D3D12_RECT sc{};
++        bool view = false;
++        SIZE_T srv[4] = {};
++        uint64_t srv_gen = 0;
++        bool table = false;
++        unsigned smp = ~0u;
++        const void *vprog = nullptr, *pprog = nullptr;
++        uint64_t vver = 0, pver = 0;
++        int topo = -1;
++        float bf[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
++        int sref = -1;
++    } bound;
++    /* Bumped whenever a CPU SRV slot is written or freed: a cached
++     * shader-visible table holds copies, so a rewritten slot must miss. */
++    uint64_t srv_gen = 1;
++
+     std::vector<Chunk *> chunk_free, chunk_now, chunk_pending;
+     std::vector<std::pair<uint64_t, IUnknown *>> dead;
+ 
+@@ -442,6 +473,7 @@ void open_list() {
+     ID3D12DescriptorHeap *heaps[2] = {D->gsrv, D->gsmp};
+     D->cl->SetDescriptorHeaps(2, heaps);
+     D->cl->SetGraphicsRootSignature(D->root);
++    D->bound = Dev::Bound();
+     D->open = true;
+     D->dirty = false;
+ }
+@@ -607,7 +639,7 @@ void tex_free(Tex *t) {
+     if (!t) return;
+     if (t->res) defer_release(t->res);
+     t->res = nullptr;
+-    if (t->srv >= 0) { D->srv.release(t->srv); t->srv = -1; }
++    if (t->srv >= 0) { D->srv.release(t->srv); t->srv = -1; D->srv_gen++; }
+     if (t->rtv >= 0) { D->rtv.release(t->rtv); t->rtv = -1; }
+     t->w = t->h = 0;
+ }
+@@ -633,6 +665,7 @@ bool tex_alloc(Tex *t, int w, int h, DXGI_FORMAT fmt, bool is_int) {
+     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+     sd.Texture2D.MipLevels = 1;
+     D->dev->CreateShaderResourceView(t->res, &sd, D->srv.at(t->srv));
++    D->srv_gen++;
+     return true;
+ }
+ 
+@@ -864,10 +897,18 @@ bool reflect_stage(Program *p, ID3DBlob *b, int stage) {
+ void write_uniform(Program *p, int loc, const void *data, int bytes) {
+     if (!p || loc < 0 || loc >= (int)p->unis.size()) return;
+     Uni &u = p->unis[(size_t)loc];
+-    if (u.vs_off >= 0 && (size_t)u.vs_off + (size_t)bytes <= p->vcb.size())
+-        std::memcpy(&p->vcb[(size_t)u.vs_off], data, (size_t)std::min(bytes, u.vs_size));
+-    if (u.ps_off >= 0 && (size_t)u.ps_off + (size_t)bytes <= p->pcb.size())
+-        std::memcpy(&p->pcb[(size_t)u.ps_off], data, (size_t)std::min(bytes, u.ps_size));
++    /* Only a real change moves the version: the renderer re-sets the same
++     * uniforms before every batch. */
++    if (u.vs_off >= 0 && (size_t)u.vs_off + (size_t)bytes <= p->vcb.size()) {
++        uint8_t *dst = &p->vcb[(size_t)u.vs_off];
++        const size_t n = (size_t)std::min(bytes, u.vs_size);
++        if (std::memcmp(dst, data, n) != 0) { std::memcpy(dst, data, n); p->vcb_ver = ++g_cb_ver; }
++    }
++    if (u.ps_off >= 0 && (size_t)u.ps_off + (size_t)bytes <= p->pcb.size()) {
++        uint8_t *dst = &p->pcb[(size_t)u.ps_off];
++        const size_t n = (size_t)std::min(bytes, u.ps_size);
++        if (std::memcmp(dst, data, n) != 0) { std::memcpy(dst, data, n); p->pcb_ver = ++g_cb_ver; }
++    }
+ }
+ 
+ /* ---- pipeline states ---------------------------------------------------- */
+@@ -1034,18 +1075,21 @@ ID3D12PipelineState *get_pso(Program *p, Vao *vao, int topo, DXGI_FORMAT rtv_fmt
+ void bind_target(Tex *ct, Rb *ds) {
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv = D->rtv.at(tex_rtv(ct));
+     barrier(ct->res, ct->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+     if (ds) {
+         barrier(ds->res, ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+-        D3D12_CPU_DESCRIPTOR_HANDLE dsv = D->dsv.at(ds->dsv);
+-        D->cl->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+-    } else {
+-        D->cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
++        dsv = D->dsv.at(ds->dsv);
+     }
++    Dev::Bound &B = D->bound;
++    if (B.target && B.rtv == rtv.ptr && B.dsv == (ds ? dsv.ptr : 0)) return;
++    D->cl->OMSetRenderTargets(1, &rtv, FALSE, ds ? &dsv : nullptr);
++    B.target = true;
++    B.rtv = rtv.ptr;
++    B.dsv = ds ? dsv.ptr : 0;
+ }
+ 
+ void set_view(Tex *ct) {
+     D3D12_VIEWPORT vp{(float)S.vp[0], (float)S.vp[1], (float)S.vp[2], (float)S.vp[3], 0.0f, 1.0f};
+-    D->cl->RSSetViewports(1, &vp);
+     D3D12_RECT r;
+     if (S.scissor) {
+         r.left = std::max(0, S.sc[0]);
+@@ -1057,7 +1101,15 @@ void set_view(Tex *ct) {
+     } else {
+         r.left = 0; r.top = 0; r.right = ct->w; r.bottom = ct->h;
+     }
++    Dev::Bound &B = D->bound;
++    if (B.view && std::memcmp(&B.vp, &vp, sizeof(vp)) == 0 &&
++        std::memcmp(&B.sc, &r, sizeof(r)) == 0)
++        return;
++    D->cl->RSSetViewports(1, &vp);
+     D->cl->RSSetScissorRects(1, &r);
++    B.view = true;
++    B.vp = vp;
++    B.sc = r;
+ }
+ 
+ void draw(unsigned mode, int first, int count) {
+@@ -1072,9 +1124,10 @@ void draw(unsigned mode, int first, int count) {
+     ID3D12PipelineState *ps = get_pso(p, vao, topo, ct->fmt, ds != nullptr);
+     if (!ps) return;
+ 
+-    /* Textures, samplers. */
+-    int table = gpu_desc_alloc(4);
+-    if (table < 0) { logf("out of shader-visible descriptors"); return; }
++    /* Textures, samplers. The table is reused while the same four views
++     * are bound; the state transitions are checked either way. */
++    Dev::Bound &B = D->bound;
++    D3D12_CPU_DESCRIPTOR_HANDLE srcs[4];
+     unsigned smp_bits = 0;
+     for (int slot = 0; slot < 4; slot++) {
+         D3D12_CPU_DESCRIPTOR_HANDLE srcd = D->srv.at(D->null_srv);
+@@ -1089,41 +1142,57 @@ void draw(unsigned mode, int first, int count) {
+                 srcd = D->srv.at(D->null_srv_uint);
+             }
+         }
+-        D3D12_CPU_DESCRIPTOR_HANDLE dstd = D->gsrv->GetCPUDescriptorHandleForHeapStart();
+-        dstd.ptr += (SIZE_T)(table + slot) * D->gsrv_inc;
+-        D->dev->CopyDescriptorsSimple(1, dstd, srcd, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        srcs[slot] = srcd;
++    }
++    bool same_views = B.table && B.srv_gen == D->srv_gen;
++    for (int slot = 0; slot < 4 && same_views; slot++)
++        same_views = B.srv[slot] == srcs[slot].ptr;
++    if (!same_views) {
++        const int table = gpu_desc_alloc(4);
++        if (table < 0) { logf("out of shader-visible descriptors"); return; }
++        for (int slot = 0; slot < 4; slot++) {
++            D3D12_CPU_DESCRIPTOR_HANDLE dstd = D->gsrv->GetCPUDescriptorHandleForHeapStart();
++            dstd.ptr += (SIZE_T)(table + slot) * D->gsrv_inc;
++            D->dev->CopyDescriptorsSimple(1, dstd, srcs[slot],
++                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++            B.srv[slot] = srcs[slot].ptr;
++        }
++        D3D12_GPU_DESCRIPTOR_HANDLE gt = D->gsrv->GetGPUDescriptorHandleForHeapStart();
++        gt.ptr += (UINT64)table * D->gsrv_inc;
++        D->cl->SetGraphicsRootDescriptorTable(2, gt);
++        B.table = true;
++        B.srv_gen = D->srv_gen;
+     }
+     bind_target(ct, ds);
+     set_view(ct);
+ 
+-    D->cl->SetPipelineState(ps);
+-    /* Constants. */
+-    if (!p->vcb.empty()) {
+-        Upload u = upload_alloc(p->vcb.size(), 256);
+-        if (!u.cpu) return;
+-        std::memcpy(u.cpu, p->vcb.data(), p->vcb.size());
+-        D->cl->SetGraphicsRootConstantBufferView(0, u.gpu);
+-    } else {
+-        Upload u = upload_alloc(256, 256);
++    if (B.pso != ps) {
++        D->cl->SetPipelineState(ps);
++        B.pso = ps;
++    }
++    /* Constants: re-uploaded only when this program's values changed. */
++    if (B.vprog != p || B.vver != p->vcb_ver) {
++        Upload u = upload_alloc(p->vcb.empty() ? 256 : p->vcb.size(), 256);
+         if (!u.cpu) return;
++        if (!p->vcb.empty()) std::memcpy(u.cpu, p->vcb.data(), p->vcb.size());
+         D->cl->SetGraphicsRootConstantBufferView(0, u.gpu);
++        B.vprog = p;
++        B.vver = p->vcb_ver;
+     }
+-    if (!p->pcb.empty()) {
+-        Upload u = upload_alloc(p->pcb.size(), 256);
+-        if (!u.cpu) return;
+-        std::memcpy(u.cpu, p->pcb.data(), p->pcb.size());
+-        D->cl->SetGraphicsRootConstantBufferView(1, u.gpu);
+-    } else {
+-        Upload u = upload_alloc(256, 256);
++    if (B.pprog != p || B.pver != p->pcb_ver) {
++        Upload u = upload_alloc(p->pcb.empty() ? 256 : p->pcb.size(), 256);
+         if (!u.cpu) return;
++        if (!p->pcb.empty()) std::memcpy(u.cpu, p->pcb.data(), p->pcb.size());
+         D->cl->SetGraphicsRootConstantBufferView(1, u.gpu);
++        B.pprog = p;
++        B.pver = p->pcb_ver;
++    }
++    if (B.smp != smp_bits) {
++        D3D12_GPU_DESCRIPTOR_HANDLE gs = D->gsmp->GetGPUDescriptorHandleForHeapStart();
++        gs.ptr += (UINT64)smp_bits * 4 * D->gsmp_inc;
++        D->cl->SetGraphicsRootDescriptorTable(3, gs);
++        B.smp = smp_bits;
+     }
+-    D3D12_GPU_DESCRIPTOR_HANDLE gt = D->gsrv->GetGPUDescriptorHandleForHeapStart();
+-    gt.ptr += (UINT64)table * D->gsrv_inc;
+-    D->cl->SetGraphicsRootDescriptorTable(2, gt);
+-    D3D12_GPU_DESCRIPTOR_HANDLE gs = D->gsmp->GetGPUDescriptorHandleForHeapStart();
+-    gs.ptr += (UINT64)smp_bits * 4 * D->gsmp_inc;
+-    D->cl->SetGraphicsRootDescriptorTable(3, gs);
+     if (topo == 2) {
+         float lc[4] = {(float)S.vp[2], (float)S.vp[3], S.line_width, 0.0f};
+         D->cl->SetGraphicsRoot32BitConstants(4, 4, lc, 0);
+@@ -1146,16 +1215,26 @@ void draw(unsigned mode, int first, int count) {
+             D->cl->IASetVertexBuffers(0, 1, &v);
+         }
+     }
+-    D->cl->IASetPrimitiveTopology(topo == 0 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+-                                            : D3D_PRIMITIVE_TOPOLOGY_LINELIST);
++    const int d3d_topo = topo == 0 ? 0 : 1;
++    if (B.topo != d3d_topo) {
++        D->cl->IASetPrimitiveTopology(d3d_topo == 0 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
++                                                    : D3D_PRIMITIVE_TOPOLOGY_LINELIST);
++        B.topo = d3d_topo;
++    }
+     if (S.blend) {
+         const bool alpha_const = S.bsrc == X_CONSTANT_ALPHA || S.bdst == X_CONSTANT_ALPHA ||
+                                  S.bsrc == X_ONE_MINUS_CONSTANT_ALPHA || S.bdst == X_ONE_MINUS_CONSTANT_ALPHA;
+         float f[4] = {S.bcolor[0], S.bcolor[1], S.bcolor[2], S.bcolor[3]};
+         if (alpha_const) f[0] = f[1] = f[2] = S.bcolor[3];
+-        D->cl->OMSetBlendFactor(f);
++        if (std::memcmp(B.bf, f, sizeof(f)) != 0) {
++            D->cl->OMSetBlendFactor(f);
++            std::memcpy(B.bf, f, sizeof(f));
++        }
++    }
++    if (S.stencil && ds && B.sref != (S.sref & 0xFF)) {
++        D->cl->OMSetStencilRef((UINT)(S.sref & 0xFF));
++        B.sref = S.sref & 0xFF;
+     }
+-    if (S.stencil && ds) D->cl->OMSetStencilRef((UINT)(S.sref & 0xFF));
+     D->cl->DrawInstanced((UINT)count, 1, 0, 0);
+     D->dirty = true;
+ }
+@@ -1417,6 +1496,8 @@ static void x_LinkProgram(unsigned p) {
+     pr->psb = compile_hlsl(pr->fdef->name, pr->fdef->hlsl, "ps_5_0");
+     if (!pr->vsb || !pr->psb) { pr->log = "HLSL compile failed"; return; }
+     pr->unis.clear(); pr->vcb.clear(); pr->pcb.clear(); pr->slot_used = 0;
++    pr->vcb_ver = ++g_cb_ver;
++    pr->pcb_ver = ++g_cb_ver;
+     if (!reflect_stage(pr, pr->vsb, 0) || !reflect_stage(pr, pr->psb, 1)) {
+         pr->log = "shader reflection failed";
+         return;
+@@ -2243,6 +2324,7 @@ void gl12_SwapWindow(SDL_Window *) {
+         D->cl->SetGraphicsRootDescriptorTable(3, D->gsmp->GetGPUDescriptorHandleForHeapStart());
+         D->cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+         D->cl->DrawInstanced(3, 1, 0, 0);
++        D->bound = Dev::Bound();
+     }
+     barrier(bb, bstate, D3D12_RESOURCE_STATE_PRESENT);
+     const uint64_t v = submit();
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -2331,11 +2331,13 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
+  * implementation for GL/VK/SW, see gpu_uv.h. */
+ #include "gpu_uv.h"
+ 
++/* On by default since 120 FPS made draw calls count: consecutive dual-source
++ * semi prims share one draw. PSX_GL_SEMI_BATCH=0 isolates them again. */
+ static int semi_batch_enabled(void) {
+     static int enabled = -1;
+     if (enabled < 0) {
+         const char *e = getenv("PSX_GL_SEMI_BATCH");
+-        enabled = (e && e[0] == '1') ? 1 : 0;
++        enabled = (e && e[0] == '0') ? 0 : 1;
+     }
+     return enabled;
+ }
+@@ -2402,12 +2404,16 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+          * prim alone (composited fully before the next), let opaque prims
+          * keep batching. Cost is one draw per semi prim.
+          *
+-         * PSX_GL_SEMI_BATCH=1 (A/B, default off) lets CONSECUTIVE dual-source
+-         * semi prims share one draw. Blending inside a draw is applied in
++         * CONSECUTIVE dual-source semi prims (batch key 4: no mask check, not
++         * mode 2) share one draw. Blending inside a draw is applied in
+          * primitive order and each fragment picks opaque-vs-blend itself, so
+          * only opaque/semi interleaving needs the split, and the batch key
+-         * already splits there (-1 vs 4). Off until the heartbeat's
+-         * semi_isolated count and a visual check say it is worth it. */
++         * already splits there (-1 vs 4). The two-pass path above is the one
++         * that mis-orders, and it stays isolated. Checked byte-identical to
++         * isolated draws in tuning/renderer_parity - overlapping prims of one
++         * mode, modes 0/1/3 interleaved, an opaque prim between - on both
++         * APIs; it halves the draws of a semi-heavy frame and cuts recording
++         * time by a fifth. PSX_GL_SEMI_BATCH=0 isolates every semi prim. */
+         int isolate = (semi >= 0) && !(batch_semi == 4 && semi_batch_enabled());
+         int reason = -1;
+         if (s_tb_n > 0) {
+--- /dev/null
++++ b/runtime/src/host_profiler.c
+@@ -0,0 +1,246 @@
++/* host_profiler.c - see host_profiler.h. */
++#include "host_profiler.h"
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++
++#define HP_SLOTS 32768u               /* distinct instruction pointers */
++#define HP_TOP   800                  /* written, by count             */
++#define HP_PATH  "psx_host_profile.json"
++
++typedef struct {
++    uint64_t ip;
++    uint32_t n[HP_PHASES];
++} HpSlot;
++
++static HpSlot  *s_slots;              /* allocated on first start       */
++static volatile LONG s_phase;
++static HANDLE   s_target;             /* the emulation thread           */
++static DWORD    s_target_id;
++static HANDLE   s_thread;             /* the sampler                    */
++/* 0 idle, 1 sampling, 2 paused, 3 finished (budget spent or shut down) */
++static volatile LONG s_state;
++static volatile LONG s_written;
++static char     s_tag[48];
++static uint64_t s_budget_us, s_active_us;
++static uint64_t s_samples, s_dropped, s_phase_n[HP_PHASES];
++static int      s_env = -1;           /* PSX_HOST_PROFILE: -1 unset, 0, 1 */
++
++static void hp_write(void);
++
++void host_profiler_attach(void)
++{
++    if (s_target) return;
++    s_target_id = GetCurrentThreadId();
++    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
++                         GetCurrentProcess(), &s_target,
++                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
++                             THREAD_QUERY_INFORMATION,
++                         FALSE, 0))
++        s_target = NULL;
++    const char *e = getenv("PSX_HOST_PROFILE");
++    s_env = (e && e[0]) ? (e[0] != '0') : -1;
++    if (s_env == 1) host_profiler_start("session", 60);
++}
++
++void host_profiler_phase(int phase)
++{
++    s_phase = phase;
++}
++
++/* One sample. Nothing here may take a lock the suspended thread could hold:
++ * no allocation, no loader or debug-help calls - only the context read. */
++static void hp_sample(void)
++{
++    if (SuspendThread(s_target) == (DWORD)-1) return;
++    CONTEXT ctx;
++    memset(&ctx, 0, sizeof(ctx));
++    ctx.ContextFlags = CONTEXT_CONTROL;
++    const BOOL ok = GetThreadContext(s_target, &ctx);
++    const LONG phase = s_phase;
++    ResumeThread(s_target);
++    if (!ok) return;
++#if defined(_M_X64) || defined(__x86_64__)
++    const uint64_t ip = (uint64_t)ctx.Rip;
++#else
++    const uint64_t ip = (uint64_t)ctx.Eip;
++#endif
++    const int ph = (phase >= 0 && phase < HP_PHASES) ? (int)phase : HP_OTHER;
++    s_samples++;
++    s_phase_n[ph]++;
++    uint32_t h = (uint32_t)((ip * 0x9E3779B97F4A7C15ull) >> 49) & (HP_SLOTS - 1u);
++    for (uint32_t probe = 0; probe < 64u; probe++) {
++        HpSlot *s = &s_slots[(h + probe) & (HP_SLOTS - 1u)];
++        if (s->ip == ip) { s->n[ph]++; return; }
++        if (s->ip == 0) { s->ip = ip; s->n[ph] = 1; return; }
++    }
++    s_dropped++;
++}
++
++static DWORD WINAPI hp_thread_main(LPVOID arg)
++{
++    (void)arg;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++    HANDLE timer = CreateWaitableTimerExW(NULL, NULL,
++                                          CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                          TIMER_ALL_ACCESS);
++    LARGE_INTEGER freq, last, now;
++    QueryPerformanceFrequency(&freq);
++    QueryPerformanceCounter(&last);
++    while (s_state != 3) {
++        /* Every 2 ms: ~500 samples a second, 10,000 in the 120 FPS budget.
++         * Each one stops the sampled thread for a few microseconds, so the
++         * rate is kept where that stays well under 1% of it - profiling a
++         * mode that is short of time must not be what tips it over. */
++        if (timer) {
++            LARGE_INTEGER due;
++            due.QuadPart = -20000;                  /* 2 ms, relative */
++            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
++                WaitForSingleObject(timer, 30);
++            else
++                Sleep(2);
++        } else {
++            Sleep(2);
++        }
++        QueryPerformanceCounter(&now);
++        const uint64_t dt = (uint64_t)(now.QuadPart - last.QuadPart) * 1000000ull /
++                            (uint64_t)freq.QuadPart;
++        last = now;
++        if (s_state != 1) continue;
++        s_active_us += dt;
++        hp_sample();
++        if (s_active_us >= s_budget_us) {
++            InterlockedExchange(&s_state, 3);
++            hp_write();
++        }
++    }
++    if (timer) CloseHandle(timer);
++    return 0;
++}
++
++int host_profiler_start(const char *tag, unsigned seconds)
++{
++    if (!s_target || s_env == 0) return 0;
++    if (s_state == 3) return 0;
++    if (s_state == 1) return 1;
++    if (!s_slots) {
++        s_slots = (HpSlot *)calloc(HP_SLOTS, sizeof(HpSlot));
++        if (!s_slots) return 0;
++        snprintf(s_tag, sizeof(s_tag), "%s", tag ? tag : "profile");
++        s_budget_us = (uint64_t)(seconds ? seconds : 20u) * 1000000ull;
++    }
++    InterlockedExchange(&s_state, 1);
++    if (!s_thread) {
++        s_thread = CreateThread(NULL, 0, hp_thread_main, NULL, 0, NULL);
++        if (!s_thread) { InterlockedExchange(&s_state, 0); return 0; }
++    }
++    return 1;
++}
++
++void host_profiler_pause(void)
++{
++    InterlockedCompareExchange(&s_state, 2, 1);
++}
++
++void host_profiler_finish(void)
++{
++    if (!s_thread) return;
++    InterlockedExchange(&s_state, 3);
++    WaitForSingleObject(s_thread, 1000);
++    hp_write();
++}
++
++static int hp_cmp(const void *a, const void *b)
++{
++    const HpSlot *x = *(const HpSlot *const *)a, *y = *(const HpSlot *const *)b;
++    const uint64_t nx = (uint64_t)x->n[0] + x->n[1] + x->n[2] + x->n[3];
++    const uint64_t ny = (uint64_t)y->n[0] + y->n[1] + y->n[2] + y->n[3];
++    return nx < ny ? 1 : nx > ny ? -1 : 0;
++}
++
++/* Module of an address, as a short name and a base, with a small cache. */
++static const char *hp_module(uint64_t ip, uint64_t *base)
++{
++    static struct { HMODULE h; char name[64]; } cache[64];
++    static int ncache;
++    HMODULE h = NULL;
++    *base = 0;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            (LPCWSTR)(uintptr_t)ip, &h) || !h)
++        return "?";
++    *base = (uint64_t)(uintptr_t)h;
++    for (int i = 0; i < ncache; i++)
++        if (cache[i].h == h) return cache[i].name;
++    char path[MAX_PATH];
++    DWORD n = GetModuleFileNameA(h, path, sizeof(path));
++    const char *name = "?";
++    if (n > 0) {
++        const char *slash = strrchr(path, '\\');
++        name = slash ? slash + 1 : path;
++    }
++    if (ncache < 64) {
++        cache[ncache].h = h;
++        snprintf(cache[ncache].name, sizeof(cache[ncache].name), "%s", name);
++        return cache[ncache++].name;
++    }
++    return "?";
++}
++
++static void hp_write(void)
++{
++    if (!s_slots || s_samples == 0) return;
++    if (InterlockedExchange(&s_written, 1)) return;
++    HpSlot **order = (HpSlot **)malloc(sizeof(HpSlot *) * HP_SLOTS);
++    if (!order) return;
++    int used = 0;
++    for (uint32_t i = 0; i < HP_SLOTS; i++)
++        if (s_slots[i].ip) order[used++] = &s_slots[i];
++    qsort(order, (size_t)used, sizeof(order[0]), hp_cmp);
++
++    FILE *f = fopen(HP_PATH, "w");
++    if (!f) { free(order); return; }
++    const uint64_t exe = (uint64_t)(uintptr_t)GetModuleHandleW(NULL);
++    fprintf(f, "{\n  \"tag\": \"%s\",\n  \"active_ms\": %llu,\n  \"samples\": %llu,\n"
++               "  \"dropped\": %llu,\n  \"distinct\": %d,\n  \"exe_base\": \"0x%llX\",\n"
++               "  \"phases\": {\"emulate\": %llu, \"present\": %llu, \"pace\": %llu, "
++               "\"other\": %llu},\n  \"leaf\": [\n",
++            s_tag, (unsigned long long)(s_active_us / 1000u),
++            (unsigned long long)s_samples, (unsigned long long)s_dropped, used,
++            (unsigned long long)exe,
++            (unsigned long long)s_phase_n[0], (unsigned long long)s_phase_n[1],
++            (unsigned long long)s_phase_n[2], (unsigned long long)s_phase_n[3]);
++    const int top = used < HP_TOP ? used : HP_TOP;
++    for (int i = 0; i < top; i++) {
++        const HpSlot *s = order[i];
++        uint64_t base = 0;
++        const char *mod = hp_module(s->ip, &base);
++        fprintf(f, "    {\"m\": \"%s\", \"rva\": \"0x%llX\", \"n\": [%u, %u, %u, %u]}%s\n",
++                mod, (unsigned long long)(base ? s->ip - base : s->ip),
++                s->n[0], s->n[1], s->n[2], s->n[3], i + 1 < top ? "," : "");
++    }
++    fprintf(f, "  ]\n}\n");
++    fclose(f);
++    free(order);
++    fprintf(stdout, "psxrecomp: host profile (%s, %llu samples) written to %s\n",
++            s_tag, (unsigned long long)s_samples, HP_PATH);
++}
++
++#else  /* !_WIN32 */
++
++void host_profiler_attach(void) {}
++void host_profiler_phase(int phase) { (void)phase; }
++int  host_profiler_start(const char *tag, unsigned seconds) { (void)tag; (void)seconds; return 0; }
++void host_profiler_pause(void) {}
++void host_profiler_finish(void) {}
++
++#endif
+--- /dev/null
++++ b/runtime/include/host_profiler.h
+@@ -0,0 +1,47 @@
++/* host_profiler.h - a sampling profiler for the emulation thread.
++ *
++ * A helper thread suspends the emulation thread about 500 times a second,
++ * reads its instruction pointer, resumes it, and counts. What the
++ * thread was doing at the time - emulating, presenting, waiting on the pacer -
++ * is a plain store the main loop makes (host_profiler_phase), sampled in the
++ * same breath. The result, psx_host_profile.json in the working directory,
++ * is a flat profile by module and address: tuning/scripts/host_profile.py
++ * names the addresses from the executable's symbol table.
++ *
++ * Nothing is sampled unless something starts it: native 120 FPS does, for its
++ * first seconds engaged (the one mode that runs out of host time by design),
++ * and PSX_HOST_PROFILE=1 profiles a whole session from the start.
++ * PSX_HOST_PROFILE=0 turns it off entirely. Windows only; elsewhere every call
++ * is a no-op. */
++#ifndef HOST_PROFILER_H
++#define HOST_PROFILER_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum {
++    HP_EMULATE = 0,   /* running guest code (and the GPU work it issues)  */
++    HP_PRESENT = 1,   /* the VBlank present body: render, post-fx, swap   */
++    HP_PACE    = 2,   /* waiting for the wall clock                       */
++    HP_OTHER   = 3,   /* menus, pause, anything else                      */
++    HP_PHASES  = 4
++};
++
++/* Once, on the thread to be sampled. */
++void host_profiler_attach(void);
++/* What that thread is doing now. A plain store; callable from anywhere. */
++void host_profiler_phase(int phase);
++/* Sample for up to `seconds` of active time under `tag`. One profile per
++ * session: a later call resumes the same one. Returns 1 while sampling. */
++int  host_profiler_start(const char *tag, unsigned seconds);
++/* Stop counting time and samples until the next start. */
++void host_profiler_pause(void);
++/* Write the profile if anything was sampled and it is not written yet. */
++void host_profiler_finish(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

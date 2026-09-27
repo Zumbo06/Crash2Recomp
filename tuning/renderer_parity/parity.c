@@ -15,6 +15,8 @@
 
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+#include "gpu_postfx.h"
+#include "host_profiler.h"
 
 extern const GpuRenderBackend *gl_backend_get(void);
 
@@ -121,6 +123,36 @@ static void scenario(const GpuRenderBackend *b) {
     }
     b->set_semi_transparency(0, 0);
 
+    /* Overlapping semi-transparent prims of one mode, back to back: the case
+     * batching them into one draw (PSX_GL_SEMI_BATCH) must get right - the
+     * blend is order-dependent, and within a draw it is applied in primitive
+     * order just as across separate draws. */
+    for (int m = 0; m < 4; m++) {
+        b->set_semi_transparency(1, m);
+        for (int i = 0; i < 12; i++)
+            b->draw_textured_triangle(200 + i * 3, 150 + m * 20 + i, 0, 0,
+                                      262 + i * 2, 158 + m * 20, 30, 0,
+                                      222, 196 + m * 5 - i, 0, 30,
+                                      0, 0, texpage(12, 0, 2, m));
+        for (int i = 0; i < 8; i++)
+            b->draw_flat_triangle(12 + i * 4, 62 + m * 30, 92, 70 + m * 30 + i,
+                                  32, 100 + m * 30, rgb15(4 + i * 3, 10, 31 - i * 3, 0));
+    }
+    /* ...and modes 0, 1 and 3 interleaved, which share one batch key (the
+     * mode rides per vertex), overlapping, with an opaque prim in between. */
+    for (int i = 0; i < 18; i++) {
+        const int m = (i % 3 == 2) ? 3 : (i % 3);
+        b->set_semi_transparency(1, m);
+        b->draw_textured_triangle(120 + i * 4, 20 + i * 2, 0, 0, 190 + i, 30, 30, 0,
+                                  140, 90 - i, 0, 30, 0, 0, texpage(12, 0, 2, m));
+        if (i == 9) {
+            b->set_semi_transparency(0, 0);
+            b->draw_textured_triangle(150, 30, 0, 0, 200, 40, 30, 0, 160, 80, 0, 30,
+                                      0, 480, texpage(10, 0, 0, 0));
+        }
+    }
+    b->set_semi_transparency(0, 0);
+
     /* Texture window: repeat an 8x8 corner. */
     b->set_texture_window((1u) | (1u << 5));
     b->draw_textured_rect(180, 60, 48, 32, 0, 0, 0, 480, texpage(10, 0, 0, 0));
@@ -209,6 +241,8 @@ int main(int argc, char **argv) {
     const GpuRenderBackend *b = gl_backend_get();
     b->init(g_vram);
     b->set_scale(scale);
+    /* PARITY_FILTER=1: bilinear texture sampling, TEX_FS's second path. */
+    if (getenv("PARITY_FILTER")) b->set_texture_filter(atoi(getenv("PARITY_FILTER")));
     gl_renderer_set_swap_interval(0);
     if (!gl_renderer_init_context(win)) { fprintf(stderr, "renderer init failed\n"); return 1; }
     printf("renderer: %s, scale %d\n", b->name, b->scale());
@@ -222,14 +256,23 @@ int main(int argc, char **argv) {
             bench_frame(b, i);
             gl_renderer_present_vram(0, 0, 320, 240, 1, 0);
         }
+        /* PARITY_PROFILE=1: sample this thread through the timed frames
+         * (psx_host_profile.json; tuning/scripts/host_profile.py reads it). */
+        const int profile = getenv("PARITY_PROFILE") != NULL;
+        if (profile) {
+            host_profiler_attach();
+            host_profiler_start(d3d ? "parity-d3d12" : "parity-gl", 600);
+        }
         const double f = (double)SDL_GetPerformanceFrequency();
         Uint64 t_draw = 0, t_present = 0;
         double worst_draw = 0.0;
         const Uint64 t0 = SDL_GetPerformanceCounter();
         for (int i = 0; i < n; i++) {
             const Uint64 a = SDL_GetPerformanceCounter();
+            host_profiler_phase(HP_EMULATE);
             bench_frame(b, i);
             const Uint64 m = SDL_GetPerformanceCounter();
+            host_profiler_phase(HP_PRESENT);
             gl_renderer_present_vram(0, 0, 320, 240, 1, 0);
             const Uint64 e = SDL_GetPerformanceCounter();
             t_draw += m - a;
@@ -237,6 +280,7 @@ int main(int argc, char **argv) {
             if ((double)(m - a) * 1000.0 / f > worst_draw) worst_draw = (double)(m - a) * 1000.0 / f;
         }
         const double ms = (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / f;
+        if (profile) host_profiler_finish();
         printf("bench: %d frames, %.3f ms/frame (%s, scale %d): record %.3f ms (worst %.3f), present %.3f ms\n",
                n, ms / n, b->name, scale, (double)t_draw * 1000.0 / f / n, worst_draw,
                (double)t_present * 1000.0 / f / n);
@@ -299,6 +343,17 @@ int main(int argc, char **argv) {
 
     /* 4. Hold-last: redraw the captured drawable. */
     gl_renderer_present_hold_last();
+
+    /* 4b. The pause menu's POST FX switch on that held frame: off, then on
+     *     again. With a chain configured the redraw replays it over the
+     *     pre-effect image, so "off" is the image without effects and "on"
+     *     is the held frame again (grain aside, which reseeds). */
+    if (getenv("PSX_POSTFX")) {
+        postfx_set_enabled(0);
+        gl_renderer_present_hold_last();
+        postfx_set_enabled(1);
+        gl_renderer_present_hold_last();
+    }
 
     /* 5. Native-wide compositor: a 400-wide surface for the buffer at x=0,
      *    margins cleared, a prim reaching into both margins mirrored. */

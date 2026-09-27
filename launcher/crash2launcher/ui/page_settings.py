@@ -298,8 +298,8 @@ class SettingsPage(QWidget):
 
         return card(
             section("Preset"),
-            dim("A starting point for the common cases. Presets never change "
-                "anything on the Advanced page."),
+            dim("Quick starting points. Presets never touch the Advanced "
+                "page."),
             buttons,
         )
 
@@ -333,12 +333,10 @@ class SettingsPage(QWidget):
             [(RENDERER_LABELS.get(r, r), r) for r in SELECTABLE_RENDERERS],
             self.settings.renderer, self._on_renderer)
         self.renderer.setToolTip(
-            "OpenGL is the default and the most tested.\n\n"
-            "Direct3D 12 is the same renderer running on Direct3D 12 - every "
-            "feature works the same way. Try it if OpenGL stutters or misbehaves "
-            "on your driver. If it cannot start, the game falls back to OpenGL "
-            "by itself.\n\n"
-            "Software is the reference rasterizer: slow, native resolution only.")
+            "OpenGL: the default, most tested.\n\nDirect3D 12: the same "
+            "renderer on Direct3D 12. Try it if OpenGL misbehaves; it falls "
+            "back to OpenGL if it can't start.\n\nSoftware: slow, native "
+            "resolution only.")
 
         self.scale = QComboBox()
         for n in range(1, MAX_SUPERSAMPLING + 1):
@@ -347,11 +345,8 @@ class SettingsPage(QWidget):
             self.scale.addItem(label, n)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
         self.scale.setToolTip(
-            "The game is rendered at this multiple of its own resolution and "
-            "scaled down to your window, which sharpens the image.\n\n"
-            "Higher values cost GPU performance. If the game stutters or drops "
-            "below full speed, lower it - the Play page shows the live frame "
-            "rate while you test.")
+            "Renders at this multiple of native resolution, then scales down "
+            "to your window. Higher looks sharper and costs GPU time.")
         self.scale.currentIndexChanged.connect(self._on_scale)
 
         # Internal resolution and 60 FPS interact, and they live on different
@@ -406,13 +401,11 @@ class SettingsPage(QWidget):
                 self.scale_warning,
                 row("Gameplay aspect", self.aspect),
                 row("Widescreen mode", self.ws_mode),
-                dim("Gameplay aspect is what the GAME renders; Screen shape is "
-                    "the window it is shown in. Keeping gameplay at 4:3 inside a "
-                    "16:9 screen, with Zoom turned up, fills the display without "
-                    "widening the view - so nothing pops in at the edges."),
-                dim("Leave Widescreen mode on the projection hack - native-wide "
-                    "needs per-game data Crash 2 does not have, and without it "
-                    "nothing widens at all."),
+                dim("Gameplay aspect is what the game draws; Screen shape is "
+                    "the window. 4:3 gameplay with Zoom fills a wide screen "
+                    "without pop-in at the edges."),
+                dim("Keep Widescreen mode on the projection hack: "
+                    "native-wide needs data Crash 2 doesn't have."),
             ),
         )
 
@@ -460,29 +453,19 @@ class SettingsPage(QWidget):
                 row("Zoom", self.present_zoom),
                 row("Stretch", self.present_stretch),
                 row("Vertical pan", self.present_pan),
-                dim("Two ways to fill the screen. Zoom scales the picture up "
-                    "and crops top and bottom - the shape stays exact but you "
-                    "lose scanlines. Stretch widens it instead - nothing is "
-                    "lost but the image is slightly wide. Mix them to taste; "
-                    "from 14:9 even full Stretch is only about 14%."),
-                dim("Vertical pan favours one edge once Zoom is cropping - "
-                    "use it if the mask and counters lose their top."),
+                dim("Zoom crops top and bottom; Stretch widens the picture. "
+                    "Mix them to fill the screen."),
+                dim("Moves the picture up or down while Zoom is cropping."),
                 row("Overscan crop", self.overscan),
-                dim("PS1 games often draw fewer than 240 scanlines and leave "
-                    "the rest black. Those bars are part of the image, so no "
-                    "image-fit mode can remove them - only this can. Leave it "
-                    "at None when Zoom is filling the screen: the zoom crop "
-                    "already swallows those lines, and doing both throws away "
-                    "picture twice."),
+                dim("Crops the unused black lines many PS1 games leave. Keep "
+                    "it at None while Zoom already crops."),
             ),
             card(
                 section("Geometry (PGXP)"),
                 self.geom,
                 self.persp,
-                dim("Measured on this port: PGXP trades texture shimmer for "
-                    "geometry pop-in and seam lines. Both are off in every "
-                    "preset for that reason - try them, but expect that "
-                    "trade."),
+                dim("PGXP fixes texture wobble but adds pop-in and seams in "
+                    "this game, so presets leave it off."),
             ),
         )
 
@@ -531,13 +514,10 @@ class SettingsPage(QWidget):
                 row("Volume", vol_row),
                 self.mute,
                 row("Latency", self.audio_latency_ms),
-                dim("How far ahead the game buffers sound. Lower responds "
-                    "faster; too low and it crackles. Drop to Safe if you "
-                    "hear crackling."),
+                dim("Lower responds faster; raise it if you hear crackling."),
                 self.audio_hq,
-                dim("Re-mixes the sound at higher precision. Slightly more "
-                    "CPU. The game checks it against the normal mix while it "
-                    "plays and falls back on its own if they ever disagree."),
+                dim("Higher-precision audio mix. Uses a little more CPU and "
+                    "falls back by itself if needed."),
             ),
         )
 
@@ -584,17 +564,13 @@ class SettingsPage(QWidget):
                 section("Controller configuration · Player 1"),
                 self.pad_bindings,
                 row("Stick deadzone", self.pad_deadzone),
-                dim("How far a stick must move before the game sees it. Raise "
-                    "it if Crash creeps with the stick let go; lower it for a "
-                    "more responsive stick. 10% is the default."),
+                dim("Raise it if Crash drifts with the stick released. "
+                    "Default 10%."),
             ),
             card(
                 section("Save states"),
                 row("Quick save slot", self.quick_save_slot),
-                dim("The quick keys act on this slot. It is an ordinary slot, so "
-                    "a quick save still shows in the F7 menu with its thumbnail - "
-                    "point it somewhere else if you want your manual saves left "
-                    "untouched."),
+                dim("F5 and F9 use this slot. It also appears in the F7 menu."),
             ),
             card(
                 section("Keys while playing"),
@@ -611,25 +587,17 @@ class SettingsPage(QWidget):
                 section("Assists"),
                 self.cheat_infinite_lives,
                 row("Damage", self.cheat_aku_aku),
-                dim("Off by default. \"Keep 2 masks\" holds Aku Aku at two so "
-                    "a hit is always absorbed; temporary invincibility you "
-                    "already have is never reduced. \"No damage\" holds Crash "
-                    "in the invincible state the gold Aku Aku mask uses, so it "
-                    "permits everything that mask permits."),
-                dim("Neither stops falls, crushing or drowning, and both switch "
-                    "themselves off during the attract-mode demos so a recorded "
-                    "run cannot desync."),
+                dim("\"Keep 2 masks\" always absorbs a hit. \"No damage\" "
+                    "keeps Crash invincible, like the gold Aku Aku mask."),
+                dim("Neither stops falls, crushing or drowning. Both pause "
+                    "during demos."),
             ),
             card(
                 section("Before you turn these on"),
-                dim("They change saved progression. Lives and masks are written "
-                    "to your memory card as you play, so switching an assist "
-                    "off stops further writes but cannot undo values already "
-                    "saved. Copy the userdata folder first if you care "
-                    "about the file."),
-                dim("The Home menu has the same two rows and applies them "
-                    "immediately for that session; a choice made here applies "
-                    "on the next launch."),
+                dim("Assists change your save: lives and masks are written "
+                    "to the memory card as you play."),
+                dim("The Home menu has the same options and applies them "
+                    "right away."),
             ),
         )
 
@@ -680,59 +648,38 @@ class SettingsPage(QWidget):
                 row("V-sync", self.vsync),
                 self.interp,
                 row("Interpolation target", self.interp_fps),
-                dim("Interpolation changes only how many frames are PRESENTED. "
-                    "It blends between frames the game already drew and adds no "
-                    "simulation, so the game does not become more responsive - "
-                    "judge it by eye."),
+                dim("Adds blended in-between frames for smoothness. The game "
+                    "itself doesn't respond faster."),
             ),
             card(
                 section("Game update rate"),
                 self.native_60fps,
-                dim("Experimental native game updates, not interpolation. The "
-                    "game runs its own loop at 60 and stays there - it never "
-                    "hands a scene back to 30. World-speed, script and audio "
-                    "timing across the whole game are not yet validated. It "
-                    "runs the emulated PS1 CPU at 200%; your physical CPU is "
-                    "not overclocked. Relaunch to apply."),
+                dim("The game's own loop runs at 60, not interpolated. Uses "
+                    "200% virtual PS1 CPU. Experimental; relaunch to apply."),
                 self.native_120fps,
-                dim("Runs the game's own loop at 120 on top of 60 FPS: "
-                    "physics every 120 Hz refresh, game logic and music at "
-                    "their normal speed. Worth it only on a 120 Hz or "
-                    "faster display. It steps down to 60 by itself when a "
-                    "scene cannot hold 120, uses 400% virtual PS1 CPU, and "
-                    "turns frame interpolation off. Experimental - physics "
-                    "at 120 has not been validated across the game."),
-                dim("Keep native level-code compilation on, below. With it off "
-                    "every level function runs interpreted and almost nothing "
-                    "will hold 60."),
-                dim("If 60 is unsteady, the first thing to lower is Internal "
-                    "resolution on the Video page - not this. At 5x the "
-                    "renderer draws twenty-five times the pixels of native, "
-                    "and running the game at 60 instead of 30 doubles that "
-                    "again. That is usually what runs out first: the game "
-                    "itself keeps its 60 Hz cadence while the machine falls "
-                    "behind drawing it."),
+                dim("Runs the game loop at 120; game logic and music keep "
+                    "normal speed. Needs a 120 Hz+ display and a fast CPU, "
+                    "and drops to 60 when it can't keep up. Experimental."),
+                dim("Keep \"Compile level code natively\" on (below), or 60 "
+                    "FPS won't hold."),
+                dim("If 60 FPS stutters, lower Internal resolution on the "
+                    "Video page first."),
             ),
             card(
                 section("Execution"),
                 self.native_overlays,
-                dim("Crash 2 streams level code from disc. Without this it runs "
-                    "on the MIPS interpreter - correct, but far slower."),
+                dim("Compiles streamed level code instead of interpreting "
+                    "it. Much faster."),
                 row("Rewind", self.rewind),
-                dim("F8 rewinds. The game saves a snapshot every few frames "
-                    "whether you use it or not, so turning this off gives that "
-                    "work back."),
+                dim("F8 rewinds. Turn it off to skip the snapshot work."),
             ),
             card(
                 section("Reporting"),
                 self.fps_telemetry,
-                dim("Feeds the performance line on the Play page. Costs "
-                    "nothing but a line in the log."),
+                dim("Shows performance on the Play page."),
                 self.developer_mode,
-                dim("Adds the Advanced page: capture and measurement tools "
-                    "used to investigate bugs. They can make the game slower "
-                    "or sound worse, so they stay switched off, and unreachable, "
-                    "unless you turn this on."),
+                dim("Adds the Advanced page with debugging tools, which can "
+                    "slow the game down."),
             ),
         )
 
@@ -747,10 +694,8 @@ class SettingsPage(QWidget):
         reset.clicked.connect(self._reset_postfx)
         return card(
             section("Post-processing"),
-            dim("Applied to the finished picture at your screen's resolution, "
-                "after the downsample filter. The pause menu (POST FX) turns "
-                "it off and on in-game for a before/after comparison. "
-                "Everything at its default costs nothing."),
+            dim("Effects on the final picture. Toggle POST FX in the Home "
+                "menu to compare."),
             row("Edge smoothing", self.postfx_aa),
             row("Sharpening", self._postfx_slider("postfx_sharpen")),
             row("Brightness", self._postfx_slider("postfx_brightness")),
@@ -763,12 +708,8 @@ class SettingsPage(QWidget):
             row("Vignette", self._postfx_slider("postfx_vignette")),
             row("Film grain", self._postfx_slider("postfx_grain")),
             self.postfx_dedither,
-            dim("PS1 artists often painted a checkerboard dither into "
-                "textures to hide 15-bit colour banding on a CRT. This "
-                "softens it where "
-                "neighbouring texels differ by a shade or two and leaves real "
-                "detail - edges, lines, text - alone. The renderer already "
-                "draws shading in full colour, without the PS1's own dither."),
+            dim("Smooths the checkerboard dither in PS1 textures; edges and "
+                "text stay sharp."),
             reset,
         )
 
@@ -951,19 +892,12 @@ class SettingsPage(QWidget):
                     and self.settings.supersampling > limit)
         if too_high and fast:
             self.scale_warning.setText(
-                "<b>At 120 FPS this is likely to cost you frames.</b> "
-                "The renderer draws twice as many frames as at 60, and "
-                "when it cannot keep up the game steps down to 60. Try "
-                "%dx, and watch the readout on the Play page."
+                "<b>Likely too high for 120 FPS.</b> Try %dx."
                 % RECOMMENDED_SUPERSAMPLING_120FPS)
         elif too_high:
             self.scale_warning.setText(
-                "<b>At 60 FPS this is likely to cost you frames.</b> "
-                "%dx was measured missing about a third of its presents while "
-                "the game itself was still keeping up - the renderer runs out "
-                "first. Try %dx, and watch the readout on the Play page."
-                % (self.settings.supersampling,
-                   RECOMMENDED_SUPERSAMPLING_60FPS))
+                "<b>Likely too high for 60 FPS.</b> Try %dx."
+                % RECOMMENDED_SUPERSAMPLING_60FPS)
         self.scale_warning.setVisible(too_high)
 
     def _on_scale(self, index: int) -> None:

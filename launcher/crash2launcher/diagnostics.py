@@ -57,6 +57,7 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   "native_fps_target", "native_fps_field_hz",
                   "native_120fps_engaged", "native_120fps_fallbacks",
                   "native_120fps_stalls", "native_120fps_latched",
+                  "native_120fps_host_fallbacks", "native_120fps_fail_hz",
                   # Rewind captures by path: sync ones stalled on the GPU
                   # (the periodic dip in the 1% lows before patch 0037).
                   "rewind_async_captures", "rewind_sync_captures",
@@ -110,7 +111,8 @@ def sixty_fps_sample(heartbeat_path: Path) -> dict | None:
               "native_60fps_cpu_now", "native_60fps_vsync_wide",
               "native_60fps_script_hz", "native_60fps_script_hooked",
               "game_frame_ticks", "native_fps_target", "native_fps_field_hz",
-              "native_120fps_fallbacks", "native_120fps_latched")
+              "native_120fps_fallbacks", "native_120fps_latched",
+              "native_120fps_host_fallbacks", "native_120fps_fail_hz")
     return {key: source[key] for key in wanted
             if isinstance(source.get(key), int)}
 
@@ -142,33 +144,42 @@ def sixty_fps_summary(sample: dict | None) -> tuple[str, str] | None:
     # defect worth saying out loud rather than a tuning problem.
     if cpu > 100 and sample.get("native_60fps_vsync_wide") == 0:
         return ("Warn",
-                "60 FPS: the CPU clock is raised but VSync's timeout was not "
-                "widened to match. Please report this with the Log page's "
-                "diagnostic export.")
+                "60 FPS: VSync timeout not widened for the raised clock. "
+                "Please report this (Log page export).")
     label = _rate_label(sample)
     # Asked for 120 and running 60: the runtime stepped down by itself.
     if (sample.get("native_fps_target") == 120
             and sample.get("native_fps_field_hz") == 60):
         if sample.get("native_120fps_latched") == 1:
             return ("Warn",
-                    "120 FPS: this scene kept missing 120, so it stays at 60 "
-                    "until the next load or menu.")
+                    "120 FPS: this scene can't hold 120; at 60 until the "
+                    "next load.")
+        # The two reasons need opposite answers, as at 60: a machine that
+        # cannot run 120 fields a second (it would be slow motion, so the
+        # runtime steps down within a second) is helped by a lower internal
+        # resolution; a scene whose frames do not fit 1/120 s is not.
+        host = sample.get("native_120fps_host_fallbacks", 0)
+        if isinstance(host, int) and host > 0:
+            got = sample.get("native_120fps_fail_hz", 0)
+            reached = (f"reached {got} of 120 FPS"
+                       if isinstance(got, int) and 0 < got < 120
+                       else "couldn't keep 120 at full speed")
+            return ("Warn",
+                    f"120 FPS: your PC {reached}, so it runs at 60 and "
+                    "retries. Lower Internal resolution or try OpenGL.")
         fallbacks = sample.get("native_120fps_fallbacks", 0)
         if isinstance(fallbacks, int) and fallbacks > 0:
             return ("Warn",
-                    "120 FPS: stepped down to 60 for now and retries by "
-                    "itself. If it keeps happening, lower Internal "
-                    "resolution on the Video page.")
+                    "120 FPS: some frames here need more than 1/120 s, so "
+                    "it runs at 60 and retries.")
     if verdict == VERDICT_FAIL_HOST:
         return ("Warn",
-                f"{label}: this machine is behind on DRAWING the frames. "
-                "Lower Internal resolution on the Video page - the game "
-                "itself is keeping up.")
+                f"{label}: your PC is behind. Lower Internal resolution.")
     if verdict == VERDICT_FAIL_HOLD:
         note = "" if held is None else f" - {held}% of frames fitted"
         return ("Warn",
-                f"{label}: some frames in this scene need longer than one "
-                f"refresh{note}. Internal resolution will not change this.")
+                f"{label}: some frames here need more than one "
+                f"refresh{note}.")
     if verdict == VERDICT_OK:
         note = "" if held is None else f" ({held}% of frames)"
         # Scripts step at the game's own 30 Hz while the picture runs at 60;
