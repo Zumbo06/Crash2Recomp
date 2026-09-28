@@ -1,0 +1,585 @@
+Quality of life: in-game changes are kept, the game pauses when it loses
+focus, fast-forward can toggle, and the Home menu's IMAGE FIT row works on
+every preset.
+
+Kept changes (PSX_MENU_PREFS_FILE). The Home menu's GAME ASPECT, IMAGE FIT,
+WINDOW MODE, FPS DISPLAY, POST FX, 99 LIVES and AKU AKU rows, the F readout
+key and the volume keys used to change only the running game ("MENU CHANGES
+APPLY NOW BUT RESET ON NEXT LAUNCH"). With the variable set - the launcher
+passes a file in its userdata folder - every value changed this session is
+written there as JSON under the launcher's own setting names (aspect,
+scaling_mode, fullscreen_mode, fps_overlay, postfx_enabled,
+cheat_infinite_lives, cheat_aku_aku, volume), and the launcher folds it into
+its settings when the game exits. Only values the player touched are written.
+The file is written when the menu closes and first thing in shutdown_runtime,
+never from the frame path, via a temp file and MoveFileExW. The footer says
+"CHANGES HERE ARE KEPT FOR NEXT TIME" (psx_pause_menu_set_persistent).
+
+IMAGE FIT takes the framing over. The launcher's Zoom and Stretch dials decide
+the present rect whenever they are set (letterbox_rect_aspect), so on the
+Enhanced preset (zoom 0, stretch 100) LETTERBOX, STRETCH and FILL drew the
+same picture. pause_menu_apply_fit now also sets zoom -1 and stretch 0, so
+each value looks like its name, and the kept change clears them too. POST FX
+with no effect configured (the row reads NONE) no longer flips hidden state.
+
+Pause on focus loss (PSX_PAUSE_ON_FOCUS_LOSS=1): losing window focus opens the
+Home menu once the game has started, outside netplay and other modals. While
+the window is unfocused the menu ignores the pad, so a controller used in
+another window cannot resume the game.
+
+Fast-forward toggle (PSX_FAST_FORWARD_TOGGLE=1): the fast-forward key switches
+it on and off instead of being held; PSX_FAST_FORWARD_SPEED keeps the cap.
+
+Restart through the launcher (PSX_RESTART_EXIT_CODE): RESTART GAME exits with
+that code instead of re-spawning itself, so the launcher, which could not see
+the re-spawned process, restarts it and keeps tracking the game.
+
+gpu_postfx.c: PSX_POSTFX_ENABLED=0 starts with the effects off while still
+loading them, so the POST FX row can switch them on. postfx_enabled/
+set_enabled/active/dedither_active read the environment first, so an early
+toggle cannot be overwritten by it.
+
+Release builds no longer eject the disc on Ctrl+C (a debug-build aid, now
+under #ifndef PSX_NO_DEBUG_TOOLS, with its Spanish log line in English), and
+the host refresh log prints SDL3's float refresh rate as a float.
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -580,9 +580,25 @@ static void fps_osd_set(int on) {
+     if (!enabled) host_osd_set_status(NULL);
+ }
+ 
++/* In-game changes the launcher keeps between sessions (PSX_MENU_PREFS_FILE);
++ * defined with the Home menu below. MENU_PREF_* name what changed. */
++enum {
++    MENU_PREF_ASPECT = 1u << 0,
++    MENU_PREF_FIT    = 1u << 1,
++    MENU_PREF_WINDOW = 1u << 2,
++    MENU_PREF_FPS    = 1u << 3,
++    MENU_PREF_POSTFX = 1u << 4,
++    MENU_PREF_LIVES  = 1u << 5,
++    MENU_PREF_AKU    = 1u << 6,
++    MENU_PREF_VOLUME = 1u << 7,
++};
++static void menu_prefs_note(unsigned bits);
++static void menu_prefs_write(void);
++
+ static void fps_telemetry_toggle(void) {
+     const int enabled = fps_osd_enabled() ? 0 : 1;
+     fps_osd_set(enabled);
++    menu_prefs_note(MENU_PREF_FPS);
+     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
+ }
+ 
+@@ -605,6 +621,17 @@ static int manual_fast_forward_multiplier(void) {
+     return value;
+ }
+ 
++/* PSX_FAST_FORWARD_TOGGLE=1: the fast-forward key switches it on and off
++ * instead of having to be held. */
++static int manual_fast_forward_toggle(void) {
++    static int value = -1;
++    if (value < 0) {
++        const char *e = std::getenv("PSX_FAST_FORWARD_TOGGLE");
++        value = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    return value;
++}
++
+ static void post_load_probe_stall_pc_note(uint32_t pc) {
+     if (!pc) return;
+     for (int i = 0; i < s_stall_pc_used; i++) {
+@@ -2781,6 +2808,8 @@ static void netplay_soft_exit(const char *origin) {
+ }
+ 
+ static void shutdown_runtime(void) {
++    /* Quit, Restart and closing the window all come through here. */
++    menu_prefs_write();
+     host_profiler_finish();
+     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
+      * off-thread JIT worker here; the worker no longer exists.) */
+@@ -6202,6 +6231,138 @@ static void pause_menu_sync_overlay(void) {
+                              pause_menu_confirm_armed);
+ }
+ 
++/* ---------------------------------------------------------------------
++ * In-game changes the launcher keeps
++ *
++ * The Home menu's display and assist rows, the F readout key and the volume
++ * keys change only the running game. With PSX_MENU_PREFS_FILE set - the
++ * launcher passes a path in its userdata folder - every value changed this
++ * session is written there as JSON, keyed by the launcher's own setting names,
++ * and the launcher folds it into its settings when the game exits. Only
++ * touched values are written, so one the player never changed cannot undo a
++ * launcher choice made while the game was running. Alt+Enter / Ctrl+F stay
++ * temporary: they flip the window without changing the configured mode.
++ *
++ * Written when the menu closes and on every orderly exit (shutdown_runtime),
++ * never from the frame path: a held volume key must not write a file per
++ * repeat.
++ * ------------------------------------------------------------------- */
++static unsigned s_menu_prefs_changed = 0;   /* MENU_PREF_* touched this session */
++static int      s_menu_prefs_dirty = 0;     /* changed since the last write */
++
++static const std::filesystem::path &menu_prefs_path(void) {
++    static int read = 0;
++    static std::filesystem::path path;
++    if (!read) {
++        read = 1;
++#if defined(_WIN32)
++        if (const wchar_t *e = _wgetenv(L"PSX_MENU_PREFS_FILE")) path = e;
++#else
++        if (const char *e = std::getenv("PSX_MENU_PREFS_FILE")) path = e;
++#endif
++    }
++    return path;
++}
++
++static void menu_prefs_note(unsigned bits) {
++    if (menu_prefs_path().empty()) return;
++    s_menu_prefs_changed |= bits;
++    s_menu_prefs_dirty = 1;
++}
++
++static void menu_prefs_write(void) {
++    if (!s_menu_prefs_dirty) return;
++    const std::filesystem::path &path = menu_prefs_path();
++    if (path.empty()) return;
++    static const char *const kFit[PSX_PAUSE_FIT_COUNT] = {
++        "letterbox", "stretch", "fill", "fit_width"   /* FIT_LABEL order */
++    };
++    static const char *const kAku[PSX_PAUSE_AKU_COUNT] = {
++        "off", "keep_masks", "no_damage"              /* C2_AKU_* order */
++    };
++    const unsigned c = s_menu_prefs_changed;
++    std::string json = "{\n";
++    char line[160];
++    if (c & MENU_PREF_ASPECT) {
++        const int i = pause_menu_aspect_index();
++        std::snprintf(line, sizeof(line), "  \"aspect\": \"%d:%d\",\n",
++                      kPauseAspect[i][0], kPauseAspect[i][1]);
++        json += line;
++    }
++    if (c & MENU_PREF_FIT) {
++        const int m = (g_present_fit_mode >= 0 &&
++                       g_present_fit_mode < PSX_PAUSE_FIT_COUNT)
++                      ? g_present_fit_mode : 0;
++        /* The fit took the framing over (pause_menu_apply_fit), so the dials
++         * it cleared are part of the change. */
++        std::snprintf(line, sizeof(line),
++                      "  \"scaling_mode\": \"%s\",\n"
++                      "  \"present_zoom\": -1,\n  \"present_stretch\": 0,\n",
++                      kFit[m]);
++        json += line;
++    }
++    if (c & MENU_PREF_WINDOW) {
++        std::snprintf(line, sizeof(line), "  \"fullscreen_mode\": %d,\n",
++                      (g_fullscreen >= 0 && g_fullscreen <= 2) ? g_fullscreen : 0);
++        json += line;
++    }
++    if (c & MENU_PREF_FPS) {
++        json += fps_osd_enabled() ? "  \"fps_overlay\": true,\n"
++                                  : "  \"fps_overlay\": false,\n";
++    }
++    if (c & MENU_PREF_POSTFX) {
++        json += postfx_enabled() ? "  \"postfx_enabled\": true,\n"
++                                 : "  \"postfx_enabled\": false,\n";
++    }
++    if (c & MENU_PREF_LIVES) {
++        json += crash2_cheat_lives_enabled()
++                    ? "  \"cheat_infinite_lives\": true,\n"
++                    : "  \"cheat_infinite_lives\": false,\n";
++    }
++    if (c & MENU_PREF_AKU) {
++        int a = crash2_cheat_aku_level();
++        if (a < 0 || a >= PSX_PAUSE_AKU_COUNT) a = 0;
++        std::snprintf(line, sizeof(line), "  \"cheat_aku_aku\": \"%s\",\n",
++                      kAku[a]);
++        json += line;
++    }
++    if (c & MENU_PREF_VOLUME) {
++        std::snprintf(line, sizeof(line), "  \"volume\": %d,\n",
++                      host_volume_get());
++        json += line;
++    }
++    if (json.size() >= 2 && json[json.size() - 2] == ',')
++        json.erase(json.size() - 2, 1);                  /* last comma */
++    json += "}\n";
++
++    /* Whole file or nothing: write beside it, then replace. */
++    std::filesystem::path tmp = path;
++    tmp += ".tmp";
++#if defined(_WIN32)
++    FILE *f = _wfopen(tmp.c_str(), L"wb");
++#else
++    FILE *f = std::fopen(tmp.c_str(), "wb");
++#endif
++    if (!f) return;
++    const bool wrote = std::fwrite(json.data(), 1, json.size(), f) == json.size();
++    const bool closed = std::fclose(f) == 0;
++    std::error_code ec;
++    if (!wrote || !closed) {
++        std::filesystem::remove(tmp, ec);
++        return;
++    }
++#if defined(_WIN32)
++    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
++        std::filesystem::remove(tmp, ec);
++        return;
++    }
++#else
++    std::filesystem::rename(tmp, path, ec);
++    if (ec) return;
++#endif
++    s_menu_prefs_dirty = 0;
++}
++
+ /* Request only - see g_pending_aspect. Safe to call from the pause loop. */
+ static void pause_menu_apply_aspect(int index) {
+     if (index < 0 || index >= PSX_PAUSE_ASPECT_COUNT) return;
+@@ -6260,10 +6421,19 @@ static void pause_menu_flush_pending(void) {
+     refresh_widescreen_projection();
+ }
+ 
++/* A fit picked here takes the framing over. The launcher's Zoom and Stretch
++ * dials decide the rect whenever they are set (letterbox_rect_aspect: zoom
++ * replaces the letterbox/fill choice, stretch 100 fills like STRETCH), so on
++ * a preset that sets them - Enhanced has zoom 0 and stretch 100 - LETTERBOX,
++ * STRETCH and FILL all drew the same picture and the row looked dead. Handing
++ * framing back to the fit makes every value look like its name; the launcher
++ * keeps the dials cleared too (menu_prefs_write). */
+ static void pause_menu_apply_fit(int mode) {
+     if (mode < 0 || mode >= PSX_PAUSE_FIT_COUNT) return;
+     g_present_fit_mode = mode;
+     gl_renderer_set_scaling_mode(mode);
++    gl_renderer_set_present_zoom(-1);
++    gl_renderer_set_present_stretch(0);
+ }
+ 
+ /* Live, no relaunch: the GL backend re-derives its viewport from
+@@ -6284,6 +6454,22 @@ static void pause_menu_apply_window_mode(int mode) {
+  * build (it needs PSX_HAS_GAME_CODEGEN + RECOMP_LAUNCHER), so re-exec the
+  * process with the exact command line we were started with. */
+ static void pause_menu_restart_game(void) {
++    /* Started by the launcher (PSX_RESTART_EXIT_CODE): exit with that code and
++     * let it start the game again. A process spawned from here is invisible to
++     * the launcher - its Play page went back to "Ready to play" over a running
++     * game - and the new session would miss the settings and in-game changes
++     * the launcher now holds. */
++    if (const char *e = std::getenv("PSX_RESTART_EXIT_CODE")) {
++        const int code = std::atoi(e);
++        if (code > 0 && code < 256) {
++            std::fprintf(stdout, "psxrecomp: restart requested from pause menu "
++                                 "(launcher restarts, exit code %d)\n", code);
++            std::fflush(stdout);
++            psx_crash_trace_set_exit_origin("pause_menu_restart");
++            shutdown_runtime();
++            std::exit(code);
++        }
++    }
+ #if defined(_WIN32)
+     STARTUPINFOW si;
+     PROCESS_INFORMATION pi;
+@@ -6328,6 +6514,7 @@ static void pause_menu_close(void) {
+     pause_menu_open = 0;
+     pause_menu_confirm_armed = 0;
+     pause_menu_sync_overlay();
++    menu_prefs_write();
+ }
+ 
+ static void pause_menu_toggle(SDL_Keycode opened_by_key) {
+@@ -6339,6 +6526,7 @@ static void pause_menu_toggle(SDL_Keycode opened_by_key) {
+     if (pause_menu_open) {
+         pause_menu_sel = 0;
+         pause_menu_open_key = opened_by_key;
++        psx_pause_menu_set_persistent(!menu_prefs_path().empty());
+     } else {
+         pause_menu_open_key = 0;
+     }
+@@ -6363,6 +6551,7 @@ static void pause_menu_adjust(int delta) {
+         while (i < 0) i += PSX_PAUSE_ASPECT_COUNT;
+         while (i >= PSX_PAUSE_ASPECT_COUNT) i -= PSX_PAUSE_ASPECT_COUNT;
+         pause_menu_apply_aspect(i);
++        menu_prefs_note(MENU_PREF_ASPECT);
+         break;
+     }
+     case PSX_PAUSE_ROW_FIT: {
+@@ -6370,6 +6559,7 @@ static void pause_menu_adjust(int delta) {
+         while (i < 0) i += PSX_PAUSE_FIT_COUNT;
+         while (i >= PSX_PAUSE_FIT_COUNT) i -= PSX_PAUSE_FIT_COUNT;
+         pause_menu_apply_fit(i);
++        menu_prefs_note(MENU_PREF_FIT);
+         break;
+     }
+     case PSX_PAUSE_ROW_WINDOW: {
+@@ -6377,10 +6567,12 @@ static void pause_menu_adjust(int delta) {
+         while (i < 0) i += PSX_PAUSE_WINDOW_COUNT;
+         while (i >= PSX_PAUSE_WINDOW_COUNT) i -= PSX_PAUSE_WINDOW_COUNT;
+         pause_menu_apply_window_mode(i);
++        menu_prefs_note(MENU_PREF_WINDOW);
+         break;
+     }
+     case PSX_PAUSE_ROW_FPS:
+         fps_osd_set(!fps_osd_enabled());
++        menu_prefs_note(MENU_PREF_FPS);
+         break;
+     case PSX_PAUSE_ROW_POSTFX:
+         /* The launcher's post-processing, on or off for this session - a
+@@ -6392,11 +6584,18 @@ static void pause_menu_adjust(int delta) {
+          * Not gl_renderer_invalidate_present(), which this used to call: that
+          * drops the held frame, and with it every redraw the pause loop makes -
+          * the menu itself stopped updating until it was closed, so the switch
+-         * looked dead. */
++         * looked dead.
++         *
++         * With no effect set the row reads NONE; there is nothing to switch,
++         * and flipping the hidden state would only be remembered as "off". */
++        if (!postfx_chain_wanted(postfx_settings()) && !postfx_settings()->dedither)
++            return;
+         postfx_set_enabled(!postfx_enabled());
++        menu_prefs_note(MENU_PREF_POSTFX);
+         break;
+     case PSX_PAUSE_ROW_LIVES:
+         crash2_cheat_set_lives(!crash2_cheat_lives_enabled());
++        menu_prefs_note(MENU_PREF_LIVES);
+         break;
+     case PSX_PAUSE_ROW_AKU: {
+         /* Three values, so it wraps like the aspect and fit rows rather than
+@@ -6405,6 +6604,7 @@ static void pause_menu_adjust(int delta) {
+         while (i < 0) i += PSX_PAUSE_AKU_COUNT;
+         while (i >= PSX_PAUSE_AKU_COUNT) i -= PSX_PAUSE_AKU_COUNT;
+         crash2_cheat_set_aku(i);
++        menu_prefs_note(MENU_PREF_AKU);
+         break;
+     }
+     default:
+@@ -6589,6 +6789,35 @@ static void pause_menu_mouse_click(int mx, int my, int button) {
+     pause_menu_activate();
+ }
+ 
++/* SDL_WINDOW_INPUT_FOCUS: keyboard events only arrive with it, but a pad
++ * reads the same with or without, so the menu checks. */
++static int pause_menu_window_focused(void) {
++    return sdl_window &&
++           (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
++}
++
++/* PSX_PAUSE_ON_FOCUS_LOSS=1: the game pauses behind the Home menu when its
++ * window loses focus (alt-tab, a click elsewhere), instead of playing on
++ * unattended. It stays paused until the player resumes it. */
++static int pause_on_focus_loss_enabled(void) {
++    static int value = -1;
++    if (value < 0) {
++        const char *e = std::getenv("PSX_PAUSE_ON_FOCUS_LOSS");
++        value = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    return value;
++}
++
++static void pause_menu_on_focus_lost(void) {
++    extern int fntrace_is_game_started(void);
++    if (!pause_on_focus_loss_enabled() || pause_menu_open) return;
++    /* Not during boot, not in netplay (the peer keeps running), and not over
++     * another modal - those are paused already. */
++    if (!fntrace_is_game_started() || psx_netplay_active()) return;
++    if (savestate_menu_open || psx_rewind_is_open()) return;
++    pause_menu_toggle(0);
++}
++
+ static void pause_menu_host_pause_loop(void) {
+     host_profiler_phase(HP_OTHER);
+     while (pause_menu_open) {
+@@ -6639,7 +6868,9 @@ static void pause_menu_host_pause_loop(void) {
+                     pause_menu_adjust(dy > 0 ? 1 : -1);
+             }
+         }
+-        pause_menu_poll_nav((uint32_t)SDL_GetTicks());
++        /* A pad used in another window must not resume the game. */
++        if (pause_menu_window_focused())
++            pause_menu_poll_nav((uint32_t)SDL_GetTicks());
+         rewind_pause_present();
+         SDL_Delay(8);
+     }
+@@ -6864,6 +7095,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                     close_controller();
+                     refresh_player_devices();
+                 }
++#if defined(PSX_SDL3)
++            } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
++#else
++            } else if (ev.type == SDL_WINDOWEVENT &&
++                       ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
++#endif
++                pause_menu_on_focus_lost();
+             } else if (ev.type == SDL_KEYDOWN) {
+ #if defined(PSX_SDL3)
+                 const SDL_Keymod mod = ev.key.mod;
+@@ -6917,11 +7155,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                     else if (savestate_submit_slot(psx_quick_slot(), 0))
+                         host_osd_push("Quick load", 1200);
+                 }
++#ifndef PSX_NO_DEBUG_TOOLS
++                /* Debug builds only: Ctrl+C forces a CD reinsert. In a release
++                 * build a common key chord must not eject the game's disc. */
+                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
+-                    std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
++                    std::fprintf(stdout, "[DEBUG] forcing a CD reinsert\n");
+                     debug_force_cd_reinsert();
+                     host_osd_push("CD reinsert", 1500);
+                 }
++#endif
+                 else if (!key_repeat &&
+                          host_keymap_match_event(HOST_KEYMAP_DISPLAY_PERF,
+                                                  (int)key, (int)scancode,
+@@ -6934,10 +7176,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                                                   (int)key, (int)scancode,
+                                                   (int)mod)) {
+                     host_volume_adjust(+5);
++                    menu_prefs_note(MENU_PREF_VOLUME);
+                 } else if (host_keymap_match_event(HOST_KEYMAP_VOLUME_DOWN,
+                                                     (int)key, (int)scancode,
+                                                     (int)mod)) {
+                     host_volume_adjust(-5);
++                    menu_prefs_note(MENU_PREF_VOLUME);
+                 }
+                 /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. Toggles between
+                  * windowed and the CONFIGURED tri-state mode (g_fullscreen: 1
+@@ -7167,7 +7411,22 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         const Uint8* keys = SDL_GetKeyboardState(NULL);
+         static int turbo_skip = 0;
+         static int turbo_was_down = 0;
+-        if (host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
++        static int turbo_key_prev = 0;
++        static int turbo_latched = 0;
++        const int turbo_key = host_keymap_down(HOST_KEYMAP_TURBO, keys,
++                                               (int)SDL_GetModState());
++        int turbo_on = turbo_key;
++        if (manual_fast_forward_toggle()) {
++            /* Toggle mode: each press flips it; the "on" message below is
++             * the same as for a held key. */
++            if (turbo_key && !turbo_key_prev) {
++                turbo_latched = !turbo_latched;
++                if (!turbo_latched) host_osd_push("Fast forward off", 900);
++            }
++            turbo_on = turbo_latched;
++        }
++        turbo_key_prev = turbo_key;
++        if (turbo_on) {
+             const int mult = manual_fast_forward_multiplier();
+             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
+             manual_turbo_active = true;
+@@ -13841,11 +14100,13 @@ session_reboot:
+             g_host_refresh_hz = host_hz;
+             if (host_hz >= 58.8 && host_hz <= 61.2) {
+                 g_frame_period_ms = 1000.0 / host_hz;
+-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+-                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
++                /* host_hz, not dm.refresh_rate: SDL3 made that a float, and
++                 * printed as %d it logged a garbage rate. */
++                std::printf("psxrecomp: sync-to-host-refresh: pacing to %.2f Hz panel "
++                            "(%.4f ms/frame)\n", host_hz, g_frame_period_ms);
+             } else {
+-                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+-                            "59.94 Hz pacing\n", dm.refresh_rate);
++                std::printf("psxrecomp: host panel %.2f Hz not ~60 Hz; keeping PSX "
++                            "59.94 Hz pacing\n", host_hz);
+             }
+         }
+     }
+--- a/runtime/src/psx_pause_menu.c
++++ b/runtime/src/psx_pause_menu.c
+@@ -70,6 +70,7 @@ static int s_lives_on;
+ static int s_aku_level;
+ static int s_postfx = -1;       /* last drawn value, see overlay_image */
+ static int s_confirm_armed;
++static int s_persistent;        /* changes are kept by the launcher */
+ static int s_dirty = 1;
+ static uint32_t s_panel[PM_W * PM_H];
+ 
+@@ -311,7 +312,8 @@ static void rasterize_panel(void)
+               "KEYS: ARROWS MOVE/CHANGE  ENTER SELECT  ESC CLOSE",
+               0xFFB8BDC8u, 1);
+     draw_text(s_panel, 32, 458,
+-              "MENU CHANGES APPLY NOW BUT RESET ON NEXT LAUNCH",
++              s_persistent ? "CHANGES HERE ARE KEPT FOR NEXT TIME"
++                           : "MENU CHANGES APPLY NOW BUT RESET ON NEXT LAUNCH",
+               0xFF7F8796u, 1);
+     s_dirty = 0;
+ }
+@@ -350,6 +352,14 @@ int psx_pause_menu_needs_present(void)
+     return s_open;
+ }
+ 
++void psx_pause_menu_set_persistent(int on)
++{
++    on = on ? 1 : 0;
++    if (s_persistent != on)
++        s_dirty = 1;
++    s_persistent = on;
++}
++
+ int psx_pause_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
+ {
+     if (!s_open) {
+--- a/runtime/include/psx_pause_menu.h
++++ b/runtime/include/psx_pause_menu.h
+@@ -66,6 +66,10 @@ void psx_pause_menu_set_state(int open, int selected,
+ 
+ int psx_pause_menu_needs_present(void);
+ 
++/* Non-zero when the launcher keeps what this menu changes (main.cpp writes it
++ * to PSX_MENU_PREFS_FILE). Only the footer's wording depends on it. */
++void psx_pause_menu_set_persistent(int on);
++
+ /* ARGB8888, top-down, fully opaque. Returns 0 and NULLs the outputs when the
+  * menu is closed. Stretched to the full window by both present paths. */
+ int psx_pause_menu_overlay_image(const uint32_t **pixels, int *w, int *h);
+--- a/runtime/src/gpu_postfx.c
++++ b/runtime/src/gpu_postfx.c
+@@ -81,6 +81,15 @@ const PostFxSettings *postfx_settings(void) {
+         const char *env = getenv("PSX_POSTFX");
+         postfx_parse(env, &s_settings);
+         s_loaded = 1;
++        /* PSX_POSTFX_ENABLED=0: the launcher's "Post-processing on" is off.
++         * The settings still load, so the Home menu's POST FX row can switch
++         * them on for a comparison. */
++        const char *on = getenv("PSX_POSTFX_ENABLED");
++        if (on && on[0] == '0') {
++            s_enabled = 0;
++            fprintf(stdout, "psxrecomp: post-processing starts off "
++                            "(PSX_POSTFX_ENABLED=0)\n");
++        }
+         if (env && env[0]) {
+             const PostFxSettings *s = &s_settings;
+             fprintf(stdout,
+@@ -103,13 +112,24 @@ int postfx_chain_wanted(const PostFxSettings *s) {
+            s->grain > 0.0f;
+ }
+ 
+-int  postfx_enabled(void) { return s_enabled; }
+-void postfx_set_enabled(int on) { s_enabled = on ? 1 : 0; }
++/* Each of these reads the environment first (postfx_settings), so a toggle
++ * made before the first frame cannot be overwritten by PSX_POSTFX_ENABLED. */
++int postfx_enabled(void) {
++    (void)postfx_settings();
++    return s_enabled;
++}
++
++void postfx_set_enabled(int on) {
++    (void)postfx_settings();
++    s_enabled = on ? 1 : 0;
++}
+ 
+ int postfx_active(void) {
+-    return s_enabled && postfx_chain_wanted(postfx_settings());
++    const PostFxSettings *s = postfx_settings();
++    return s_enabled && postfx_chain_wanted(s);
+ }
+ 
+ int postfx_dedither_active(void) {
+-    return s_enabled && postfx_settings()->dedither;
++    const PostFxSettings *s = postfx_settings();
++    return s_enabled && s->dedither;
+ }

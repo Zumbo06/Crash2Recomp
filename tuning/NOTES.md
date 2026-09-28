@@ -3106,3 +3106,81 @@ Recording on the parity bench, ms per frame:
 
 Launcher: explanations cut to a line each across Settings, Play, Mods,
 Advanced and Setup.
+
+## Part 23: 120 FPS goes behind Developer mode; quality of life
+
+Report after part 22: 120 FPS "hits 120 once or twice, otherwise 60, and when
+it hits it's laggy". The decision was to hide it behind Developer mode and
+spend the round on polish and quality of life.
+
+**120 FPS.**
+
+- `config.native_120fps_active()` now also requires `developer_mode`. That is
+  a hard gate, like the one on diagnostics, so a box left ticked in an old
+  settings.json does not run 120.
+- The checkbox reads "120 FPS (developer preview)" and shows only in
+  Developer mode. The runtime is unchanged: it runs 120 only when the launcher
+  sets `PSX_CRASH2_FPS=120`. The host profiler (part 22) starts only with 120,
+  so it is inert for players.
+
+**Patch 0045 (runtime).**
+
+- **Home-menu changes are kept.**
+  - With `PSX_MENU_PREFS_FILE` set, `menu_prefs_write` records the rows the
+    player changed this session, plus the F readout key and the volume keys.
+    It writes them as JSON under the launcher's own setting names.
+  - Only touched values are written, so a launcher change made mid-session is
+    not undone. Alt+Enter and Ctrl+F stay temporary.
+  - The file is written on menu close and first thing in `shutdown_runtime`,
+    never from the frame path, via temp file + `MoveFileExW`.
+  - `launcher/crash2launcher/ingame.py` validates each value against the
+    launcher's own rules. A 21:9 *game* aspect is refused by design: the
+    launcher offers 21:9 only as a screen shape (part on `OUTPUT_ASPECTS`).
+- **IMAGE FIT really changes the picture.**
+  - `letterbox_rect_aspect` lets a set Zoom dial replace the letterbox/fill
+    choice, and Stretch 100 fills like STRETCH.
+  - So on Enhanced (zoom 0, stretch 100) LETTERBOX, STRETCH and FILL drew the
+    same frame.
+  - A fit picked in the menu now clears zoom (-1) and stretch (0), in the game
+    and in the kept settings.
+- **Pause on focus loss** (`PSX_PAUSE_ON_FOCUS_LOSS`). Losing focus opens the
+  Home menu once the game has started, outside netplay and other modals. While
+  the window is unfocused the menu ignores the pad.
+- **Fast-forward toggle** (`PSX_FAST_FORWARD_TOGGLE`). The launcher also
+  passes `PSX_FAST_FORWARD_SPEED`, which existed but was never set.
+- **Restart through the launcher** (`PSX_RESTART_EXIT_CODE`, 75). RESTART GAME
+  used to `CreateProcessW` a child the launcher could not see, so the Play
+  page said "Ready to play" over a running game. Now the launcher restarts it.
+- **Post-processing master switch.** `PSX_POSTFX_ENABLED=0` starts the effects
+  off but loaded. POST FX with no effect set (NONE) no longer flips hidden
+  state.
+- **Two small fixes.**
+  - Ctrl+C "CD reinsert" is now debug-build only; it used to eject the disc in
+    release, with a Spanish log line.
+  - The SDL3 float refresh rate was printed with `%d`.
+
+**Launcher.**
+
+- **Hotkeys** (`hotkeys.py`): the runtime's `config.ini [KeyMap]`, edited on
+  Settings > Input, with clash warnings against the game's buttons.
+  - The Play page's key list and the game-key editor's warning now come from
+    the live bindings, not three hand-kept lists.
+  - The dead `turbo_key` setting is gone.
+- **Saves page** (`saves.py`, `page_saves.py`):
+  - the 12 slots with their thumbnails (runtime's "PSTH" format);
+  - Play from here (`PSX_LOAD_SLOT`, which the runtime already had);
+  - delete;
+  - memory-card backup and restore. A restore backs up the replaced cards
+    first and reads only members named like a card.
+- **Direct3D 12** loses "(experimental)": it holds up in play, and the parity
+  harness holds it to OpenGL's VRAM.
+- **Presets updated stale controls.** `_rebuild_from_settings` never re-synced
+  Zoom, Stretch, Vertical pan or Screen shape, which every preset sets. The
+  new check in `test_settings_apply.py` fails against the old code (zoom
+  combo 75 while the setting was 0).
+
+**Open.**
+
+- `PSX_LOAD_SLOT` at boot had not been used by this project's tools before.
+  If a boot-time load fails, the runtime says "Load failed slot N" and the
+  game starts normally.

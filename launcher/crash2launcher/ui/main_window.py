@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import config, modcatalog, paths
+from .. import config, ingame, modcatalog, paths
 from ..paths import Layout
 from ..runtime import GameSession, apply_config_settings
 from ..version import full_version
@@ -27,6 +27,7 @@ from .page_advanced import AdvancedPage
 from .page_log import LogPage
 from .page_mods import ModsPage
 from .page_play import PlayPage
+from .page_saves import SavesPage
 from .page_settings import SettingsPage
 from .page_setup import SetupPage
 from .theme import SIDEBAR_W, SPACE_3
@@ -42,6 +43,7 @@ from .theme import SIDEBAR_W, SPACE_3
 NAV_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ("PLAY", [
         ("play", "Play", ""),
+        ("saves", "Saves", ""),
         ("setup", "Setup", ""),
         ("mods", "Mods", ""),
     ]),
@@ -77,8 +79,8 @@ def nav_groups(developer: bool) -> list[tuple[str, list[tuple[str, str, str]]]]:
 
 # Which stack widget each nav key shows.
 _STACK_FOR = {
-    "play": "play", "setup": "setup", "mods": "mods", "log": "log",
-    "advanced": "advanced",
+    "play": "play", "saves": "saves", "setup": "setup", "mods": "mods",
+    "log": "log", "advanced": "advanced",
 }
 
 
@@ -111,11 +113,13 @@ class MainWindow(QWidget):
                       else layout_.runtime_exe.parent) / "psx_freeze_heartbeat.json"))
         self.advanced_page = AdvancedPage(settings)
         self.mods_page = ModsPage(layout_)
+        self.saves_page = SavesPage(layout_, settings, self.session)
 
         # Stack order is independent of the nav order now; _select maps.
         self._stack_index = {}
         for name, widget in (("setup", self.setup_page),
                              ("play", self.play_page),
+                             ("saves", self.saves_page),
                              ("settings", self.settings_page),
                              ("mods", self.mods_page),
                              ("log", self.log_page),
@@ -137,6 +141,13 @@ class MainWindow(QWidget):
         # The runtime rewrites state.toml as it exits, so whatever the page is
         # showing after a session is stale until it re-reads.
         self.session.finished.connect(lambda _code: self.mods_page.reload())
+        # What the player changed in the Home menu comes back when the game
+        # exits (ingame.py). Connected after the Play page's own handler, so
+        # its "Kept from the game" notice is not cleared straight away; the
+        # Play page also asks before every launch, which covers Relaunch.
+        self.session.finished.connect(lambda _code: self._import_ingame_changes())
+        self.play_page.before_launch = self._import_ingame_changes
+        self.saves_page.play_slot.connect(self._play_slot)
 
         # Stage the builtin mod catalog for an ALREADY-built game. _relayout
         # covers the just-finished-a-build case, but it never fires on an
@@ -146,6 +157,9 @@ class MainWindow(QWidget):
         count, detail = modcatalog.stage_builtin(layout_)
         if count or "skipping" not in detail:
             self.log_page.append(f"[launcher] {detail}")
+
+        # A game that outlived the last launcher session left its changes.
+        self._import_ingame_changes()
 
         # Restore the page and geometry the user left on.
         start = settings.last_page if layout_.has_runtime else "setup"
@@ -286,7 +300,8 @@ class MainWindow(QWidget):
         count, detail = modcatalog.stage_builtin(self.layout_)
         if count or "skipping" not in detail:
             self.log_page.append(f"[launcher] {detail}")
-        for page in (self.setup_page, self.play_page, self.mods_page):
+        for page in (self.setup_page, self.play_page, self.mods_page,
+                     self.saves_page):
             page.set_layout(self.layout_)
         # Push settings out NOW that the build directory finally exists.
         # _settings_targets only returns directories present on disk, so on a
@@ -295,6 +310,30 @@ class MainWindow(QWidget):
         # silently did not apply to their first session, until they happened to
         # change some unrelated option.
         apply_config_settings(self.layout_, self.settings)
+
+    def _import_ingame_changes(self) -> None:
+        """Fold what the player changed in the game into the settings.
+
+        The runtime writes the Home menu's changes (and the F and volume keys')
+        to a file the launcher named (runtime.build_plan); see ingame.py.
+        """
+        kept, dropped = ingame.apply_pending(
+            ingame.changes_path(self.layout_), self.settings)
+        if dropped:
+            self.log_page.append("[launcher] not kept from the game: "
+                                 + "; ".join(dropped))
+        if not kept:
+            return
+        self.log_page.append("[launcher] kept from the game: " + ", ".join(kept))
+        self._on_settings_changed()
+        self.settings_page.refresh_from_settings()
+        self.play_page.show_kept_changes(kept)
+
+    def _play_slot(self, slot: int) -> None:
+        """The Saves page's Play from here: start on the Play page."""
+        self._select(next(i for i, (k, _, _) in enumerate(self._pages)
+                          if k == "play"))
+        self.play_page.play_from_slot(slot)
 
     def _on_mods_changed(self) -> None:
         """A mod selection changed.

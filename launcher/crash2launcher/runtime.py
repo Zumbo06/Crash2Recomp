@@ -16,9 +16,14 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from . import config, gametoml, keybinds, padbinds, usersettings
+from . import config, gametoml, hotkeys, ingame, keybinds, padbinds, usersettings
 from .config import Settings
 from .paths import Layout, find_c_toolchain_bin, find_overlay_python
+
+# The Home menu's RESTART GAME exits with this code when the launcher started
+# the game (PSX_RESTART_EXIT_CODE), and the Play page starts it again. A
+# process the runtime re-spawned itself was invisible to the launcher.
+RESTART_EXIT_CODE = 75
 
 
 @dataclass
@@ -37,8 +42,14 @@ class LaunchPlan:
         return " ".join(parts)
 
 
-def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
-    """Translate launcher settings into a runtime command line."""
+def build_plan(layout: Layout, settings: Settings,
+               load_slot: int | None = None) -> LaunchPlan:
+    """Translate launcher settings into a runtime command line.
+
+    `load_slot` starts the game from that save-state slot (PSX_LOAD_SLOT): the
+    runtime stages the load right after boot, and if it fails it says so on
+    screen and the game simply starts from the beginning.
+    """
     args: list[str] = ["--no-launcher"]
 
     if layout.game_toml.is_file():
@@ -64,6 +75,13 @@ def build_plan(layout: Layout, settings: Settings) -> LaunchPlan:
 
     env = _build_env(settings)
     env.update(overlay_env(layout, settings))
+    # What the player changes in the Home menu (and with the F / volume keys)
+    # is written here and folded back into these settings when the game exits
+    # - see ingame.py. Without it the menu said "reset on next launch".
+    env["PSX_MENU_PREFS_FILE"] = str(ingame.changes_path(layout))
+    env["PSX_RESTART_EXIT_CODE"] = str(RESTART_EXIT_CODE)
+    if load_slot is not None and 0 <= int(load_slot) < 12:
+        env["PSX_LOAD_SLOT"] = str(int(load_slot))
 
     program = _runtime_for(layout, settings)
 
@@ -173,6 +191,15 @@ def _build_env(settings: Settings) -> dict[str, str]:
     if settings.merge_all_input:
         env["PSX_DEV_INPUT"] = "1"
 
+    # While playing. Written every time, like the rewind variables, so a
+    # value cannot leak in from the launcher's own environment.
+    env["PSX_FAST_FORWARD_SPEED"] = (str(settings.fast_forward_speed)
+                                     if settings.fast_forward_speed else "max")
+    env["PSX_FAST_FORWARD_TOGGLE"] = "1" if settings.fast_forward_toggle else "0"
+    env["PSX_PAUSE_ON_FOCUS_LOSS"] = "1" if settings.pause_on_focus_loss else "0"
+    # The in-game FPS counter (F key / Home menu FPS DISPLAY).
+    env["PSX_FPS_OSD"] = "1" if settings.fps_overlay else "0"
+
     # Frame pacing. Note the runtime treats vsync and its wall-clock pacer as
     # mutually exclusive, and vsync only really clocks ~60 Hz panels.
     env["PSX_VSYNC"] = str(settings.vsync)
@@ -268,6 +295,9 @@ def _build_env(settings: Settings) -> dict[str, str]:
     postfx = config.postfx_string(settings)
     if postfx:
         env["PSX_POSTFX"] = postfx
+    # The master switch. Off still passes PSX_POSTFX above, so the Home menu's
+    # POST FX row can switch the effects on for a comparison.
+    env["PSX_POSTFX_ENABLED"] = "1" if settings.postfx_enabled else "0"
 
     # Pan & Scan. Only emitted when actually dialled, so an untouched setting
     # leaves the historical letterbox/fill rects byte-identical.
@@ -427,11 +457,20 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
             if existing:
                 settings.pad_bindings = existing
                 break
+    if not settings.hotkeys:
+        # And for the hotkeys in config.ini [KeyMap], which the runtime reads
+        # beside its exe (host_keymap.c).
+        for build_dir in targets:
+            existing = hotkeys.read(build_dir / "config.ini")
+            if existing:
+                settings.hotkeys = existing
+                break
     for build_dir in targets:
         usersettings.save(build_dir / "settings.toml", settings)
         keybinds.save(build_dir / "keybinds.ini", settings.bindings)
         # input.ini sits beside each runtime too; the game re-reads it at start.
         padbinds.save(build_dir / "input.ini", settings.pad_bindings)
+        hotkeys.save(build_dir / "config.ini", settings.hotkeys)
 
     # game.toml is optional; settings.toml is not. Returning early on a missing
     # game.toml used to skip the settings.toml write above too, so in any tree

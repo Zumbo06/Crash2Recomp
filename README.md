@@ -51,9 +51,26 @@ page tells you to relaunch.
 | F5 / F9 | Quick save / quick load |
 | F7 | Save state slots |
 | F8 | Rewind |
-| F | Toggle the performance readout |
+| Tab | Fast-forward: hold it, or set it to switch on and off |
+| F | FPS counter |
+| Alt+Enter or Ctrl+F | Fullscreen |
+| Keypad + / - | Volume |
 
-Saves live in `userdata/`, next to the launcher.
+These are the defaults. **Settings > Input > Hotkeys** changes them, and the
+same page sets the fast-forward speed.
+
+What you change in the Home menu - display options, POST FX, the FPS
+counter, the assists - and with the volume keys is kept for the next launch,
+and the launcher's settings show it. Switching to another window pauses the
+game behind the Home menu; Settings > Input can turn that off.
+
+## Saves
+
+Saves live in `userdata/`, next to the launcher. The **Saves** page shows the
+twelve save-state slots with a picture of each. **Play from here** starts the
+game and loads that slot, and a slot can be deleted. The page also backs up
+the memory cards, which hold the game's own saves, and restores a backup; a
+restore first backs up the cards it replaces.
 
 ## Controls
 
@@ -65,6 +82,10 @@ the list and still works in the game. Names are positions: A is the bottom
 face button on every pad, Cross on a PlayStation controller. The stick deadzone
 is set there too.
 
+The keys that work while playing - pause menu, quick save, fast-forward and
+the rest - are under **Hotkeys** on the same page. A hotkey can use Ctrl, Alt
+or Shift, and the page warns when one is also a game button.
+
 ## Video
 
 **Settings > Video** sets internal resolution, aspect and output, and has a
@@ -75,10 +96,10 @@ preset leaves all of it off; Enhanced turns on SMAA and light sharpening. The
 Home menu's **POST FX** row switches it on and off while you play, so you can
 compare.
 
-The renderer is OpenGL by default. **Direct3D 12 (experimental)** draws the
-same picture through Direct3D 12 - the same renderer built for the other
-API - for systems whose OpenGL driver misbehaves. If it cannot start, the log
-says so and the game runs on OpenGL.
+The renderer is OpenGL by default. **Direct3D 12** draws the same picture
+through Direct3D 12 - the same renderer built for the other API - for systems
+whose OpenGL driver misbehaves. If it cannot start, the log says so and the
+game runs on OpenGL.
 
 ## Mods
 
@@ -99,6 +120,8 @@ To add one, press **Install a .psxmod...** and pick the file. It is checked
 before anything is written, so a package with an unexpected layout is refused
 rather than half-installed. If a selection cannot work, the page says so before
 you launch rather than leaving you to read an error on startup.
+
+## Frame rate
 
 **Settings -> Performance has an experimental, opt-in 60 FPS mode.** It runs
 Crash 2's own game loop at 60 instead of 30 - a real change to how the game
@@ -125,17 +148,10 @@ time inside the frame.
 If something behaves strangely, turn it off and see whether the problem goes
 away - that is a useful thing to report. It changes timing, not saved data.
 
-**120 FPS (experimental)** sits under the 60 FPS switch and needs it on. It
-runs the game loop at 120: physics every 120 Hz refresh, while scripted
-animation and music keep their normal speed. It is only worth it on a 120 Hz
-or faster display. It runs the emulated processor at 400% and turns frame
-interpolation off. When a scene cannot hold 120 it steps down to 60 by
-itself and tries again later, and the Play page says which it is doing. How
-the physics behaves at 120 across whole levels has not been verified - if
-something moves or collides strangely, compare with it off.
+## Assists
 
-The same page offers **Keep 99 lives** and a **Damage** setting with three
-positions, all off by default:
+**Settings > Cheats** offers **Keep 99 lives** and a **Damage** setting with
+three positions, all off by default:
 
 | Damage | |
 |---|---|
@@ -152,8 +168,8 @@ one, drop to *Keep 2 masks*.
 
 These change saved progression: lives and masks are written to the memory card
 as you play, so switching an assist off stops further writes but cannot undo
-values already saved. The Home-menu rows apply immediately for that session,
-while launcher choices apply on the next launch.
+values already saved. The Home menu has the same switches: they apply at once
+and are kept, while launcher choices apply on the next launch.
 
 ## If something goes wrong
 
@@ -173,6 +189,13 @@ measurement tools: a TCP debug server, interpreter fallbacks, audio path
 overrides and tracing. They exist to investigate bugs and most of them make
 the game slower or worse. They stay switched off, and unreachable, unless you
 turn this on.
+
+It also shows **120 FPS (developer preview)** under the 60 FPS switch. It runs
+the game loop at 120 - physics every 120 Hz refresh, while scripted animation
+and music keep their normal speed - with the emulated processor at 400%. In
+play it reached 120 only in bursts, fell back to 60 the rest of the time and
+stuttered when it did hit 120, so it is not offered in normal play, and it
+does not apply with Developer mode off even if it was ticked.
 
 ## Legal
 

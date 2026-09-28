@@ -20,7 +20,8 @@ SETTING_KEYS = (
     "frame_interpolation", "frame_interpolation_fps", "frame_blend",
     "audio_latency_ms", "audio_hq", "developer_mode", "fast_loading",
     "native_60fps", "native_120fps",
-    "postfx_aa", "postfx_sharpen", "postfx_bloom", "postfx_dedither",
+    "postfx_enabled", "postfx_aa", "postfx_sharpen", "postfx_bloom",
+    "postfx_dedither",
     # Assists can change saved progression, so a report that cannot show
     # whether they were on cannot tell "the game broke my save" from "I had
     # assists enabled".

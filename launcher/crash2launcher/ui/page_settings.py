@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from ..config import (
     ASPECTS,
+    FAST_FORWARD_SPEEDS,
     MAX_SUPERSAMPLING,
     OUTPUT_RESOLUTIONS,
     POSTFX_NEUTRAL,
@@ -49,7 +50,7 @@ from ..config import (
 )
 from .common import card, dim, heading, row, section, warn
 from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
-from .widgets.key_bindings import KeyBindingsEditor
+from .widgets.key_bindings import HotkeyEditor, KeyBindingsEditor
 from .widgets.pad_bindings import PadBindingsEditor
 
 # Crash 2's own framebuffer, measured from the runtime's gpu_state. The
@@ -180,6 +181,11 @@ VSYNC_MODES = [
     ("Off - wall-clock pacer (best on high-refresh)", 0),
     ("On - vsync (only clocks ~60 Hz panels)", 1),
     ("Adaptive", -1),
+]
+
+# How fast Tab (or whatever the Fast-forward hotkey is) runs the game.
+FAST_FORWARD_UI = [
+    ("%dx" % n if n else "Unlimited", n) for n in FAST_FORWARD_SPEEDS
 ]
 
 INTERP_TARGETS = [
@@ -541,17 +547,23 @@ class SettingsPage(QWidget):
         self.quick_save_slot.setCurrentIndex(self.settings.quick_save_slot)
         self.quick_save_slot.currentIndexChanged.connect(self._on_quick_slot)
 
-        keys = QLabel(
-            "<table cellpadding='3'>"
-            "<tr><td><b>F5</b></td><td>Quick save</td></tr>"
-            "<tr><td><b>F9</b></td><td>Quick load</td></tr>"
-            "<tr><td><b>F7</b></td><td>Save state menu (all slots)</td></tr>"
-            "<tr><td><b>F8</b></td><td>Rewind</td></tr>"
-            "<tr><td><b>Alt+Enter</b></td><td>Toggle fullscreen</td></tr>"
-            "<tr><td><b>Tab</b></td><td>Fast-forward (hold)</td></tr>"
-            "</table>"
-        )
-        keys.setTextFormat(Qt.TextFormat.RichText)
+        # The runtime's own keys (config.ini [KeyMap]). They and the game's
+        # buttons warn about each other, so each refreshes the other.
+        self.hotkeys = HotkeyEditor(self.settings)
+        self.hotkeys.changed.connect(self._on_hotkeys)
+        self.bindings.changed.connect(self.hotkeys.refresh)
+
+        self.fast_forward_speed = self._combo(FAST_FORWARD_UI,
+                                              self.settings.fast_forward_speed,
+                                              self._on_fast_forward_speed)
+        self.fast_forward_toggle = QCheckBox(
+            "Press once to start fast-forward, again to stop")
+        self.fast_forward_toggle.setChecked(self.settings.fast_forward_toggle)
+        self.fast_forward_toggle.toggled.connect(self._on_fast_forward_toggle)
+        self.pause_on_focus_loss = QCheckBox(
+            "Pause when the game window loses focus")
+        self.pause_on_focus_loss.setChecked(self.settings.pause_on_focus_loss)
+        self.pause_on_focus_loss.toggled.connect(self._on_pause_on_focus_loss)
 
         return self._wrap(
             card(
@@ -567,14 +579,19 @@ class SettingsPage(QWidget):
                 dim("Raise it if Crash drifts with the stick released. "
                     "Default 10%."),
             ),
+            card(section("Hotkeys"), self.hotkeys),
+            card(
+                section("While playing"),
+                row("Fast-forward speed", self.fast_forward_speed),
+                self.fast_forward_toggle,
+                self.pause_on_focus_loss,
+                dim("Alt-tab and the game waits behind the Home menu."),
+            ),
             card(
                 section("Save states"),
                 row("Quick save slot", self.quick_save_slot),
-                dim("F5 and F9 use this slot. It also appears in the F7 menu."),
-            ),
-            card(
-                section("Keys while playing"),
-                keys,
+                dim("Quick save and quick load use this slot. The Saves page "
+                    "shows every slot."),
             ),
         )
 
@@ -616,9 +633,13 @@ class SettingsPage(QWidget):
         self.native_60fps.setChecked(self.settings.native_60fps)
         self.native_60fps.toggled.connect(self._on_native_60fps)
 
-        self.native_120fps = QCheckBox("120 FPS (experimental)")
+        # Developer mode only (config.native_120fps_active): in play it reached
+        # 120 in bursts and stuttered when it did.
+        self.native_120fps = QCheckBox("120 FPS (developer preview)")
         self.native_120fps.setChecked(self.settings.native_120fps)
         self.native_120fps.toggled.connect(self._on_native_120fps)
+        self.native_120fps_note = dim(
+            "Unstable: usually falls back to 60 and can stutter.")
 
 
         self.cheat_infinite_lives = QCheckBox("Keep 99 lives")
@@ -637,6 +658,10 @@ class SettingsPage(QWidget):
         self.fps_telemetry = QCheckBox("Show performance readout on the Play page")
         self.fps_telemetry.setChecked(self.settings.fps_telemetry)
         self.fps_telemetry.toggled.connect(self._on_fps_telemetry)
+
+        self.fps_overlay = QCheckBox("FPS counter in the game window")
+        self.fps_overlay.setChecked(self.settings.fps_overlay)
+        self.fps_overlay.toggled.connect(self._on_fps_overlay)
 
         self.developer_mode = QCheckBox("Developer mode")
         self.developer_mode.setChecked(self.settings.developer_mode)
@@ -657,9 +682,7 @@ class SettingsPage(QWidget):
                 dim("The game's own loop runs at 60, not interpolated. Uses "
                     "200% virtual PS1 CPU. Experimental; relaunch to apply."),
                 self.native_120fps,
-                dim("Runs the game loop at 120; game logic and music keep "
-                    "normal speed. Needs a 120 Hz+ display and a fast CPU, "
-                    "and drops to 60 when it can't keep up. Experimental."),
+                self.native_120fps_note,
                 dim("Keep \"Compile level code natively\" on (below), or 60 "
                     "FPS won't hold."),
                 dim("If 60 FPS stutters, lower Internal resolution on the "
@@ -677,6 +700,8 @@ class SettingsPage(QWidget):
                 section("Reporting"),
                 self.fps_telemetry,
                 dim("Shows performance on the Play page."),
+                self.fps_overlay,
+                dim("Its hotkey and the Home menu switch it too; that's kept."),
                 self.developer_mode,
                 dim("Adds the Advanced page with debugging tools, which can "
                     "slow the game down."),
@@ -685,6 +710,9 @@ class SettingsPage(QWidget):
 
     def _postfx_card(self) -> QWidget:
         self._postfx_values: dict[str, QLabel] = {}
+        self.postfx_enabled = QCheckBox("Post-processing on")
+        self.postfx_enabled.setChecked(self.settings.postfx_enabled)
+        self.postfx_enabled.toggled.connect(self._on_postfx_enabled)
         self.postfx_aa = self._combo(POSTFX_AA_ITEMS, self.settings.postfx_aa,
                                      self._on_postfx_aa)
         self.postfx_dedither = QCheckBox("Smooth dithered textures")
@@ -694,8 +722,9 @@ class SettingsPage(QWidget):
         reset.clicked.connect(self._reset_postfx)
         return card(
             section("Post-processing"),
-            dim("Effects on the final picture. Toggle POST FX in the Home "
-                "menu to compare."),
+            self.postfx_enabled,
+            dim("Effects on the final picture. POST FX in the Home menu "
+                "switches them while you play, and that's kept."),
             row("Edge smoothing", self.postfx_aa),
             row("Sharpening", self._postfx_slider("postfx_sharpen")),
             row("Brightness", self._postfx_slider("postfx_brightness")),
@@ -746,6 +775,10 @@ class SettingsPage(QWidget):
         self.settings.postfx_dedither = on
         self._touch()
 
+    def _on_postfx_enabled(self, on: bool) -> None:
+        self.settings.postfx_enabled = on
+        self._touch()
+
     def _reset_postfx(self) -> None:
         for name, value in POSTFX_NEUTRAL.items():
             setattr(self.settings, name, value)
@@ -791,7 +824,11 @@ class SettingsPage(QWidget):
         self.interp_fps.setToolTip(
             "" if on else "Enable frame interpolation to choose a target.")
 
-        # 120 refines 60; it cannot apply on its own.
+        # 120 refines 60; it cannot apply on its own. And it is a developer
+        # preview: hidden, and not applied, outside developer mode.
+        developer = self.settings.developer_mode
+        self.native_120fps.setVisible(developer)
+        self.native_120fps_note.setVisible(developer)
         sixty = self.settings.native_60fps
         self.native_120fps.setEnabled(sixty)
         self.native_120fps.setToolTip(
@@ -813,11 +850,20 @@ class SettingsPage(QWidget):
         self.changed.emit()          # persist + push to the runtime config
         self._rebuild_from_settings()
 
+    def refresh_from_settings(self) -> None:
+        """Show values changed outside this page (kept in-game changes)."""
+        self._rebuild_from_settings()
+
     def _rebuild_from_settings(self) -> None:
-        """Push the dataclass back into the widgets after a bulk change."""
+        """Push the dataclass back into the widgets after a bulk change.
+
+        Every control must be listed. Zoom, Stretch, Vertical pan and Screen
+        shape used to be missing, although every preset sets them, so after a
+        preset those four showed the values from before it."""
         self._loading = True
         self.bindings.refresh()
         self.pad_bindings.refresh()
+        self.hotkeys.refresh()
         self.pad_deadzone.setValue(self.settings.pad_deadzone)
         self._refresh_scale_warning()
         idx = self.renderer.findData(self.settings.renderer)
@@ -830,6 +876,10 @@ class SettingsPage(QWidget):
             (self.rewind, self.settings.rewind),
             (self.ws_mode, self.settings.widescreen_native_wide),
             (self.scaling, self.settings.scaling_mode),
+            (self.output_aspect, self.settings.output_aspect),
+            (self.present_zoom, self.settings.present_zoom),
+            (self.present_pan, self.settings.present_pan),
+            (self.present_stretch, self.settings.present_stretch),
             (self.tex_filter, self.settings.texture_filter),
             (self.present_filter, self.settings.present_filter),
             (self.crt, self.settings.crt_filter),
@@ -838,20 +888,43 @@ class SettingsPage(QWidget):
             (self.interp_fps, self.settings.frame_interpolation_fps),
             (self.cheat_aku_aku, self.settings.cheat_aku_aku),
             (self.postfx_aa, self.settings.postfx_aa),
+            (self.audio_latency_ms, self.settings.audio_latency_ms),
+            (self.quick_save_slot, self.settings.quick_save_slot),
+            (self.fast_forward_speed, self.settings.fast_forward_speed),
         ):
             idx = box.findData(value)
             if idx >= 0:
                 box.setCurrentIndex(idx)
-        self.aa.setChecked(self.settings.antialiasing)
-        self.geom.setChecked(self.settings.geometry_correction)
-        self.persp.setChecked(self.settings.perspective_texturing)
-        self.interp.setChecked(self.settings.frame_interpolation)
-        self.native_60fps.setChecked(self.settings.native_60fps)
-        self.native_120fps.setChecked(self.settings.native_120fps)
-        self.cheat_infinite_lives.setChecked(self.settings.cheat_infinite_lives)
+        self.output_resolution.setCurrentIndex(next(
+            (i for i, (_, w, h) in enumerate(OUTPUT_RESOLUTIONS)
+             if (w, h) == (self.settings.window_width, self.settings.window_height)),
+            0))
+        self.volume.setValue(self.settings.volume)
+        self.volume_lbl.setText("%d%%" % self.settings.volume)
+        self.volume.setEnabled(not self.settings.mute)
+        for box, value in (
+            (self.aa, self.settings.antialiasing),
+            (self.geom, self.settings.geometry_correction),
+            (self.persp, self.settings.perspective_texturing),
+            (self.interp, self.settings.frame_interpolation),
+            (self.native_60fps, self.settings.native_60fps),
+            (self.native_120fps, self.settings.native_120fps),
+            (self.cheat_infinite_lives, self.settings.cheat_infinite_lives),
+            (self.mute, self.settings.mute),
+            (self.audio_hq, self.settings.audio_hq),
+            (self.merge_input, self.settings.merge_all_input),
+            (self.native_overlays, self.settings.native_overlays),
+            (self.fps_telemetry, self.settings.fps_telemetry),
+            (self.fps_overlay, self.settings.fps_overlay),
+            (self.developer_mode, self.settings.developer_mode),
+            (self.postfx_enabled, self.settings.postfx_enabled),
+            (self.postfx_dedither, self.settings.postfx_dedither),
+            (self.fast_forward_toggle, self.settings.fast_forward_toggle),
+            (self.pause_on_focus_loss, self.settings.pause_on_focus_loss),
+        ):
+            box.setChecked(bool(value))
         for name in POSTFX_RANGES:
             getattr(self, name).setValue(int(getattr(self.settings, name)))
-        self.postfx_dedither.setChecked(self.settings.postfx_dedither)
         self._loading = False
         self._sync_dependent_controls()
         self._refresh_preset_label()
@@ -995,6 +1068,27 @@ class SettingsPage(QWidget):
 
     def _on_fps_telemetry(self, on: bool) -> None:
         self.settings.fps_telemetry = on
+        self._touch()
+
+    def _on_fps_overlay(self, on: bool) -> None:
+        self.settings.fps_overlay = on
+        self._touch()
+
+    def _on_hotkeys(self) -> None:
+        # The game-button editor warns about keys shared with a hotkey.
+        self.bindings.refresh()
+        self._touch()
+
+    def _on_fast_forward_speed(self, index: int) -> None:
+        self.settings.fast_forward_speed = self.fast_forward_speed.itemData(index)
+        self._touch()
+
+    def _on_fast_forward_toggle(self, on: bool) -> None:
+        self.settings.fast_forward_toggle = on
+        self._touch()
+
+    def _on_pause_on_focus_loss(self, on: bool) -> None:
+        self.settings.pause_on_focus_loss = on
         self._touch()
 
     def _on_developer_mode(self, on: bool) -> None:

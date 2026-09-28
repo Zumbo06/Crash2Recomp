@@ -37,13 +37,15 @@ RENDERERS = ("opengl", "d3d12", "vulkan", "software")
 #
 # Direct3D 12 is the OpenGL renderer itself, compiled a second time against a
 # Direct3D 12 layer (runtime gpu_gl12.h), so everything OpenGL does - supersampling,
-# native widescreen, frame blending, bezels, post-processing - it does too. It
-# is labelled experimental until it has as many hours of play behind it as
-# OpenGL; if it cannot start, the runtime falls back to OpenGL on its own.
+# native widescreen, frame blending, bezels, post-processing - it does too, and
+# the parity harness (tuning/renderer_parity) holds the two to identical VRAM.
+# It was labelled experimental until it had held up in real play; OpenGL stays
+# the default, and if Direct3D 12 cannot start the runtime falls back to OpenGL
+# on its own.
 SELECTABLE_RENDERERS = ("opengl", "d3d12", "software")
 RENDERER_LABELS = {
     "opengl": "OpenGL",
-    "d3d12": "Direct3D 12 (experimental)",
+    "d3d12": "Direct3D 12",
     "vulkan": "Vulkan",
     "software": "Software",
 }
@@ -132,10 +134,17 @@ POSTFX_RANGES: dict[str, tuple[int, int, int]] = {
     "postfx_grain":           (0, 100, 0),
 }
 POSTFX_NEUTRAL: dict[str, Any] = {
+    # The master switch is part of "neutral": resetting the card or applying a
+    # preset must leave the effects it configures switched on.
+    "postfx_enabled": True,
     "postfx_aa": "off",
     **{name: neutral for name, (_, _, neutral) in POSTFX_RANGES.items()},
     "postfx_dedither": False,
 }
+
+# Fast-forward speed caps for PSX_FAST_FORWARD_SPEED; 0 is unlimited ("max").
+# The runtime accepts 2..16 and defaults to 4.
+FAST_FORWARD_SPEEDS = (2, 3, 4, 8, 0)
 
 REWIND_LEVELS = {
     "off":   None,          # PSX_REWIND=0; no snapshots taken at all
@@ -184,8 +193,15 @@ def recommended_supersampling(native_60fps: bool,
 
 
 def native_120fps_active(settings: "Settings") -> bool:
-    """120 is a refinement of 60: it only applies with 60 FPS on."""
-    return bool(settings.native_60fps and settings.native_120fps)
+    """120 is a refinement of 60: it only applies with 60 FPS on.
+
+    It is also a developer preview: in play it reached 120 only in bursts and
+    stuttered when it did. So developer mode is a hard gate here, like the one
+    on diagnostics in runtime._build_env - a box left ticked in a settings file
+    must not run it once the checkbox is hidden.
+    """
+    return bool(settings.developer_mode and settings.native_60fps
+                and settings.native_120fps)
 
 
 @dataclass
@@ -303,6 +319,11 @@ class Settings:
     # Runs on the finished picture at screen resolution, after the downsample
     # filter; the game's own menus are part of the picture, the launcher's
     # overlays and the pause menu are not. POSTFX_RANGES has the bounds.
+    #
+    # postfx_enabled is the master switch (PSX_POSTFX_ENABLED): off keeps the
+    # values below but starts the game with them off, and the Home menu's POST
+    # FX row can still switch them on. That row is also how it gets turned off.
+    postfx_enabled: bool = True
     postfx_aa: str = "off"              # off | fxaa | smaa
     postfx_sharpen: int = 0
     postfx_brightness: int = 0
@@ -373,7 +394,18 @@ class Settings:
     # --- performance ------------------------------------------------------
     fast_loading: bool = False
     cd_speed_boost: bool = False
-    turbo_key: str = "Tab"
+    # (turbo_key used to sit here. It had no control and was never written
+    # anywhere; the fast-forward key is now the "Turbo" entry in `hotkeys`.)
+
+    # --- while playing ------------------------------------------------------
+    # Fast-forward cap, one of FAST_FORWARD_SPEEDS (0 = unlimited).
+    fast_forward_speed: int = 4
+    # Press the fast-forward key once to switch it on, again to switch it off,
+    # instead of holding it (PSX_FAST_FORWARD_TOGGLE).
+    fast_forward_toggle: bool = False
+    # Pause behind the Home menu when the game window loses focus, so the game
+    # does not play on unattended after an alt-tab (PSX_PAUSE_ON_FOCUS_LOSS).
+    pause_on_focus_loss: bool = True
 
     # --- audio ------------------------------------------------------------
     volume: int = 100
@@ -420,6 +452,10 @@ class Settings:
     # fired precisely when none were. It is an ordinary setting on the
     # Performance page now, and stays on so the readout works.
     fps_telemetry: bool = True
+    # The FPS counter drawn in the game window itself (PSX_FPS_OSD), the one
+    # the F key and the Home menu's FPS DISPLAY row switch. Separate from
+    # fps_telemetry, which feeds the Play page.
+    fps_overlay: bool = False
     # Summarises, every ~5s, how the game picks SPU voices: key-ons per voice
     # index plus each voice's phase and envelope level. Reading it needs no
     # debug port - it prints straight to the Log page.
@@ -459,6 +495,10 @@ class Settings:
     # PS1 button -> controller source(s), written to input.ini [mapping]
     # (padbinds.py). Empty means "leave input.ini's own map alone".
     pad_bindings: dict[str, str] = field(default_factory=dict)
+    # Runtime hotkey -> key(s), written to config.ini [KeyMap] (hotkeys.py):
+    # pause menu, quick save/load, rewind, fast-forward and the rest. Empty
+    # means "leave config.ini's own map alone"; the runtime's defaults apply.
+    hotkeys: dict[str, str] = field(default_factory=dict)
     # Stick deadzone, percent of full travel. 10 is the runtime's own default
     # (3277 raw); it shapes both the analog sticks and trigger thresholds.
     pad_deadzone: int = 10
@@ -571,6 +611,16 @@ class Settings:
         self.bindings = normalize(self.bindings)
         from . import padbinds
         self.pad_bindings = padbinds.normalize(self.pad_bindings)
+        from . import hotkeys
+        self.hotkeys = hotkeys.normalize(self.hotkeys)
+        try:
+            speed = int(self.fast_forward_speed)
+        except (TypeError, ValueError):
+            speed = 4
+        self.fast_forward_speed = speed if speed in FAST_FORWARD_SPEEDS else 4
+        for name in ("fast_forward_toggle", "pause_on_focus_loss",
+                     "fps_overlay", "postfx_enabled"):
+            setattr(self, name, bool(getattr(self, name)))
         try:
             deadzone = int(self.pad_deadzone)
         except (TypeError, ValueError):

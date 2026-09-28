@@ -15,6 +15,7 @@ Two things this page is responsible for beyond the Play button:
 from __future__ import annotations
 
 import re
+from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -29,11 +30,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import recompprofile
+from .. import hotkeys, recompprofile
 from ..config import RENDERER_LABELS, Settings, active_diagnostics, diagnostic_label
 from ..diagnostics import sixty_fps_sample, sixty_fps_summary
 from ..paths import Layout
-from ..runtime import GameSession, build_plan, observed_from_log
+from ..runtime import RESTART_EXIT_CODE, GameSession, build_plan, observed_from_log
 from ..version import STATUS, VERSION
 from .common import card, dim, section, set_status, stat_row
 from .dialogs import confirm
@@ -59,8 +60,9 @@ _EXIT_REASONS = {
 def _is_crash(code: int) -> bool:
     """True for an abnormal termination rather than a clean or asked-for exit.
     A stop from the launcher terminates the process, so treat 1 and 15 as ours
-    rather than reporting them to the player as a crash."""
-    return code not in (0, 1, 15)
+    rather than reporting them to the player as a crash. RESTART_EXIT_CODE is
+    the Home menu's RESTART GAME, which this page answers by starting again."""
+    return code not in (0, 1, 15, RESTART_EXIT_CODE)
 
 
 def _exit_explanation(code: int) -> str:
@@ -88,6 +90,13 @@ class PlayPage(PlayScene):
         self._relaunch_pending = False
         self._launching = False
         self._missing_runtime = False
+        # Save-state slot the next launch loads (the Saves page), or None.
+        self._load_slot: int | None = None
+        # Called right before every launch plan is built. The window uses it
+        # to fold in what the last session changed in the Home menu: Relaunch
+        # starts the next session from _on_finished, before the window's own
+        # finished handler would have run.
+        self.before_launch: Callable[[], None] | None = None
 
         self.subtitle = QLabel("Unofficial fan recompilation for PC", self)
         self.subtitle.setObjectName("PlaySubtitle")
@@ -104,11 +113,9 @@ class PlayPage(PlayScene):
         self.details.resize(610, 430)
         details_layout = QVBoxLayout(self.details)
         details_layout.addWidget(section("In-game controls"))
-        details_layout.addWidget(dim(
-            "Home or Guide / Start+Select: pause menu with restart, aspect ratio, "
-            "image fit and quick save/load.\n\n"
-            "F5: quick save    F9: quick load    F7: save slots\n"
-            "F8: rewind    F: FPS readout"))
+        # Filled from the player's own hotkeys each time it is shown.
+        self.keys_lbl = dim("")
+        details_layout.addWidget(self.keys_lbl)
         details_layout.addWidget(self._status())
         details_layout.addWidget(dim(STATUS))
         details_layout.addStretch(1)
@@ -158,7 +165,27 @@ class PlayPage(PlayScene):
         srow.addStretch(1)
         return secondary
 
+    def _key(self, action: str) -> str:
+        return hotkeys.display(self.settings.hotkeys, action)
+
+    def keys_text(self) -> str:
+        """The in-game keys as the player has them set (Settings > Input)."""
+        k = self._key
+        fast = ("press to start and stop" if self.settings.fast_forward_toggle
+                else "hold")
+        return (
+            f"{k('PauseMenu')}, or Guide / Start+Select on a controller: pause "
+            "menu with restart, display options, assists and quick save/load.\n\n"
+            f"{k('QuickSave')}: quick save    {k('QuickLoad')}: quick load    "
+            f"{k('SaveStateMenu')}: save slots\n"
+            f"{k('Rewind')}: rewind    {k('Turbo')}: fast-forward ({fast})    "
+            f"{k('DisplayPerf')}: FPS counter\n"
+            f"{k('Fullscreen')}: fullscreen    "
+            f"{k('VolumeUp')} / {k('VolumeDown')}: volume\n\n"
+            "Change them in Settings > Input.")
+
     def _show_details(self) -> None:
+        self.keys_lbl.setText(self.keys_text())
         self.details.show()
         self.details.raise_()
         self.details.activateWindow()
@@ -377,8 +404,19 @@ class PlayPage(PlayScene):
         self.layout_ = layout_
         self.refresh()
 
+    def show_kept_changes(self, kept: list[str]) -> None:
+        """What the last session changed in the game and is now kept."""
+        if kept and not self.session.running:
+            self._set_notice("Ok", "Kept from the game: " + ", ".join(kept) + ".")
+
     # -- actions -----------------------------------------------------------
+    def play_from_slot(self, slot: int) -> None:
+        """Start the game and load a save-state slot (from the Saves page)."""
+        self._load_slot = slot
+        self._on_play()
+
     def _on_play(self) -> None:
+        load_slot, self._load_slot = self._load_slot, None
         if self.session.running or self._launching or not self.layout_.has_runtime:
             return
         self._launching = True
@@ -388,8 +426,14 @@ class PlayPage(PlayScene):
         self.observed_lbl.setText("-")
         self.perf_lbl.setText("-")
         self._set_notice("", "")
-        self._set_readiness("Starting the game", "Preparing your session…")
-        self.session.launch(build_plan(self.layout_, self.settings))
+        if self.before_launch is not None:
+            self.before_launch()
+        self._set_readiness(
+            "Starting the game",
+            "Preparing your session…" if load_slot is None
+            else f"Loading slot {load_slot + 1}…")
+        self.session.launch(build_plan(self.layout_, self.settings,
+                                       load_slot=load_slot))
 
     def _on_relaunch(self) -> None:
         # Starting again immediately raced the shutdown: stop() falls back to
@@ -435,7 +479,8 @@ class PlayPage(PlayScene):
     def _on_started(self) -> None:
         self._launching = False
         self._sixty_timer.start()
-        self._set_readiness("Game running", "Enjoy the adventure. Home opens the pause menu.")
+        self._set_readiness("Game running", "Enjoy the adventure. %s opens the "
+                            "pause menu." % self._key("PauseMenu"))
         self.play_btn.setText("RUNNING")
         self.play_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -454,6 +499,11 @@ class PlayPage(PlayScene):
         self.stop_btn.hide()
         self.relaunch_btn.hide()
 
+        if code == RESTART_EXIT_CODE:
+            # RESTART GAME in the Home menu: the runtime left it to us, so
+            # this page keeps tracking the game and the new session gets the
+            # current settings.
+            self._relaunch_pending = True
         if self._relaunch_pending:
             self._relaunch_pending = False
             self._on_play()
@@ -491,7 +541,8 @@ class PlayPage(PlayScene):
             self.perf_lbl.setText(
                 f'{fps} fps  <span style="color:{colour}">({speed}x speed)</span>')
             self.perf_lbl.setTextFormat(Qt.TextFormat.RichText)
-            self.ready_hint.setText(f"{fps} fps · {speed}x speed · Home for pause menu")
+            self.ready_hint.setText(f"{fps} fps · {speed}x speed · "
+                                    f"{self._key('PauseMenu')} for pause menu")
             return
 
         found = observed_from_log(line)
