@@ -3184,3 +3184,313 @@ spend the round on polish and quality of life.
 - `PSX_LOAD_SLOT` at boot had not been used by this project's tools before.
   If a boot-time load fails, the runtime says "Load failed slot N" and the
   game starts normally.
+
+## Widescreen, part 8: object activation, found and widened
+
+Patch 0046. Parts 5-7 left one cause of the edge popping unmeasured: how
+dynamic objects come and go (part 5, "Phase 5"). It is the whole story for
+objects, and it is authored level data, not a cull.
+
+### How Crash 2 decides which objects exist
+
+Found statically in the executable.
+
+- **The camera-path lists.** Each camera path entity carries per-node lists
+  (CrashEdit's names):
+  - 0x13C: entities visible from that node on (forward);
+  - 0x13B: entities last visible at that node;
+  - 0x208/0x209: level data to load and unload there.
+- **The per-node call.** The camera update (`0x80020200..0x80020830`) walks the
+  path a node at a time. At each node it calls `func_800217F8` (load lists),
+  then `func_8001A13C(entity, node<<8, dir)` (draw lists).
+  - Forward (dir 2): queues a kill for 0x13B(n-1) and a spawn for 0x13C(n).
+  - Backward: the mirror, 0x13C(n+1) and 0x13B(n).
+- **The queue.** `func_8001A054` records the actions in a queue at `0x8006302C`:
+  12-byte `{value, object, action}` entries, count at `[gp+0x23C]`
+  (`gp = 0x8005F17C`, so `0x8005F3B8`). The last action per entity wins.
+- **Carrying the queue out.** `func_8001A23C` does it:
+  - 0x13C spawns through `func_80019098`, which returns -22 when the object
+    pool is full;
+  - 0x13B kills through `func_80019BBC`.
+- **Path entry and jumps.** Entering a path or jumping along it marks everything
+  queued for a kill (`func_8001A014`) and replays from the nearer end.
+- **The accessor.** `0x80031AE8` is the generic entity-property accessor. In the
+  mode these calls use, it returns a row only on an exact node match.
+- **Reference-counted loads.** A load row adds a reference through
+  `0x80014260`; an unload row drops one through `0x8001434C(rec, -1)`.
+- **No bounds check.** The queue region ends where other data begins,
+  `0x800632AC`, so it holds 53 entries.
+
+A value is `(index<<24) | (id<<8) | zone link`. The entity's word at
+`0x8007B1C4 + id*4`, bit 0, marks "spawned".
+
+So objects appear exactly at the node where the 4:3 frustum starts seeing
+them, and vanish where it stops. Any wider view pops them at its edges. Part
+6's render-box fix could never touch this, which is why its measured revival
+rate was about 5%.
+
+### The fix: widen in time, never touch the original
+
+`crash2_wide_spawn.h`: at node n an object is wanted if the original lists show
+it anywhere within [n-k, n+k].
+
+- **Leaves the game's call alone.** `jr $ra` is a hook point, so at the return
+  the hook rebuilds each nearby object's original presence from all its rows in
+  the path. That presence is exactly the game's own state: every step is one
+  row, and entry replays from an end.
+- **Acts only where the window wants an object and the original does not.**
+  It spawns it early, or overrides the game's fresh kill to keep it. Objects
+  neither wants but still alive are killed again.
+- **Identity at k = 0.** With k = 0 nothing is ever changed.
+
+Safety:
+
+- **Data lifetime.** Early spawn only if no load row lies before the object's
+  original spawn node; late keep only if no unload row lies after its original
+  kill node. An object never runs ahead of, or outlives, its reference-counted
+  data. At the first unload it dies in the same update its original did.
+- **Open intervals.** Objects whose rows do not open and close inside the path
+  are left to the game. Their state depends on the entry end: a replay from the
+  start never spawns an end-only object, and one from the end never spawns a
+  start-only one. Well-formed data has none; the model found this, not play.
+- **Queue capacity.** The hook appends at most up to 45 of the 53 queue slots.
+- **Failed spawns.** A spawn that fails (object pool full, code not resident)
+  returns an error the game already handles, and is retried at the next node.
+- **Stale state.** A state load (`interrupts_resync_after_restore`) or a window
+  change re-checks every queued object at the next node.
+- **Code words.** 19 words across `func_8001A13C`, the queue, the flush, the
+  three call sites, the load lists, the accessor and `gp` are checked first.
+
+`PSX_CRASH2_WIDE_SPAWN=N`: nodes at 16:9, scaled by the live `x_margin` (so
+14:9 gets about half). Zero at 4:3 and on frames presented 4:3.
+
+### Checked without the game
+
+`tuning/wide_spawn_sim` runs the real header against a C model of the queue,
+the per-node call, entry replay and the flush. Guest RAM holds the real
+executable, so the signature check runs on actual bytes. The camera entity is
+written in the engine's layout. All 11 checks pass:
+
+- k=0 is identity;
+- k=1..3 match the widened set at every node through walks, reversals, jumps
+  and entries from both ends;
+- malformed objects are never touched;
+- load and unload rows block in both directions;
+- the queue limit holds;
+- failed spawns are retried;
+- a state load retires far-away objects;
+- 14:9 halves the window;
+- a changed word disables the hook.
+
+### Not verified yet: play
+
+Things only a real run can show:
+
+- that the lists behave as read in every level (vehicle, chase and bonus
+  paths);
+- that nothing spawned early misbehaves, since its AI starts at spawn;
+- how often `unsafe_load` / `unsafe_unload` hold things back.
+
+The heartbeat's `wide_spawn` object and the `c2_spawn` debug command, which
+changes k live, report arrivals, early, kept, retired, unsafe_load,
+unsafe_unload, full and bad.
+
+Launcher:
+
+- **Object range.** Settings > Video > Object range (Off / Slightly wider /
+  Wider / Widest = k 0-3), on in the Widescreen preset.
+- **Widescreen mode labels.** The native-wide option is labelled for what it
+  is: part 2 showed it never needed per-game data; what it costs is memory.
+
+## Widescreen, part 9: native-wide dropped the polygons in its margins
+
+Patch 0047. Reported after part 8, in native-wide at 14:9 with the object range
+on: "mostly the same culling issue". The heartbeat showed the object window
+working (1011 arrivals, 110 early, 98 kept, 0 bad), so objects were not it.
+
+### What was still wrong: the per-polygon screen test
+
+Crash 2's renderers drop a polygon when every projected vertex lies past the
+same screen edge. The test is packed, on the GTE's SXY words (Y<<16 | X), with
+`B = 0x00D90200` (217<<16 | 512):
+
+    t8 = ~((s0-B) | (s1-B) | (s2-B)) | (s0 & s1 & s2)
+    bltz t8, reject      ; all Y above the top, or all at 217 and below
+    sll  t8, t8, 16
+    bltz t8, reject      ; all X < 0, or all X >= 512
+
+Bit 15 of `s` is X's sign; bit 15 of `s-B` is clear exactly when X >= 512 for
+the GTE's range [-1024, 1023]. There are no SLTI/SLTIU compares here, which is
+why part 2's census of width immediates found nothing. Seven sites use it:
+
+| X branch     | kind     | where                           | vertices           |
+|--------------|----------|---------------------------------|--------------------|
+| `0x80041C18` | triangle | model polygons (`0x80041B80`)   | SXY0..2            |
+| `0x800424E0` | triangle | world, `func_80041E5C`          | SXY0..2            |
+| `0x800427A0` | quad     | world                           | `[v1+376]`, SXY0..2 |
+| `0x8004518C` | line     | `0x80044F54`                    | SXY0..1            |
+| `0x80045404` | dot      | `0x80045218`, right edge only   | `$a1` (SXY2)       |
+| `0x80045EC4` | triangle | world, second loop              | SXY0..2            |
+| `0x800460D0` | quad     | world, second loop              | `[v1+376]`, SXY0..2 |
+
+Squash (mode 1) squeezes X in the GTE before this test, so the game already
+tests the wider view. Native-wide (mode 2) leaves the GTE alone and moves the
+picture with the GPU draw offset, so the game still tested [0,512): every
+polygon wholly inside a revealed margin was dropped, and only polygons
+straddling the old 4:3 edge reached it. Part 5's 5,735 "past the window"
+primitives were exactly those straddlers. Part 6 fixed the object box test
+(`func_80041D14`) for mode 2 but never looked at this one. That part-6 fix was
+measured in mode 2 with the per-polygon test still dropping the margins, which
+may be part of why it showed so little.
+
+### Where to hook it without regenerating code
+
+Every branch in the generated code calls `psx_check_interrupts_at(cpu, pc)`
+with the PC it continues at, taken or not, so a hook can act on entry to the
+block holding the X branch. That block is reached only by falling through the
+Y branch: no branch, jump or table word in the executable targets these PCs.
+
+Two recompile-time routes were considered and not taken:
+
+- A new codegen site type. It would change `code_generator.cpp`, which is in
+  the codegen hash, so every overlay shard would have to be rebuilt.
+- A `[[recompiler.patch]]` rewrite. The widened test needs about four more
+  instructions than the original has.
+
+### The fix
+
+`crash2_wide_reject.h`, at the X-branch block entry:
+
+- **Re-decides X** against `[-off, 512+off)`, the window native-wide shows
+  (`off = ws_nw_extra()/2`: 43 at 14:9, 85 at 16:9). When the polygon reaches
+  into it, the hook clears bit 31 of `t8` and the game takes its own keep path.
+- **Only turns rejects into keeps.** A squash of 4/3 (16:9) maps `[-85.3,
+  597.3)` onto `[0,512)`, so both modes accept the same polygons. Native-wide's
+  primitive-buffer and ordering-table use is therefore what squash already
+  produced.
+- **`t8` is scratch.** Every kept path writes it before reading it, and the
+  value left is one the game itself leaves for a kept polygon.
+- **Quads.** A quad projects its fourth vertex (RTPS) between reading three
+  vertices and testing, which pushes vertex 0 out of the GTE. Both quad paths
+  store it first with `swc2 SXY0, 376($v1)`, and that is where it is read.
+- **Self-check.** Before changing anything, the hook recomputes the game's own
+  verdict from the vertices it read. If that differs from the game's bit, it
+  counts a `mismatch` and leaves the polygon alone.
+- **Guarded.** 141 code words are checked once, and again after a state load.
+- **Identity** at 4:3, in squash mode, and on frames presented 4:3.
+
+`PSX_CRASH2_WIDE_REJECT=0` turns it off. The `c2_reject` debug command switches
+it live and reports `off`, `checked`, `kept` and `mismatch`; the heartbeat
+carries the same counters as `wide_reject`.
+
+### Checked without the game
+
+`tuning/wide_reject_sim` runs the actual instruction bytes of all seven sites,
+read from the executable, through a small MIPS interpreter, with the real header
+hooked in where the generated code calls it. Random vertices are weighted to
+the edges at 0, 512, 14:9 and 16:9. All checks pass:
+
+- **Identity at margin 0.** 20,000 runs per site; not one register differs.
+- **The game's verdict reproduced.** At 14:9 and 16:9, 40,000 runs per site:
+  - the game's X verdict equals the plain rule at [0,512), and `mismatch` is
+    0 everywhere;
+  - the result is the widened rule every time, and no other register or GTE
+    word changes.
+- **Coverage.** At 16:9 the world triangle loop drew 5,127 of the 6,023
+  polygons the game dropped.
+- **Quads.** A quad whose only vertex in the margin is vertex 0 is kept.
+- **Off and guarded.** `on:0` is the game's own test, and a changed code word
+  disables the hook until the word is back.
+
+### To check in play
+
+- The heartbeat's `wide_reject` should show:
+  - in native-wide gameplay: `code_ok` 1, `off` 43 (14:9) or 85 (16:9), and
+    `kept` rising while `mismatch` stays 0;
+  - in squash mode: `off` 0 and nothing counted.
+- Compare `c2_reject {"on":0}` and `{"on":1}` on the same scene: the margins
+  should go from ragged to filled.
+- Anything still missing at the edges in both modes is then either the level
+  itself ending (part 4's caveat) or an object the object range holds back
+  (`unsafe_load` / `unsafe_unload`).
+
+## Build: two failures from player logs (0.9.5)
+
+Patch 0048, plus packaging. Two players' Setup logs, neither reproducible on
+this machine:
+
+### 1. A Vulkan SDK on the machine stopped every build in ninja
+
+    -- Vulkan backend: headers C:\VulkanSDK\1.3.224.1/Include, glslc ...
+    ninja: error: '.../game/psxrecomp/tools/embed_spirv.py', needed by
+    'psx-runtime_vkgen/vk_shaders_spv.h', missing and no known rule to make it
+
+`runtime.cmake` defaulted `PSX_ENABLE_VULKAN` ON and turned the backend on
+whenever `$VULKAN_SDK` supplied headers and `glslc`. That adds a custom step
+running `${PSXRECOMP_ROOT}/tools/embed_spirv.py`, and the framework payload we
+ship has no `tools/` (the memory note on missing directories). Here there is
+no SDK, so the backend always built as a stub and this never showed.
+
+The fix:
+
+- **Default OFF.** The launcher offers only OpenGL and Direct3D 12.
+- **Stub fallback.** With the option ON anyway (a stale cache, or `-D`), a
+  missing `embed_spirv.py` falls back to the software stub.
+
+### 2. A space in the install path failed the BIOS step
+
+    psxrecomp-bios: FATAL: config file not found: D:\Crash
+    psxrecomp: error: BIOS recompilation failed
+
+The player unpacked into `D:\Crash Bandicoot 2`. The CLI (`main_cli.cpp`
+`run_process`) starts `psxrecomp-game` and `psxrecomp-bios` with `_spawnv`,
+which joins `argv` with single spaces and quotes nothing, so the child split
+`--config D:\Crash Bandicoot 2\...` again.
+
+- **Why the game step survived.** It gets `--config game.toml`, a relative
+  path.
+- **Why the BIOS step failed.** It gets absolute paths.
+
+The fix:
+
+- **Quoting.** Every argument is now quoted by the C runtime's parsing rules.
+- **Our CLI ships.** The launcher now ships a CLI built from the vendored tree
+  instead of the stock one. `_build/build_recompiler.ps1` builds it in
+  `_build/build-cli` with `PSXRECOMP_ENABLE_CHD=ON`, so `.chd` discs still
+  read. It is statically linked and import-checked like `psxrecomp-game`.
+- **Packaging.** `tools/package.ps1` takes it from there.
+
+The runtime's own overlay autocompile was already safe with spaces: the
+launcher quotes every path, and `autocompile.c` wraps the whole command for
+`cmd /C`.
+
+### Checked
+
+The staged 0.9.5 bundle was copied into `...\c2 e2e\Crash Bandicoot 2\`, with
+a fake Vulkan SDK in `VULKAN_SDK`. The launcher's three steps then ran as
+`page_setup.py` runs them:
+
+1. `psxrecomp.exe build`;
+2. the recompile profile, then `psxrecomp-game`;
+3. `build.ps1` with the bundled toolchain.
+
+A configure with `-DPSX_ENABLE_VULKAN=ON` checked the fallback.
+
+| Check | Old pieces | New pieces |
+|---|---|---|
+| BIOS step in a spaced path | `FATAL: config file not found: C:\...\Temp\c2` (the stock CLI) | passes |
+| Build with a Vulkan SDK present | `ninja: error: '.../tools/embed_spirv.py' ... missing and no known rule to make it` (the patch 0048 original) | configure says "Vulkan backend: disabled"; `SCUS_94154_Recompiled.exe` (18 MB) builds |
+| Vulkan forced ON | not tested | "SDK found but ... embed_spirv.py is not in this framework tree", stub |
+
+Both old failures are the players' own errors, reproduced exactly.
+
+### Also in 0.9.5
+
+Native-wide and the object range are developer previews for now, like
+120 FPS:
+
+- **Hidden.** Their controls show only in Developer mode.
+- **Not applied.** `config.widescreen_native_wide_active()` and
+  `widescreen_object_range_active()` keep them off otherwise, even if a
+  settings file still has them on.
+- **Preset.** The Widescreen preset no longer sets the object range.

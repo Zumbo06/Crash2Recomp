@@ -1,0 +1,626 @@
+Widescreen object range: Crash 2 spawns objects for the widened view, not
+just the 4:3 one.
+
+The edge popping that NOTES "Widescreen, parts 4-7" could not remove is object
+ACTIVATION, not rendering. Crash 2 creates and removes enemies, crates and
+platforms from two per-node lists on each camera path entity, authored for the
+4:3 frustum (0x13C: visible from this node, 0x13B: last visible at this node).
+The camera update walks the path one node at a time through func_8001A13C,
+which queues kills and spawns in a 12-byte queue at 0x8006302C (count at
+[gp+0x23C]) that func_8001A23C then carries out. Any wider view therefore
+shows objects appearing and vanishing at its edges.
+
+crash2_wide_spawn.h (new) widens that in time: at node n an object is wanted if
+the original lists show it anywhere within [n-k, n+k]. The game's call runs
+unchanged; at its return the hook reads the camera entity's rows the way the
+engine's accessor (0x80031AE8) does, rebuilds each nearby object's original
+presence from all its rows in the path, and acts only on objects the window
+wants and the original does not: their queue action becomes spawn (kept alive,
+or spawned early). Objects neither wants that are still alive are killed again.
+The original's own objects are never touched; with k = 0 nothing changes.
+
+Level data is reference-counted per node (load lists 0x208/0x209), so an
+object may spawn early only if no load row lies between here and its original
+spawn node, and is kept late only if no unload row lies between its original
+kill node and here - it never outlives, or runs ahead of, the data it uses. A
+spawn that still fails returns an error the game already handles and is
+retried at the next node. Objects whose rows do not open and close inside the
+path (their state depends on which end the path was entered from) are left to
+the game. The queue has no bounds check in the game; the hook never appends
+past 45 of its 53 entries. After a state load or a window change (the Home
+menu's aspect, a 4:3 FMV) the next node re-checks every queued object.
+
+PSX_CRASH2_WIDE_SPAWN=N (nodes at 16:9, scaled by the live widescreen margin,
+off by default). Every code word it depends on is checked first. The c2_spawn
+debug command changes it live and reports counters; the heartbeat carries them
+as "wide_spawn". Checked against a model of the game's queue with the real
+executable as guest RAM (tuning/wide_spawn_sim).
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- /dev/null
++++ b/runtime/src/crash2_wide_spawn.h
+@@ -0,0 +1,459 @@
++/* SCUS-94154 only: spawn objects for the widened view, not just the 4:3 one.
++ *
++ * Crash 2 does not decide per frame which objects exist. Each camera path
++ * entity carries two per-node lists, authored offline for the 4:3 frustum:
++ *
++ *   0x13C  "draw list B"  entities that become visible AT that node (forward)
++ *   0x13B  "draw list A"  entities last visible at that node (forward)
++ *
++ * The camera update (0x80020200..0x80020830) walks the path one node at a time
++ * and calls func_8001A13C(entity, node<<8, dir) per node: forward (dir 2) it
++ * queues a kill for A(n-1) and a spawn for B(n); backward (dir 1) a kill for
++ * B(n+1) and a spawn for A(n). func_8001A054 puts those in a 12-byte queue at
++ * 0x8006302C ({value, object, action}, count at [gp+0x23C], last action per
++ * entity wins) and func_8001A23C carries it out: 0x13C spawns the entity
++ * (func_80019098), 0x13B kills its object (func_80019BBC). Entering a path or
++ * jumping along it marks every queued entity 0x13B (func_8001A014) and replays
++ * the path node by node from the nearer end.
++ *
++ * So objects appear and vanish exactly at the node where the 4:3 view starts
++ * or stops seeing them; widen the view and they pop at its edges. This hook
++ * widens that in TIME instead: at node n an object is wanted if the original
++ * lists would show it at any node within [n-k, n+k].
++ *
++ * How, without touching the game's own decisions:
++ *
++ *   - The game's call runs unchanged. At its return (jr $ra is a hook point)
++ *     the rows near n are read straight from the entity, the way 0x80031AE8
++ *     reads them, and each nearby entity's ORIGINAL presence at n is rebuilt
++ *     from all its rows in this path. That rebuilt presence is exactly the
++ *     game's own state: every step it takes is one row's worth of it, and a
++ *     path entry replays it from an end. Entities the original wants are left
++ *     entirely to the original. Entities it does not want but the window does
++ *     are spawned early or kept alive; entities neither wants but that are
++ *     alive - ours, from an earlier node - are killed again. With k = 0 the
++ *     window is the original, so nothing is ever changed.
++ *
++ *   - Level data is reference-counted per node too (load lists 0x208/0x209,
++ *     func_800217F8 -> func_80021900). An object must never outlive, or run
++ *     ahead of, the data it uses. So:
++ *       early spawn only if no load row lies between here and the node where
++ *         the original spawns it - its data was already requested, exactly as
++ *         the original relies on;
++ *       late keep only if no unload row lies between the node where the
++ *         original killed it and here - at the first unload it dies in the same
++ *         update, just as the original's object did.
++ *     A spawn that still fails (object pool full, code not resident) returns
++ *     an error, the game drops the queue entry, and the next node retries.
++ *
++ *   - The queue has no bounds check in the game. Its region ends where other
++ *     data begins (0x800632AC: 53 entries); this never appends past
++ *     C2WS_Q_CAP - C2WS_Q_HEADROOM, and simply does less when that is near.
++ *
++ *   - After a state load, or when the window changes (aspect switched in the
++ *     Home menu, a 4:3 FMV), the next node re-checks every queued entity, not
++ *     just the nearby ones, so nothing we kept can be left behind.
++ *
++ * Off unless PSX_CRASH2_WIDE_SPAWN > 0. The window is 0 - retire only - at 4:3
++ * and on frames presented 4:3 (same gate as crash2_wide_bbox.h). Every code
++ * word it depends on is checked first; any mismatch leaves the game alone. */
++
++#define C2WS_FN          0x8001A13Cu  /* queue one node's draw-list rows        */
++#define C2WS_RA_STEP     0x8002052Cu  /* return from the per-node walk call     */
++#define C2WS_RA_ENTRY_0  0x80020424u  /* return from path entry at node 0 (fwd)  */
++#define C2WS_RA_ENTRY_L  0x80020470u  /* return from path entry at the last node */
++#define C2WS_Q_BASE      0x8006302Cu
++#define C2WS_Q_COUNT     0x8005F3B8u  /* [gp+0x23C], gp = 0x8005F17C            */
++#define C2WS_Q_CAP       53u          /* 0x800632AC - 0x8006302C = 0x280 bytes   */
++#define C2WS_Q_HEADROOM  8u
++#define C2WS_KILL        0x13Bu
++#define C2WS_SPAWN       0x13Cu
++#define C2WS_P_DRAW_A    0x13B
++#define C2WS_P_DRAW_B    0x13C
++#define C2WS_P_LOAD_A    0x208
++#define C2WS_P_LOAD_B    0x209
++#define C2WS_MAX_ROWS    256
++#define C2WS_MAX_CAND    96
++#define C2WS_MAX_EVENTS  48
++#define C2WS_MAX_K       8
++
++#ifndef C2WS_R32
++extern uint32_t psx_read_word(uint32_t a);
++extern uint16_t psx_read_half(uint32_t a);
++extern uint8_t  psx_read_byte(uint32_t a);
++extern void     psx_write_word(uint32_t a, uint32_t v);
++#define C2WS_R32(a)    psx_read_word(a)
++#define C2WS_R16(a)    psx_read_half(a)
++#define C2WS_R8(a)     psx_read_byte(a)
++#define C2WS_W32(a, v) psx_write_word((a), (v))
++#endif
++
++typedef struct { int node; uint32_t vals; int count; } C2wsRow;
++typedef struct { int n; C2wsRow r[C2WS_MAX_ROWS]; } C2wsProp;
++typedef struct { int node; int on; } C2wsEvent;
++typedef struct { uint32_t key, value; int n; C2wsEvent e[C2WS_MAX_EVENTS]; } C2wsCand;
++
++static int c2ws_base_k = -1;          /* PSX_CRASH2_WIDE_SPAWN; -1 = unread     */
++static int c2ws_sig = -1;             /* code words: -1 unchecked, 0 bad, 1 ok  */
++static int c2ws_last_k = -1;          /* window used at the previous node       */
++static int c2ws_full_pass = 1;        /* re-check every queued entity next node */
++static struct { int armed; uint32_t ra, cam; int node, dir, k; } c2ws_call;
++static unsigned long long c2ws_arrivals, c2ws_early, c2ws_kept, c2ws_retired,
++                          c2ws_unsafe_load, c2ws_unsafe_unload, c2ws_full,
++                          c2ws_bad;
++
++static int c2ws_is_ram(uint32_t a) { return a >= 0x80000000u && a < 0x801FFFF0u; }
++
++/* One property's rows, read the way 0x80031AE8 reads them: binary search of
++ * the 8-byte headers at entity+16 (count at +12), falling back along the
++ * entity+8 chain; data at entity+12+offset; flag 0x40 = per-row counts
++ * (uint16[n]) else one shared count; flag 0x20 = an int16 node per row;
++ * values start 4-aligned after that. Returns 0 (rows or none), -1 for
++ * anything this does not understand - the caller then leaves the game alone. */
++static int c2ws_prop(uint32_t ent, int id, C2wsProp *out)
++{
++    out->n = 0;
++    for (int depth = 0; ent != 0u && depth < 4; depth++) {
++        if (!c2ws_is_ram(ent)) return -1;
++        int lo = 0, hi = (int16_t)C2WS_R16(ent + 12u) - 1;
++        uint32_t hdr = 0u;
++        if (hi > 512) return -1;
++        while (lo <= hi) {
++            const int mid = (lo + hi) >> 1;
++            const uint32_t h = ent + 16u + (uint32_t)mid * 8u;
++            const int hid = (int16_t)C2WS_R16(h);
++            if (hid == id) { hdr = h; break; }
++            if (hid < id) lo = mid + 1; else hi = mid - 1;
++        }
++        if (hdr == 0u) { ent = C2WS_R32(ent + 8u); continue; }
++        const uint32_t data = ent + 12u + C2WS_R16(hdr + 2u);
++        const unsigned flags = C2WS_R8(hdr + 4u);
++        const unsigned esize = C2WS_R8(hdr + 5u);
++        const int nrows = C2WS_R16(hdr + 6u);
++        if (!(flags & 0x20u) || esize != 4u || nrows > C2WS_MAX_ROWS) return -1;
++        uint32_t counts = 0u, metas;
++        int common = 0;
++        if (flags & 0x40u) { counts = data; metas = data + 2u * (uint32_t)nrows; }
++        else { common = C2WS_R16(data); metas = data + 2u; }
++        const uint32_t vals = (metas + 2u * (uint32_t)nrows + 3u) & ~3u;
++        uint32_t off = 0u;
++        for (int i = 0; i < nrows; i++) {
++            const int c = counts ? (int)C2WS_R16(counts + 2u * (uint32_t)i) : common;
++            if (c < 0 || c > 256) return -1;
++            out->r[i].node = (int16_t)C2WS_R16(metas + 2u * (uint32_t)i);
++            out->r[i].vals = vals + off * 4u;
++            out->r[i].count = c;
++            off += (uint32_t)c;
++        }
++        if (!c2ws_is_ram(vals + off * 4u)) return -1;
++        out->n = nrows;
++        return 0;
++    }
++    return 0;
++}
++
++/* Non-empty row at exactly this node (the accessor's exact-match mode). */
++static int c2ws_row_at(const C2wsProp *p, int node)
++{
++    for (int i = 0; i < p->n; i++)
++        if (p->r[i].node == node) return p->r[i].count > 0;
++    return 0;
++}
++
++/* Presence under the ORIGINAL lists: B(s) makes an entity present from s,
++ * A(e) absent from e+1. At one node a start outranks an end (the game queues
++ * the kill first and the spawn second, and the last action wins). Before its
++ * first event it is present iff that event is an end - it was carried in. */
++static int c2ws_present(const C2wsCand *c, int x)
++{
++    if (c->n == 0) return 0;
++    int on = !c->e[0].on;
++    for (int i = 0; i < c->n && c->e[i].node <= x; i++) on = c->e[i].on;
++    return on;
++}
++
++static int c2ws_add_cand(C2wsCand *cand, int *ncand, uint32_t key)
++{
++    for (int i = 0; i < *ncand; i++) if (cand[i].key == key) return i;
++    if (*ncand >= C2WS_MAX_CAND) return -1;
++    cand[*ncand].key = key;
++    cand[*ncand].value = 0u;
++    cand[*ncand].n = 0;
++    return (*ncand)++;
++}
++
++/* Queue index for this entity, -1 none, -2 queue state not understood. */
++static int c2ws_q_find(uint32_t key)
++{
++    const uint32_t n = C2WS_R32(C2WS_Q_COUNT);
++    if (n > C2WS_Q_CAP) return -2;
++    for (uint32_t i = 0; i < n; i++)
++        if ((C2WS_R32(C2WS_Q_BASE + i * 12u) & 0x00FFFF00u) == key) return (int)i;
++    return -1;
++}
++
++/* func_8001A054 for one value: rewrite an existing entry, or append one. */
++static int c2ws_q_set(uint32_t value, uint32_t action, int idx)
++{
++    if (idx >= 0) {
++        C2WS_W32(C2WS_Q_BASE + (uint32_t)idx * 12u, value);
++        C2WS_W32(C2WS_Q_BASE + (uint32_t)idx * 12u + 8u, action);
++        return 1;
++    }
++    const uint32_t n = C2WS_R32(C2WS_Q_COUNT);
++    if (n + 1u > C2WS_Q_CAP - C2WS_Q_HEADROOM) return 0;
++    C2WS_W32(C2WS_Q_BASE + n * 12u, value);
++    C2WS_W32(C2WS_Q_BASE + n * 12u + 4u, 0u);
++    C2WS_W32(C2WS_Q_BASE + n * 12u + 8u, action);
++    C2WS_W32(C2WS_Q_COUNT, n + 1u);
++    return 1;
++}
++
++/* The load / unload row a given arrival processes (func_800217F8): forward
++ * arrival j loads LA(j) and unloads LB(j-1); backward loads LB(j) and unloads
++ * LA(j+1). */
++static int c2ws_loads_at(const C2wsProp *la, const C2wsProp *lb, int j, int d)
++{
++    return d > 0 ? c2ws_row_at(la, j) : c2ws_row_at(lb, j);
++}
++static int c2ws_unloads_at(const C2wsProp *la, const C2wsProp *lb, int j, int d)
++{
++    return d > 0 ? c2ws_row_at(lb, j - 1) : c2ws_row_at(la, j + 1);
++}
++
++/* Whether the window wants an entity the original does not, at node n. */
++static int c2ws_window_wants(const C2wsCand *c, const C2wsProp *la,
++                             const C2wsProp *lb, int n, int d, int k)
++{
++    /* Ahead in the direction of travel: spawn early, if its data was already
++     * requested (no load row up to the node where the original spawns it). */
++    for (int t = 1; t <= k; t++) {
++        const int x = n + d * t;
++        if (!c2ws_present(c, x)) continue;
++        for (int j = n + d; ; j += d) {
++            if (c2ws_loads_at(la, lb, j, d)) { c2ws_unsafe_load++; goto behind; }
++            if (j == x) break;
++        }
++        return 1;
++    }
++behind:
++    /* Behind: keep alive, unless something was unloaded since the node where
++     * the original killed it. */
++    for (int t = 1; t <= k; t++) {
++        const int x = n - d * t;
++        if (!c2ws_present(c, x)) continue;
++        for (int j = x + d; ; j += d) {
++            if (c2ws_unloads_at(la, lb, j, d)) { c2ws_unsafe_unload++; return 0; }
++            if (j == n) break;
++        }
++        return 1;
++    }
++    return 0;
++}
++
++static void c2ws_apply(uint32_t cam, int n, int dir, int k)
++{
++    static C2wsProp a, b, la, lb;
++    static C2wsCand cand[C2WS_MAX_CAND];
++    int ncand = 0;
++    if (c2ws_prop(cam, C2WS_P_DRAW_A, &a) < 0 || c2ws_prop(cam, C2WS_P_DRAW_B, &b) < 0 ||
++        c2ws_prop(cam, C2WS_P_LOAD_A, &la) < 0 || c2ws_prop(cam, C2WS_P_LOAD_B, &lb) < 0) {
++        c2ws_bad++;
++        return;
++    }
++    const int d = dir == 2 ? 1 : -1;
++    const int reach = k > 0 ? k : 0;
++
++    /* Candidates: every entity with a row close enough for the window to
++     * change its state here, and - after a load or a window change - every
++     * entity in the queue. */
++    for (int pass = 0; pass < 2; pass++) {
++        const C2wsProp *p = pass ? &b : &a;
++        for (int i = 0; i < p->n; i++) {
++            if (p->r[i].node < n - reach - 1 || p->r[i].node > n + reach + 1) continue;
++            for (int j = 0; j < p->r[i].count; j++)
++                c2ws_add_cand(cand, &ncand,
++                              C2WS_R32(p->r[i].vals + 4u * (uint32_t)j) & 0x00FFFF00u);
++        }
++    }
++    if (c2ws_full_pass) {
++        const uint32_t qn = C2WS_R32(C2WS_Q_COUNT);
++        if (qn > C2WS_Q_CAP) { c2ws_bad++; return; }
++        for (uint32_t i = 0; i < qn; i++)
++            c2ws_add_cand(cand, &ncand, C2WS_R32(C2WS_Q_BASE + i * 12u) & 0x00FFFF00u);
++        c2ws_full_pass = 0;
++    }
++    /* One pass over all of this path's rows builds every candidate's events. */
++    for (int pass = 0; pass < 2; pass++) {
++        const C2wsProp *p = pass ? &b : &a;
++        for (int i = 0; i < p->n; i++)
++            for (int j = 0; j < p->r[i].count; j++) {
++                const uint32_t v = C2WS_R32(p->r[i].vals + 4u * (uint32_t)j);
++                for (int c = 0; c < ncand; c++) {
++                    if (cand[c].key != (v & 0x00FFFF00u)) continue;
++                    if (cand[c].n < C2WS_MAX_EVENTS) {
++                        cand[c].value = v;
++                        cand[c].e[cand[c].n].node = pass ? p->r[i].node : p->r[i].node + 1;
++                        cand[c].e[cand[c].n].on = pass;
++                        cand[c].n++;
++                    }
++                    break;
++                }
++            }
++    }
++
++    for (int c = 0; c < ncand; c++) {
++        C2wsCand *cd = &cand[c];
++        if (cd->n == 0) continue;            /* no rows in this path: not ours to judge */
++        for (int i = 1; i < cd->n; i++) {    /* by node, ends before starts */
++            const C2wsEvent t = cd->e[i];
++            int j = i - 1;
++            while (j >= 0 && (cd->e[j].node > t.node ||
++                              (cd->e[j].node == t.node && cd->e[j].on > t.on))) {
++                cd->e[j + 1] = cd->e[j];
++                j--;
++            }
++            cd->e[j + 1] = t;
++        }
++        /* An interval must open and close inside this path. Replaying from
++         * the start never spawns an entity whose first row here is an end,
++         * and replaying from the far end never spawns one whose last row is
++         * a start, so for those the game's state depends on which end the
++         * path was entered from - which the rows cannot tell us. Well-formed
++         * data has none (visible at node 0 is a B(0) row, visible at the
++         * last node an A row there); anything else is left to the game. */
++        if (cd->e[0].on == 0 || cd->e[cd->n - 1].on == 1) continue;
++        if (c2ws_present(cd, n)) continue;   /* the original's, entirely */
++        const int want = c2ws_window_wants(cd, &la, &lb, n, d, reach);
++        const int qi = c2ws_q_find(cd->key);
++        if (qi == -2) { c2ws_bad++; return; }
++        const uint32_t act = qi >= 0 ? C2WS_R32(C2WS_Q_BASE + (uint32_t)qi * 12u + 8u) : 0u;
++        if (!want) {
++            /* Alive (or about to spawn) although neither the original nor the
++             * window wants it: one we kept or spawned earlier. */
++            if (qi >= 0 && act != C2WS_KILL) {
++                c2ws_q_set(C2WS_R32(C2WS_Q_BASE + (uint32_t)qi * 12u), C2WS_KILL, qi);
++                c2ws_retired++;
++            }
++        } else if (qi >= 0) {
++            if (act == C2WS_KILL) {          /* the original just killed it: keep */
++                c2ws_q_set(C2WS_R32(C2WS_Q_BASE + (uint32_t)qi * 12u), C2WS_SPAWN, qi);
++                c2ws_kept++;
++            }
++        } else if (c2ws_q_set(cd->value, C2WS_SPAWN, -1)) {
++            c2ws_early++;
++        } else {
++            c2ws_full++;
++        }
++    }
++}
++
++static int c2ws_code_ok(CPUState *cpu)
++{
++    if (c2ws_sig < 0) {
++        c2ws_sig =
++            cpu->read_word(0x8001A13Cu) == 0x27BDFFC0u &&   /* func_8001A13C prologue     */
++            cpu->read_word(0x8001A158u) == 0x3405013Cu &&   /* ori a1,0x13C                */
++            cpu->read_word(0x8001A16Cu) == 0x3405013Bu &&   /* ori a1,0x13B                */
++            cpu->read_word(0x8001A19Cu) == 0x0C00C6BAu &&   /* jal 0x80031AE8              */
++            cpu->read_word(0x8001A1BCu) == 0x0C006815u &&   /* jal 0x8001A054              */
++            cpu->read_word(0x8001A078u) == 0x8F82023Cu &&   /* queue count at gp+0x23C     */
++            cpu->read_word(0x8001A08Cu) == 0x3C088006u &&   /* queue base hi               */
++            cpu->read_word(0x8001A090u) == 0x2508302Cu &&   /* queue base lo 0x302C        */
++            cpu->read_word(0x8001A2DCu) == 0x3402013Bu &&   /* flush: 0x13B = kill         */
++            cpu->read_word(0x8001A2E4u) == 0x3402013Cu &&   /*        0x13C = spawn        */
++            cpu->read_word(0x8002041Cu) == 0x0C00684Fu &&   /* the three call sites        */
++            cpu->read_word(0x80020468u) == 0x0C00684Fu &&
++            cpu->read_word(0x80020524u) == 0x0C00684Fu &&
++            cpu->read_word(0x800204C8u) == 0x0C0085FEu &&   /* load lists before draw lists */
++            cpu->read_word(0x80021814u) == 0x34050208u &&   /* load lists 0x208/0x209      */
++            cpu->read_word(0x80021828u) == 0x34050209u &&
++            cpu->read_word(0x80031AE8u) == 0x27BDFFF8u &&   /* the property accessor       */
++            cpu->read_word(0x80049BA8u) == 0x3C1C8006u &&   /* gp = 0x8005F17C             */
++            cpu->read_word(0x80049BACu) == 0x279CF17Cu;
++    }
++    return c2ws_sig == 1;
++}
++
++/* The window for this frame's widening. The launcher's value is for 16:9
++ * (85 px revealed per side); 14:9 reveals half that, 21:9 more. 0 when the
++ * frame is not widened - which still retires anything kept earlier. */
++static int c2ws_window(void)
++{
++    GpuWsDebug ws;
++    gpu_ws_get_debug(&ws);
++    if (ws.present_native_43) return 0;
++    if (!((ws.mode == 1 && ws.active) || (ws.mode == 2 && ws.nw_extra > 0))) return 0;
++    const int margin = ws.x_margin > 0 ? ws.x_margin : 85;
++    int k = (c2ws_base_k * margin + 42) / 85;
++    if (k < 1) k = 1;
++    return k > C2WS_MAX_K ? C2WS_MAX_K : k;
++}
++
++void crash2_wide_spawn_note_restore(void)
++{
++    c2ws_call.armed = 0;
++    c2ws_full_pass = 1;
++}
++
++void crash2_wide_spawn_control(int k, int reset)
++{
++    if (k >= 0) {
++        c2ws_base_k = k > C2WS_MAX_K ? C2WS_MAX_K : k;
++        c2ws_full_pass = 1;
++    }
++    if (reset) {
++        c2ws_arrivals = c2ws_early = c2ws_kept = c2ws_retired = 0;
++        c2ws_unsafe_load = c2ws_unsafe_unload = c2ws_full = c2ws_bad = 0;
++    }
++}
++
++void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k, int *sig)
++{
++    out[0] = c2ws_arrivals;  out[1] = c2ws_early;          out[2] = c2ws_kept;
++    out[3] = c2ws_retired;   out[4] = c2ws_unsafe_load;    out[5] = c2ws_unsafe_unload;
++    out[6] = c2ws_full;      out[7] = c2ws_bad;
++    if (base_k) *base_k = c2ws_base_k < 0 ? 0 : c2ws_base_k;
++    if (k) *k = c2ws_last_k < 0 ? 0 : c2ws_last_k;
++    if (sig) *sig = c2ws_sig;
++}
++
++static void crash2_wide_spawn(CPUState *cpu, uint32_t pc)
++{
++    if (pc == C2WS_FN) {
++        const uint32_t ra = cpu->gpr[31];
++        c2ws_call.armed = 0;
++        if (c2ws_base_k < 0) {
++            const char *e = getenv("PSX_CRASH2_WIDE_SPAWN");
++            const int v = e ? atoi(e) : 0;
++            c2ws_base_k = v < 0 ? 0 : (v > C2WS_MAX_K ? C2WS_MAX_K : v);
++        }
++        if (c2ws_base_k == 0) return;
++        if (ra != C2WS_RA_STEP && ra != C2WS_RA_ENTRY_0 && ra != C2WS_RA_ENTRY_L) return;
++        if (!c2ws_code_ok(cpu)) return;
++        const int k = c2ws_window();
++        if (k != c2ws_last_k) {
++            c2ws_full_pass = 1;
++            if (k > 0)
++                fprintf(stdout, "psxrecomp: widescreen object range: %d camera "
++                                "node%s either side (crash2_wide_spawn)\n",
++                        k, k == 1 ? "" : "s");
++        }
++        c2ws_last_k = k;
++        c2ws_call.armed = 1;
++        c2ws_call.ra = ra;
++        c2ws_call.cam = cpu->gpr[4];
++        c2ws_call.node = (int32_t)cpu->gpr[5] >> 8;
++        c2ws_call.dir = (int)cpu->gpr[6];
++        c2ws_call.k = k;
++        return;
++    }
++    if (!c2ws_call.armed || pc != c2ws_call.ra) return;
++    c2ws_call.armed = 0;
++    /* The caller keeps the camera entity in $s5 across the call; anything
++     * else means this is not the return we armed for. */
++    if (cpu->gpr[21] != c2ws_call.cam || !c2ws_is_ram(c2ws_call.cam)) return;
++    if (c2ws_call.dir != 1 && c2ws_call.dir != 2) return;
++    c2ws_arrivals++;
++    c2ws_apply(c2ws_call.cam, c2ws_call.node, c2ws_call.dir, c2ws_call.k);
++}
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -789,6 +789,11 @@ void interrupts_resync_after_restore(void) {
+      * reconciles on the next outer loop. Every restore path reaches here. */
+     extern void crash2_60fps_note_restore(void);
+     crash2_60fps_note_restore();
++    /* The widescreen object window (crash2_wide_spawn.h) re-checks every
++     * queued object at the next camera node: a loaded state can hold objects
++     * it kept alive that its host-side view of the path never saw. */
++    extern void crash2_wide_spawn_note_restore(void);
++    crash2_wide_spawn_note_restore();
+     /* Absolute guest-cycle timestamps from the pre-load timeline are invalid
+      * once psx_cycle_count rewinds (typical: save → play N seconds → load).
+      * Leaving post_exception_cooldown_until in the future blocks every IRQ
+@@ -2090,6 +2095,7 @@ irq_deliver_eval:
+  * current generated code on the good baseline for instrumented comparison. */
+ #include "crash2_wide_probe.h"
+ #include "crash2_wide_bbox.h"
++#include "crash2_wide_spawn.h"
+ #include "crash2_sim_tick.h"
+ #include "crash2_60fps.h"
+ #include "crash2_cheats.h"
+@@ -2099,6 +2105,7 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+     psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
+     crash2_wide_probe(cpu, resume_pc);
+     crash2_wide_bbox(cpu, resume_pc);
++    crash2_wide_spawn(cpu, resume_pc);
+     crash2_sim_tick(cpu, resume_pc);
+     crash2_60fps(cpu, resume_pc);
+     crash2_cheats_tick(cpu, resume_pc);
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8302,6 +8302,35 @@ static void handle_c2_bbox(int id, const char *json)
+              id, mode, budget, s[0], s[1], s[2], s[3], s[4], s[5]);
+ }
+ 
++/* Crash 2's widescreen object window (crash2_wide_spawn.h). Live, so one
++ * launch can A/B it:
++ *   c2_spawn               -> counters
++ *   c2_spawn {"k":N}       -> window in camera-path nodes at 16:9, 0 = off
++ *                             (scaled by the live widescreen margin)
++ *   c2_spawn {"reset":1}   -> zero the counters
++ * arrivals = camera nodes handled; early = objects spawned ahead of their
++ * node; kept = objects the game had just killed and the window kept alive;
++ * retired = those killed again once the window let go; unsafe_load /
++ * unsafe_unload = held back because level data loads or unloads in between;
++ * full = spawns skipped because the game's queue was near its end; bad =
++ * data this did not understand (it then leaves the game alone). */
++extern void crash2_wide_spawn_control(int k, int reset);
++extern void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k,
++                                    int *sig);
++static void handle_c2_spawn(int id, const char *json)
++{
++    crash2_wide_spawn_control(json_get_int(json, "k", -1),
++                              json_get_int(json, "reset", 0));
++    unsigned long long s[8];
++    int base_k = 0, k = 0, sig = 0;
++    crash2_wide_spawn_stats(s, &base_k, &k, &sig);
++    send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
++             "\"arrivals\":%llu,\"early\":%llu,\"kept\":%llu,\"retired\":%llu,"
++             "\"unsafe_load\":%llu,\"unsafe_unload\":%llu,\"full\":%llu,"
++             "\"bad\":%llu}",
++             id, base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
++}
++
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+  * fire, live extent/camera/DL-count, orig vs final bound). Read-only; small
+  * heap envelope so the per-byte stall of a giant read is never in play. */
+@@ -13901,6 +13930,7 @@ static const CmdEntry s_commands[] = {
+     { "ws_aspect",         handle_ws_aspect },
+     { "ws_nw",             handle_ws_nw },
+     { "c2_bbox",           handle_c2_bbox },
++    { "c2_spawn",          handle_c2_spawn },
+     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
+     { "ws_backdrop_margin", handle_ws_backdrop_margin },
+     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -75,6 +75,10 @@ extern unsigned crash2_60fps_frame_ticks(void);/* engine frame time,
+ extern int      crash2_cheat_lives_enabled(void);
+ extern int      crash2_cheat_aku_level(void);
+ extern int      crash2_cheat_god_active(void);
++/* Widescreen object window (crash2_wide_spawn.h): whether it is doing
++ * anything, so a report of an object misbehaving at a screen edge can say. */
++extern void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k,
++                                    int *sig);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+ extern uint32_t i_stat;                        /* memory.c */
+@@ -917,6 +921,18 @@ static void heartbeat_write(void) {
+         const int gl_n = gl_renderer_cost_json(gl_json, sizeof(gl_json));
+         if (gl_n <= 0 || gl_n >= (int)sizeof(gl_json)) strcpy(gl_json, "null");
+     }
++    char ws_json[320];
++    {
++        unsigned long long s[8];
++        int base_k = 0, k = 0, sig = 0;
++        crash2_wide_spawn_stats(s, &base_k, &k, &sig);
++        snprintf(ws_json, sizeof(ws_json),
++                 "{\"base_k\":%d,\"k\":%d,\"code_ok\":%d,\"arrivals\":%llu,"
++                 "\"early\":%llu,\"kept\":%llu,\"retired\":%llu,"
++                 "\"unsafe_load\":%llu,\"unsafe_unload\":%llu,\"full\":%llu,"
++                 "\"bad\":%llu}",
++                 base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
++    }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),
+         "{\n"
+@@ -954,6 +970,7 @@ static void heartbeat_write(void) {
+         "  \"cheat_lives\":%d,\n"
+         "  \"cheat_aku_level\":%d,\n"
+         "  \"cheat_god_active\":%d,\n"
++        "  \"wide_spawn\":%s,\n"
+         "  \"psx_cycle_count\":%llu,\n"
+         "  \"current_func\":\"0x%08X\",\n"
+         "  \"last_store_pc\":\"0x%08X\",\n"
+@@ -1045,6 +1062,7 @@ static void heartbeat_write(void) {
+         crash2_cheat_lives_enabled(),
+         crash2_cheat_aku_level(),
+         crash2_cheat_god_active(),
++        ws_json,
+         (unsigned long long)cyc,
+         cur_fn,
+         last_store,

@@ -20,6 +20,8 @@ SETTING_KEYS = (
     "frame_interpolation", "frame_interpolation_fps", "frame_blend",
     "audio_latency_ms", "audio_hq", "developer_mode", "fast_loading",
     "native_60fps", "native_120fps",
+    # Objects popping at a screen edge is the first question about these.
+    "widescreen_native_wide", "widescreen_object_range",
     "postfx_enabled", "postfx_aa", "postfx_sharpen", "postfx_bloom",
     "postfx_dedither",
     # Assists can change saved progression, so a report that cannot show
@@ -66,6 +68,12 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   # full-surface work, the numbers behind a FAIL_HOST verdict.
                   # Counters and the internal scale only - nothing private.
                   "gl",
+                  # Widescreen object range counters (crash2_wide_spawn.h).
+                  "wide_spawn",
+                  # Native-wide polygon test (crash2_wide_reject.h): kept is
+                  # polygons drawn in the revealed margins; mismatch should
+                  # stay 0.
+                  "wide_reject",
                   "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",

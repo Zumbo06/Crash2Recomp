@@ -1,0 +1,474 @@
+Native-wide polygon test: draw what the revealed margins show.
+
+Crash 2's renderers drop a polygon when every projected vertex lies past the
+same edge of the 512x217 screen, a packed test on the GTE's SXY words
+(B = 0x00D90200 = 217<<16 | 512):
+
+    t8 = ~((s0-B) | (s1-B) | (s2-B)) | (s0 & s1 & s2)
+    bltz t8, reject    ; all Y past the top or bottom
+    sll  t8, t8, 16
+    bltz t8, reject    ; all X < 0, or all X >= 512
+
+Squash widescreen (mode 1) squeezes X in the GTE before this test, so the game
+tests the wider view. Native-wide (mode 2) leaves the GTE alone and draws the
+extra columns through the GPU draw offset, so the game still tested [0,512):
+every polygon wholly inside a revealed margin was dropped and only polygons
+straddling the old 4:3 edge reached it - the broken edges native-wide showed.
+Patch 0046 (objects) and 0016 (the object box cull) could not touch this. The
+level draw lists already hold these polygons (NOTES, widescreen part 4).
+
+Seven sites use the test: model triangles (0x80041C18), world triangles and
+quads in both loops of func_80041E5C (0x800424E0, 0x800427A0, 0x80045EC4,
+0x800460D0), lines (0x8004518C) and 1x1 dots, right edge only (0x80045404).
+Every branch in the generated code calls psx_check_interrupts_at with the PC it
+continues at, and nothing else enters these blocks, so the X-branch block is
+reached only after the Y branch fell through, with t8 = mask<<16.
+
+crash2_wide_reject.h (new) re-decides X there against [-off, 512+off), the
+window native-wide shows, and clears bit 31 of t8 when the polygon reaches into
+it. It only turns rejects into keeps, and only for polygons squash mode already
+draws at the same aspect, so primitive-buffer use is what squash produces. t8
+is scratch on every kept path. Quads project their fourth vertex between the
+reads and the test; both store vertex 0 at [v1+376] first, which is where it is
+read. Before changing anything the hook recomputes the game's own verdict from
+the vertices it read and leaves the polygon alone if they disagree. Identity at
+4:3, in squash mode and on frames presented 4:3. 141 code words are checked
+(once, and again after a state load).
+
+PSX_CRASH2_WIDE_REJECT=0 turns it off; the c2_reject debug command switches it
+live and reports counters, carried by the heartbeat as "wide_reject". Checked
+against the real instructions of all seven sites run through a MIPS
+interpreter (tuning/wide_reject_sim): no change at margin 0, the game's verdict
+reproduced exactly, the widened verdict at 14:9 and 16:9, no other state
+touched, and the code-word guard.
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- /dev/null
++++ b/runtime/src/crash2_wide_reject.h
+@@ -0,0 +1,309 @@
++/* SCUS-94154 only: the per-polygon screen test, widened for native-wide.
++ *
++ * Crash 2's renderers drop a polygon when every projected vertex lies past the
++ * same edge of the 512x217 screen, with a packed test (B = 0x00D90200, that is
++ * 217<<16 | 512, and s = a GTE SXY word, Y<<16 | X):
++ *
++ *     t8 = ~((s0-B) | (s1-B) | (s2-B)) | (s0 & s1 & s2)
++ *     bltz t8, reject      ; bit 31: all Y above the top, or all below 217
++ *     sll  t8, t8, 16
++ *     bltz t8, reject      ; bit 15: all X < 0, or all X >= 512
++ *
++ * Bit 15 of s is X's sign; bit 15 of s-B is clear exactly when X >= 512 for the
++ * GTE's X range [-1024, 1023].
++ *
++ * Squash widescreen (mode 1) squeezes X inside the GTE, before this test, so
++ * the game already tests the wider view. Native-wide (mode 2) leaves the GTE
++ * alone and draws the extra columns through the GPU draw offset, so the game
++ * still tests [0,512): every polygon lying wholly inside a revealed margin,
++ * [-off,0) or [512,512+off), was dropped and only polygons straddling the old
++ * 4:3 edge reached it. That was the broken edge in native-wide. The level's
++ * draw lists already hold those polygons (NOTES, widescreen part 4), and the
++ * object window (crash2_wide_spawn.h) has nothing to do with it.
++ *
++ * Every branch in the generated code calls psx_check_interrupts_at with the PC
++ * it continues at, so the block holding the X branch is entered, only by
++ * falling through the Y branch, with t8 = mask<<16. There this re-decides X
++ * against the window native-wide shows, [-off, 512+off), and clears bit 31 of
++ * t8 when the polygon reaches into it.
++ *
++ *   - It only turns a reject into a keep, and only for polygons squash mode
++ *     already draws: at the same aspect both accept exactly [-off, 512+off),
++ *     so primitive-buffer and ordering-table use is what squash produces.
++ *   - t8 is scratch. Every kept path writes it before reading it, and the value
++ *     left is one the game itself leaves for a kept polygon.
++ *   - Before changing anything it recomputes the game's own verdict from the
++ *     vertices it read. If that differs from the game's bit, the vertices are
++ *     not the ones tested: it counts a mismatch and leaves the polygon alone.
++ *   - Off (identity) at 4:3, in squash mode and on frames presented 4:3.
++ *
++ * The seven sites (nothing else branches or jumps into these blocks):
++ *
++ *   0x80041C18  triangle  model polygons (0x80041B80)       SXY0..2
++ *   0x800424E0  triangle  world, func_80041E5C               SXY0..2
++ *   0x800427A0  quad      world                              [v1+376], SXY0..2
++ *   0x8004518C  line      0x80044F54                         SXY0..1
++ *   0x80045404  dot       0x80045218, right edge only        $a1 (SXY2)
++ *   0x80045EC4  triangle  world, second loop                 SXY0..2
++ *   0x800460D0  quad      world, second loop                 [v1+376], SXY0..2
++ *
++ * A quad projects its fourth vertex (RTPS) between reading the first three and
++ * the test, which pushes vertex 0 out of the GTE; both quad paths store it
++ * first with `swc2 SXY0, 376($v1)`. The dot test has no left edge in the game
++ * either (it draws 1x1 dots that start at the point).
++ *
++ * PSX_CRASH2_WIDE_REJECT=0 turns it off; the c2_reject debug command switches
++ * it live and reports the counters, which the heartbeat carries as
++ * "wide_reject". */
++
++#define C2WR_FIRST 0x80041C18u
++#define C2WR_LAST  0x800460D0u
++#define C2WR_W     512              /* the game's own X bound, pinned below */
++
++enum { C2WR_TRI, C2WR_QUAD, C2WR_LINE, C2WR_DOT };
++
++static int c2wr_mode = -1;         /* -1 = not yet read from env, 0 off, 1 on */
++static int c2wr_code = -1;         /* -1 = unchecked, 0 = changed code, 1 = ok */
++static int c2wr_last_off;
++static unsigned long long c2wr_checked, c2wr_kept, c2wr_mismatch;
++
++/* Every word the hook depends on: each site's vertex reads, the packed test and
++ * both branches, the quad paths' vertex-0 store and fourth projection, and the
++ * 0x00D90200 bound (loaded in place, or stored to [v1+540] by func_80041E5C for
++ * the world loops). Generated from the executable, not typed. */
++static const uint32_t c2wr_words[][2] = {
++    /* model triangle (0x80041B80) */
++    { 0x80041BDCu, 0x48196000u },  /* mfc2 $t9, SXY0 */
++    { 0x80041BE0u, 0x48046800u },  /* mfc2 $a0, SXY1 */
++    { 0x80041BE4u, 0x48057000u },  /* mfc2 $a1, SXY2 */
++    { 0x80041BE8u, 0x0324C024u },  /* and $t8, $t9, $a0 */
++    { 0x80041BECu, 0x03053024u },  /* and $a2, $t8, $a1 */
++    { 0x80041BF0u, 0x3C1800D9u },  /* lui $t8, 0x00D9 */
++    { 0x80041BF4u, 0x37180200u },  /* ori $t8, $t8, 0x0200 */
++    { 0x80041BF8u, 0x0338C823u },  /* subu $t9, $t9, $t8 */
++    { 0x80041BFCu, 0x00982023u },  /* subu $a0, $a0, $t8 */
++    { 0x80041C00u, 0x00B82823u },  /* subu $a1, $a1, $t8 */
++    { 0x80041C04u, 0x0324C025u },  /* or $t8, $t9, $a0 */
++    { 0x80041C08u, 0x0305C027u },  /* nor $t8, $t8, $a1 */
++    { 0x80041C0Cu, 0x0306C025u },  /* or $t8, $t8, $a2 */
++    { 0x80041C10u, 0x0700003Eu },  /* bltz $t8, 0x80041D0C */
++    { 0x80041C14u, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x80041C18u, 0x0700003Cu },  /* bltz $t8, 0x80041D0C */
++    /* world bound store (func_80041E5C) */
++    { 0x80041FA0u, 0x3C1800D9u },  /* lui $t8, 0x00D9 */
++    { 0x80041FA4u, 0x37180200u },  /* ori $t8, $t8, 0x0200 */
++    { 0x80041FA8u, 0xAC78021Cu },  /* sw $t8, 540($v1) */
++    /* world triangle */
++    { 0x800424A8u, 0x48186000u },  /* mfc2 $t8, SXY0 */
++    { 0x800424ACu, 0x48196800u },  /* mfc2 $t9, SXY1 */
++    { 0x800424B0u, 0x48027000u },  /* mfc2 $v0, SXY2 */
++    { 0x800424B4u, 0x8C7F021Cu },  /* lw $ra, 540($v1) */
++    { 0x800424B8u, 0x03192024u },  /* and $a0, $t8, $t9 */
++    { 0x800424BCu, 0x031FC023u },  /* subu $t8, $t8, $ra */
++    { 0x800424C0u, 0x033FC823u },  /* subu $t9, $t9, $ra */
++    { 0x800424C4u, 0x00822024u },  /* and $a0, $a0, $v0 */
++    { 0x800424C8u, 0x005F1023u },  /* subu $v0, $v0, $ra */
++    { 0x800424CCu, 0x0319C025u },  /* or $t8, $t8, $t9 */
++    { 0x800424D0u, 0x0302C027u },  /* nor $t8, $t8, $v0 */
++    { 0x800424D4u, 0x0304C025u },  /* or $t8, $t8, $a0 */
++    { 0x800424D8u, 0x0700FFADu },  /* bltz $t8, 0x80042390 */
++    { 0x800424DCu, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x800424E0u, 0x0700FFABu },  /* bltz $t8, 0x80042390 */
++    /* world quad */
++    { 0x80042728u, 0xE86C0178u },  /* swc2 $t4, 376($v1) */
++    { 0x8004272Cu, 0xE871017Cu },  /* swc2 $s1, 380($v1) */
++    { 0x80042730u, 0x48820000u },  /* mtc2 $v0, VXY0 */
++    { 0x80042734u, 0x48860800u },  /* mtc2 $a2, VZ0 */
++    { 0x80042738u, 0x48186000u },  /* mfc2 $t8, SXY0 */
++    { 0x8004273Cu, 0x48196800u },  /* mfc2 $t9, SXY1 */
++    { 0x80042740u, 0x48027000u },  /* mfc2 $v0, SXY2 */
++    { 0x80042744u, 0xAEF80008u },  /* sw $t8, 8($s7) */
++    { 0x80042748u, 0x8C7F021Cu },  /* lw $ra, 540($v1) */
++    { 0x8004274Cu, 0x4A180001u },  /* gte RTPS (sf=1 lm=0) */
++    { 0x80042750u, 0x8DCE0000u },  /* lw $t6, 0($t6) */
++    { 0x80042754u, 0x03193024u },  /* and $a2, $t8, $t9 */
++    { 0x80042758u, 0x031FC023u },  /* subu $t8, $t8, $ra */
++    { 0x8004275Cu, 0x033FC823u },  /* subu $t9, $t9, $ra */
++    { 0x80042760u, 0x00C23024u },  /* and $a2, $a2, $v0 */
++    { 0x80042764u, 0x005F1023u },  /* subu $v0, $v0, $ra */
++    { 0x80042768u, 0x0319C025u },  /* or $t8, $t8, $t9 */
++    { 0x8004276Cu, 0x000F7880u },  /* sll $t7, $t7, 2 */
++    { 0x80042770u, 0x31EF003Cu },  /* andi $t7, $t7, 0x003C */
++    { 0x80042774u, 0x0008C982u },  /* srl $t9, $t0, 6 */
++    { 0x80042778u, 0x33390C00u },  /* andi $t9, $t9, 0x0C00 */
++    { 0x8004277Cu, 0x01F97825u },  /* or $t7, $t7, $t9 */
++    { 0x80042780u, 0x48197000u },  /* mfc2 $t9, SXY2 */
++    { 0x80042784u, 0x0302C025u },  /* or $t8, $t8, $v0 */
++    { 0x80042788u, 0x00D93024u },  /* and $a2, $a2, $t9 */
++    { 0x8004278Cu, 0x033FC823u },  /* subu $t9, $t9, $ra */
++    { 0x80042790u, 0x0319C027u },  /* nor $t8, $t8, $t9 */
++    { 0x80042794u, 0x0306C025u },  /* or $t8, $t8, $a2 */
++    { 0x80042798u, 0x0700FEFDu },  /* bltz $t8, 0x80042390 */
++    { 0x8004279Cu, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x800427A0u, 0x0700FEFBu },  /* bltz $t8, 0x80042390 */
++    /* line (0x80044F54) */
++    { 0x80045154u, 0x3C0700D9u },  /* lui $a3, 0x00D9 */
++    { 0x80045158u, 0x34E70200u },  /* ori $a3, $a3, 0x0200 */
++    { 0x8004515Cu, 0x4858F800u },  /* cfc2 $t8, FLAG */
++    { 0x80045160u, 0x48196000u },  /* mfc2 $t9, SXY0 */
++    { 0x80045164u, 0x48046800u },  /* mfc2 $a0, SXY1 */
++    { 0x80045168u, 0x0018C340u },  /* sll $t8, $t8, 13 */
++    { 0x8004516Cu, 0x0700000Eu },  /* bltz $t8, 0x800451A8 */
++    { 0x80045170u, 0x03242824u },  /* and $a1, $t9, $a0 */
++    { 0x80045174u, 0x0327C823u },  /* subu $t9, $t9, $a3 */
++    { 0x80045178u, 0x00872023u },  /* subu $a0, $a0, $a3 */
++    { 0x8004517Cu, 0x0324C027u },  /* nor $t8, $t9, $a0 */
++    { 0x80045180u, 0x0305C025u },  /* or $t8, $t8, $a1 */
++    { 0x80045184u, 0x07000008u },  /* bltz $t8, 0x800451A8 */
++    { 0x80045188u, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x8004518Cu, 0x07000006u },  /* bltz $t8, 0x800451A8 */
++    /* dot (0x80045218) */
++    { 0x800453DCu, 0x3C0700D9u },  /* lui $a3, 0x00D9 */
++    { 0x800453E0u, 0x34E70200u },  /* ori $a3, $a3, 0x0200 */
++    { 0x800453E4u, 0x4858F800u },  /* cfc2 $t8, FLAG */
++    { 0x800453E8u, 0x48057000u },  /* mfc2 $a1, SXY2 */
++    { 0x800453ECu, 0x0018C340u },  /* sll $t8, $t8, 13 */
++    { 0x800453F0u, 0x0700000Du },  /* bltz $t8, 0x80045428 */
++    { 0x800453F4u, 0x00A7C023u },  /* subu $t8, $a1, $a3 */
++    { 0x800453F8u, 0x0305C027u },  /* nor $t8, $t8, $a1 */
++    { 0x800453FCu, 0x0700000Au },  /* bltz $t8, 0x80045428 */
++    { 0x80045400u, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x80045404u, 0x07000008u },  /* bltz $t8, 0x80045428 */
++    /* world triangle, second loop */
++    { 0x80045E8Cu, 0x48186000u },  /* mfc2 $t8, SXY0 */
++    { 0x80045E90u, 0x48196800u },  /* mfc2 $t9, SXY1 */
++    { 0x80045E94u, 0x48027000u },  /* mfc2 $v0, SXY2 */
++    { 0x80045E98u, 0x8C7F021Cu },  /* lw $ra, 540($v1) */
++    { 0x80045E9Cu, 0x03192024u },  /* and $a0, $t8, $t9 */
++    { 0x80045EA0u, 0x031FC023u },  /* subu $t8, $t8, $ra */
++    { 0x80045EA4u, 0x033FC823u },  /* subu $t9, $t9, $ra */
++    { 0x80045EA8u, 0x00822024u },  /* and $a0, $a0, $v0 */
++    { 0x80045EACu, 0x005F1023u },  /* subu $v0, $v0, $ra */
++    { 0x80045EB0u, 0x0319C025u },  /* or $t8, $t8, $t9 */
++    { 0x80045EB4u, 0x0302C027u },  /* nor $t8, $t8, $v0 */
++    { 0x80045EB8u, 0x0304C025u },  /* or $t8, $t8, $a0 */
++    { 0x80045EBCu, 0x0700F134u },  /* bltz $t8, 0x80042390 */
++    { 0x80045EC0u, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x80045EC4u, 0x0700F132u },  /* bltz $t8, 0x80042390 */
++    /* world quad, second loop */
++    { 0x80046048u, 0xE86C0178u },  /* swc2 $t4, 376($v1) */
++    { 0x8004604Cu, 0xE871017Cu },  /* swc2 $s1, 380($v1) */
++    { 0x80046050u, 0xE86001B4u },  /* swc2 $zero, 436($v1) */
++    { 0x80046054u, 0xE86101B8u },  /* swc2 $at, 440($v1) */
++    { 0x80046058u, 0x48820000u },  /* mtc2 $v0, VXY0 */
++    { 0x8004605Cu, 0x48860800u },  /* mtc2 $a2, VZ0 */
++    { 0x80046060u, 0xAC620220u },  /* sw $v0, 544($v1) */
++    { 0x80046064u, 0xAC660224u },  /* sw $a2, 548($v1) */
++    { 0x80046068u, 0x48186000u },  /* mfc2 $t8, SXY0 */
++    { 0x8004606Cu, 0x48196800u },  /* mfc2 $t9, SXY1 */
++    { 0x80046070u, 0x48027000u },  /* mfc2 $v0, SXY2 */
++    { 0x80046074u, 0x00000000u },  /* nop */
++    { 0x80046078u, 0x8C7F021Cu },  /* lw $ra, 540($v1) */
++    { 0x8004607Cu, 0x4A180001u },  /* gte RTPS (sf=1 lm=0) */
++    { 0x80046080u, 0x8DCE0000u },  /* lw $t6, 0($t6) */
++    { 0x80046084u, 0x03193024u },  /* and $a2, $t8, $t9 */
++    { 0x80046088u, 0x031FC023u },  /* subu $t8, $t8, $ra */
++    { 0x8004608Cu, 0x033FC823u },  /* subu $t9, $t9, $ra */
++    { 0x80046090u, 0x00C23024u },  /* and $a2, $a2, $v0 */
++    { 0x80046094u, 0x005F1023u },  /* subu $v0, $v0, $ra */
++    { 0x80046098u, 0x0319C025u },  /* or $t8, $t8, $t9 */
++    { 0x8004609Cu, 0x000F7880u },  /* sll $t7, $t7, 2 */
++    { 0x800460A0u, 0x31EF003Cu },  /* andi $t7, $t7, 0x003C */
++    { 0x800460A4u, 0x0008C982u },  /* srl $t9, $t0, 6 */
++    { 0x800460A8u, 0x33390C00u },  /* andi $t9, $t9, 0x0C00 */
++    { 0x800460ACu, 0x01F97825u },  /* or $t7, $t7, $t9 */
++    { 0x800460B0u, 0x48197000u },  /* mfc2 $t9, SXY2 */
++    { 0x800460B4u, 0x0302C025u },  /* or $t8, $t8, $v0 */
++    { 0x800460B8u, 0x00D93024u },  /* and $a2, $a2, $t9 */
++    { 0x800460BCu, 0x033FC823u },  /* subu $t9, $t9, $ra */
++    { 0x800460C0u, 0x0319C027u },  /* nor $t8, $t8, $t9 */
++    { 0x800460C4u, 0x0306C025u },  /* or $t8, $t8, $a2 */
++    { 0x800460C8u, 0x0700F0B1u },  /* bltz $t8, 0x80042390 */
++    { 0x800460CCu, 0x0018C400u },  /* sll $t8, $t8, 16 */
++    { 0x800460D0u, 0x0700F0AFu },  /* bltz $t8, 0x80042390 */
++};
++
++void crash2_wide_reject_note_restore(void) { c2wr_code = -1; }
++
++void crash2_wide_reject_control(int on, int reset) {
++    if (on == 0 || on == 1) c2wr_mode = on;
++    if (reset) c2wr_checked = c2wr_kept = c2wr_mismatch = 0;
++}
++
++void crash2_wide_reject_stats(unsigned long long out[3], int *on, int *code_ok,
++                              int *off) {
++    out[0] = c2wr_checked; out[1] = c2wr_kept; out[2] = c2wr_mismatch;
++    if (on)      *on = c2wr_mode < 0 ? 1 : c2wr_mode;
++    if (code_ok) *code_ok = c2wr_code;
++    if (off)     *off = c2wr_last_off;
++}
++
++static int c2wr_code_ok(CPUState *cpu) {
++    for (size_t i = 0; i < sizeof(c2wr_words) / sizeof(c2wr_words[0]); ++i)
++        if (cpu->read_word(c2wr_words[i][0]) != c2wr_words[i][1]) return 0;
++    return 1;
++}
++
++/* The game's rule with the edges as parameters: outside when every X is left
++ * of lo (if that edge is tested) or every X is at or right of hi. */
++static int c2wr_outside(const int *x, int n, int lo, int hi, int left_edge) {
++    int all_left = left_edge, all_right = 1;
++    for (int i = 0; i < n; ++i) {
++        if (x[i] >= lo) all_left = 0;
++        if (x[i] < hi) all_right = 0;
++    }
++    return all_left || all_right;
++}
++
++static void crash2_wide_reject(CPUState *cpu, uint32_t pc) {
++    if (pc - C2WR_FIRST > C2WR_LAST - C2WR_FIRST) return;
++    int kind;
++    switch (pc) {
++    case 0x80041C18u: case 0x800424E0u: case 0x80045EC4u: kind = C2WR_TRI; break;
++    case 0x800427A0u: case 0x800460D0u:                   kind = C2WR_QUAD; break;
++    case 0x8004518Cu:                                     kind = C2WR_LINE; break;
++    case 0x80045404u:                                     kind = C2WR_DOT; break;
++    default: return;
++    }
++    if ((int32_t)cpu->gpr[24] >= 0) return;        /* the game keeps it anyway */
++    if (c2wr_mode < 0) {
++        const char *e = getenv("PSX_CRASH2_WIDE_REJECT");
++        c2wr_mode = (e && *e == '0') ? 0 : 1;
++    }
++    if (!c2wr_mode) return;
++    /* Per-side reveal while native-wide is live on this frame; 0 at 4:3, in
++     * squash mode (whose GTE already squeezed X) and on frames presented 4:3. */
++    const int off = ws_nw_extra() / 2;
++    c2wr_last_off = off;
++    if (off <= 0) return;
++    if (c2wr_code < 0) c2wr_code = c2wr_code_ok(cpu);
++    if (!c2wr_code) return;
++
++    int x[4], n;
++    switch (kind) {
++    case C2WR_TRI:
++        n = 3;
++        for (int i = 0; i < 3; ++i) x[i] = (int16_t)cpu->gte_data[12 + i];
++        break;
++    case C2WR_QUAD:
++        n = 4;
++        x[0] = (int16_t)cpu->read_word(cpu->gpr[3] + 376u);
++        for (int i = 0; i < 3; ++i) x[1 + i] = (int16_t)cpu->gte_data[12 + i];
++        break;
++    case C2WR_LINE:
++        n = 2;
++        for (int i = 0; i < 2; ++i) x[i] = (int16_t)cpu->gte_data[12 + i];
++        break;
++    default:                                         /* C2WR_DOT */
++        n = 1;
++        x[0] = (int16_t)cpu->gpr[5];
++        break;
++    }
++    const int left_edge = kind != C2WR_DOT;
++    if (!c2wr_outside(x, n, 0, C2WR_W, left_edge)) { c2wr_mismatch++; return; }
++    c2wr_checked++;
++    if (c2wr_outside(x, n, -off, C2WR_W + off, left_edge)) return;
++    /* Visible in a revealed margin: take the game's own keep path. */
++    cpu->gpr[24] &= 0x7FFFFFFFu;
++    c2wr_kept++;
++}
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -794,6 +794,10 @@
+      * it kept alive that its host-side view of the path never saw. */
+     extern void crash2_wide_spawn_note_restore(void);
+     crash2_wide_spawn_note_restore();
++    /* The native-wide polygon test (crash2_wide_reject.h) re-checks the code
++     * words it depends on: they are guest RAM, and a state replaced them. */
++    extern void crash2_wide_reject_note_restore(void);
++    crash2_wide_reject_note_restore();
+     /* Absolute guest-cycle timestamps from the pre-load timeline are invalid
+      * once psx_cycle_count rewinds (typical: save → play N seconds → load).
+      * Leaving post_exception_cooldown_until in the future blocks every IRQ
+@@ -2096,6 +2100,7 @@
+ #include "crash2_wide_probe.h"
+ #include "crash2_wide_bbox.h"
+ #include "crash2_wide_spawn.h"
++#include "crash2_wide_reject.h"
+ #include "crash2_sim_tick.h"
+ #include "crash2_60fps.h"
+ #include "crash2_cheats.h"
+@@ -2106,6 +2111,7 @@
+     crash2_wide_probe(cpu, resume_pc);
+     crash2_wide_bbox(cpu, resume_pc);
+     crash2_wide_spawn(cpu, resume_pc);
++    crash2_wide_reject(cpu, resume_pc);
+     crash2_sim_tick(cpu, resume_pc);
+     crash2_60fps(cpu, resume_pc);
+     crash2_cheats_tick(cpu, resume_pc);
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8331,6 +8331,30 @@
+              id, base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+ }
+ 
++/* Crash 2's per-polygon screen test in native-wide (crash2_wide_reject.h).
++ * Live, so one launch can A/B it:
++ *   c2_reject               -> counters
++ *   c2_reject {"on":0|1}    -> 0 = the game's own [0,512) test, 1 = widened
++ *   c2_reject {"reset":1}   -> zero the counters
++ * off = per-side reveal the last decision used (0 outside native-wide);
++ * checked = polygons the game dropped past an X edge while native-wide was
++ * live; kept = those reaching into a revealed margin, now drawn; mismatch =
++ * the vertices read did not reproduce the game's verdict (left alone). */
++extern void crash2_wide_reject_control(int on, int reset);
++extern void crash2_wide_reject_stats(unsigned long long out[3], int *on,
++                                     int *code_ok, int *off);
++static void handle_c2_reject(int id, const char *json)
++{
++    crash2_wide_reject_control(json_get_int(json, "on", -1),
++                               json_get_int(json, "reset", 0));
++    unsigned long long s[3];
++    int on = 0, code_ok = 0, off = 0;
++    crash2_wide_reject_stats(s, &on, &code_ok, &off);
++    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"code_ok\":%d,\"off\":%d,"
++             "\"checked\":%llu,\"kept\":%llu,\"mismatch\":%llu}",
++             id, on, code_ok, off, s[0], s[1], s[2]);
++}
++
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+  * fire, live extent/camera/DL-count, orig vs final bound). Read-only; small
+  * heap envelope so the per-byte stall of a giant read is never in play. */
+@@ -13931,6 +13955,7 @@
+     { "ws_nw",             handle_ws_nw },
+     { "c2_bbox",           handle_c2_bbox },
+     { "c2_spawn",          handle_c2_spawn },
++    { "c2_reject",         handle_c2_reject },
+     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
+     { "ws_backdrop_margin", handle_ws_backdrop_margin },
+     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -79,6 +79,10 @@
+  * anything, so a report of an object misbehaving at a screen edge can say. */
+ extern void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k,
+                                     int *sig);
++/* Native-wide polygon test (crash2_wide_reject.h): a report of missing
++ * polygons at the edges in native-wide can say whether it ran. */
++extern void crash2_wide_reject_stats(unsigned long long out[3], int *on,
++                                     int *code_ok, int *off);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+ extern uint32_t i_stat;                        /* memory.c */
+@@ -933,6 +937,16 @@
+                  "\"bad\":%llu}",
+                  base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+     }
++    char wr_json[160];
++    {
++        unsigned long long s[3];
++        int on = 0, code_ok = 0, off = 0;
++        crash2_wide_reject_stats(s, &on, &code_ok, &off);
++        snprintf(wr_json, sizeof(wr_json),
++                 "{\"on\":%d,\"code_ok\":%d,\"off\":%d,\"checked\":%llu,"
++                 "\"kept\":%llu,\"mismatch\":%llu}",
++                 on, code_ok, off, s[0], s[1], s[2]);
++    }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),
+         "{\n"
+@@ -971,6 +985,7 @@
+         "  \"cheat_aku_level\":%d,\n"
+         "  \"cheat_god_active\":%d,\n"
+         "  \"wide_spawn\":%s,\n"
++        "  \"wide_reject\":%s,\n"
+         "  \"psx_cycle_count\":%llu,\n"
+         "  \"current_func\":\"0x%08X\",\n"
+         "  \"last_store_pc\":\"0x%08X\",\n"
+@@ -1063,6 +1078,7 @@
+         crash2_cheat_aku_level(),
+         crash2_cheat_god_active(),
+         ws_json,
++        wr_json,
+         (unsigned long long)cyc,
+         cur_fn,
+         last_store,

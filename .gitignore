@@ -96,7 +96,9 @@ _build/ws*.py
 # from the disc stays out - see section 1.
 !_build/Crash2Recomp/
 _build/Crash2Recomp/*
-!_build/Crash2Recomp/game.toml
+# game.toml is NOT kept: the launcher rewrites it with the player's settings
+# (renderer, supersampling, widescreen mode, ...) on every launch, so it only
+# ever showed up as a local change.
 !_build/Crash2Recomp/CMakeLists.txt
 !_build/Crash2Recomp/build.ps1
 !_build/Crash2Recomp/build.sh

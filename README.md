@@ -101,6 +101,11 @@ through Direct3D 12 - the same renderer built for the other API - for systems
 whose OpenGL driver misbehaves. If it cannot start, the log says so and the
 game runs on OpenGL.
 
+**Widescreen.** A 16:9 (or 14:9) *Gameplay aspect* widens the view. Crash 2's
+levels were made for 4:3, so the wider the view, the more objects and scenery
+can pop in at the sides; the Enhanced preset's 14:9 reaches half as far as
+16:9.
+
 ## Mods
 
 The **Mods** page lists what is installed, switches individual features on and
@@ -196,6 +201,19 @@ and music keep their normal speed - with the emulated processor at 400%. In
 play it reached 120 only in bursts, fell back to 60 the rest of the time and
 stuttered when it did hit 120, so it is not offered in normal play, and it
 does not apply with Developer mode off even if it was ticked.
+
+On the Video page it adds two widescreen previews, which likewise do nothing
+with Developer mode off:
+
+- **Widescreen mode.** **Squash** (the normal mode) is light on the GPU.
+  **Native-wide** draws real extra columns and looks sharper, but uses far more
+  GPU memory at high internal resolution. Both show the same scenery: the game
+  tests every polygon against its 4:3 screen, and in native-wide the runtime
+  widens that test to the columns actually on screen.
+- **Object range.** Crash 2 creates enemies, crates and platforms at points
+  along the camera path chosen for the 4:3 view. This creates them a little
+  earlier and keeps them a little longer for the wider view, never across a
+  point where the game loads or unloads the data those objects use.
 
 ## Legal
 

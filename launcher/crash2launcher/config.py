@@ -204,6 +204,22 @@ def native_120fps_active(settings: "Settings") -> bool:
                 and settings.native_120fps)
 
 
+def widescreen_native_wide_active(settings: "Settings") -> bool:
+    """Native-wide rendering, a developer preview for now.
+
+    Its edge fixes (patches 0046/0047) have not been confirmed in play yet, so
+    like 120 FPS it is hidden outside developer mode and a value left in a
+    settings file does not apply there: the runtime gets the squash mode.
+    """
+    return bool(settings.developer_mode and settings.widescreen_native_wide)
+
+
+def widescreen_object_range_active(settings: "Settings") -> int:
+    """The object range the runtime gets: 0 (the game's own) outside
+    developer mode, for the same reason as native-wide."""
+    return settings.widescreen_object_range if settings.developer_mode else 0
+
+
 @dataclass
 class Settings:
     # --- disc -------------------------------------------------------------
@@ -299,8 +315,23 @@ class Settings:
     #   projection, mode 2 renders extra columns - so this is a quality/memory
     #   trade, not a capability one. Toggle it live with the debug server's
     #   `ws_nw` command instead of shipping it on.
+    #   Until patch 0047 mode 2 also dropped every polygon lying wholly inside
+    #   a revealed margin: the game's per-polygon screen test still checked
+    #   [0,512). The runtime now re-decides that test for native-wide, so both
+    #   modes draw the same polygons (NOTES "Widescreen, part 9").
     #   See tuning/NOTES.md "Widescreen, part 5" and "part 6".
+    #   Developer mode only for now: widescreen_native_wide_active().
     widescreen_native_wide: bool = False
+    # Widescreen object range (PSX_CRASH2_WIDE_SPAWN, runtime
+    # crash2_wide_spawn.h), 0..3. Crash 2 creates and removes enemies, crates
+    # and platforms at camera-path nodes authored for the 4:3 view, so a wider
+    # view shows them popping in and out at its edges. Above 0 the runtime
+    # creates them that many nodes early and keeps them that many nodes longer
+    # (scaled by how much wider the view is), never across a point where the
+    # game loads or unloads the data they use. Works in both widescreen modes;
+    # does nothing at 4:3. See tuning/NOTES.md "Widescreen, part 8".
+    # Developer mode only for now: widescreen_object_range_active().
+    widescreen_object_range: int = 0
 
     # --- image quality (settings.toml only - no env override exists) -------
     texture_filter: str = "nearest"     # nearest | bilinear
@@ -550,6 +581,11 @@ class Settings:
             self.cheat_aku_aku = "off"
         if self.rewind not in REWIND_LEVELS:
             self.rewind = "short"
+        try:
+            object_range = int(self.widescreen_object_range)
+        except (TypeError, ValueError):
+            object_range = 0
+        self.widescreen_object_range = max(0, min(3, object_range))
         # Mirrors runtime_perf_init's own clamp (main.cpp).
         self.perf_diag_interval_ms = max(
             250, min(600000, int(self.perf_diag_interval_ms or 5000)))
@@ -911,9 +947,9 @@ PRESET_NOTES: dict[str, str] = {
                                "extra scenery pops in. The picture is centred "
                                "with bars at the sides; raise Zoom or Stretch "
                                "on this page to trade some accuracy for width."),
-    "Widescreen (wider view)": ("Genuinely wider field of view, but Crash 2's "
-                                "levels end at the 4:3 edge, so scenery can "
-                                "appear and vanish at the frame border."),
+    "Widescreen (wider view)": ("Genuinely wider 16:9 view. It reaches past "
+                                "the edge the levels were made for, so objects "
+                                "and some scenery can pop in at the sides."),
 }
 
 

@@ -1,0 +1,117 @@
+Two build failures players reported: a Vulkan SDK on the machine, and a space
+in the folder path.
+
+1. runtime.cmake: PSX_ENABLE_VULKAN defaulted ON, so on a machine with the
+   Vulkan SDK installed ($VULKAN_SDK, glslc) the configure added a custom step
+   that runs ${PSXRECOMP_ROOT}/tools/embed_spirv.py. The framework payload this
+   port ships carries no tools/ directory, so ninja stopped with "missing and
+   no known rule to make it" on every build. Crash 2 Recompiled offers OpenGL
+   and Direct3D 12 only, so the option now defaults OFF, and even when ON (a
+   cache from an earlier configure, or -D on the command line) the backend
+   falls back to its software stub when embed_spirv.py is not in the tree.
+
+2. main_cli.cpp: run_process started psxrecomp-game and psxrecomp-bios with
+   _spawnv, which joins argv with single spaces and quotes nothing. The child's
+   C runtime split any argument holding a space again, so a game unpacked into
+   "D:\Crash Bandicoot 2" failed at "[3/4] Recompiling BIOS" with "config file
+   not found: D:\Crash". Every argument is now quoted the way the C runtime
+   parses it back (backslashes literal except before a quote). The launcher
+   ships a CLI built from this tree (_build/build_recompiler.ps1 builds it in
+   _build/build-cli with PSXRECOMP_ENABLE_CHD=ON so .chd discs still read)
+   instead of the stock one.
+
+main_cli.cpp is not in codegen_hash_sources.cmake and runtime.cmake does not
+change generated code; the codegen hash is unchanged (3d2b5a19).
+
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -1523,11 +1523,13 @@
+     # We need only the Vulkan HEADERS at compile time, plus glslc to build SPIR-V.
+     # Both ship with the Vulkan SDK ($VULKAN_SDK) or a Vulkan-Headers package.
+     #
+-    # Build Vulkan when its SDK tools are available so release binaries can offer
+-    # it without game projects opting in individually. This does not select the
+-    # runtime renderer: OpenGL remains the default in config_loader.h. Builders
+-    # can still use -DPSX_ENABLE_VULKAN=OFF to produce the inert stub explicitly.
+-    option(PSX_ENABLE_VULKAN "Build the Vulkan renderer backend when SDK tools are available" ON)
++    # Crash 2 Recompiled: OFF by default. Its launcher offers OpenGL and
++    # Direct3D 12 only, and the framework it ships has no tools/ directory, so
++    # no embed_spirv.py. With ON, a player's installed Vulkan SDK ($VULKAN_SDK)
++    # switched this on, added the shader step below, and every build stopped in
++    # ninja on the missing script. -DPSX_ENABLE_VULKAN=ON still builds it where
++    # the script exists.
++    option(PSX_ENABLE_VULKAN "Build the Vulkan renderer backend when SDK tools are available" OFF)
+     if(PSX_ENABLE_VULKAN)
+     # $VULKAN_SDK first; else find_path. Unset before find_path — an empty
+     # normal _vk_inc makes find_path a no-op on modern CMake (Homebrew miss).
+@@ -1546,7 +1548,12 @@
+     endif()
+     find_program(GLSLC_EXE NAMES glslc
+         HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+-    if(_vk_inc AND GLSLC_EXE)
++    if(_vk_inc AND GLSLC_EXE AND NOT EXISTS "${PSXRECOMP_ROOT}/tools/embed_spirv.py")
++        # Also covers a cache that still says ON from an earlier configure.
++        message(STATUS "Vulkan backend: SDK found but ${PSXRECOMP_ROOT}/tools/"
++                       "embed_spirv.py is not in this framework tree - "
++                       "gpu_vk_renderer.c builds as a software stub")
++    elseif(_vk_inc AND GLSLC_EXE)
+         message(STATUS "Vulkan backend: headers ${_vk_inc}, glslc ${GLSLC_EXE}")
+         target_include_directories(${target} PRIVATE "${_vk_inc}")
+         target_compile_definitions(${target} PRIVATE PSX_HAVE_VULKAN=1)
+--- a/recompiler/src/main_cli.cpp
++++ b/recompiler/src/main_cli.cpp
+@@ -178,15 +178,50 @@
+         "packaged BIOS profile is missing: " + profile.filename);
+ }
+ 
++#ifdef _WIN32
++// _spawnv joins argv with single spaces and quotes nothing, so the child's
++// command-line parser split every argument that held a space: a game unpacked
++// into "D:\Crash Bandicoot 2" failed at the BIOS step with "config file not
++// found: D:\Crash". Quote each argument the way the C runtime parses it back
++// (backslashes are literal except before a quote).
++std::string quote_windows_arg(const std::string& arg) {
++    if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string::npos)
++        return arg;
++    std::string out = "\"";
++    for (size_t i = 0;; ++i) {
++        size_t backslashes = 0;
++        while (i < arg.size() && arg[i] == '\\') {
++            ++i;
++            ++backslashes;
++        }
++        if (i == arg.size()) {
++            out.append(backslashes * 2, '\\');
++            break;
++        }
++        out.append(arg[i] == '"' ? backslashes * 2 + 1 : backslashes, '\\');
++        out.push_back(arg[i]);
++    }
++    out.push_back('"');
++    return out;
++}
++#endif
++
+ int run_process(const std::vector<std::string>& args) {
++#ifdef _WIN32
++    std::vector<std::string> quoted;
++    quoted.reserve(args.size());
++    for (const std::string& arg : args) quoted.push_back(quote_windows_arg(arg));
++    std::vector<char*> raw;
++    raw.reserve(quoted.size() + 1);
++    for (std::string& arg : quoted) raw.push_back(arg.data());
++    raw.push_back(nullptr);
++    intptr_t result = _spawnv(_P_WAIT, args[0].c_str(), raw.data());
++    return result < 0 ? -1 : (int)result;
++#else
+     std::vector<char*> raw;
+     raw.reserve(args.size() + 1);
+     for (const std::string& arg : args) raw.push_back(const_cast<char*>(arg.c_str()));
+     raw.push_back(nullptr);
+-#ifdef _WIN32
+-    intptr_t result = _spawnv(_P_WAIT, args[0].c_str(), raw.data());
+-    return result < 0 ? -1 : (int)result;
+-#else
+     pid_t pid = fork();
+     if (pid < 0) return -1;
+     if (pid == 0) {

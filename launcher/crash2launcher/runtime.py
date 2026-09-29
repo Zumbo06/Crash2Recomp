@@ -199,6 +199,11 @@ def _build_env(settings: Settings) -> dict[str, str]:
     env["PSX_PAUSE_ON_FOCUS_LOSS"] = "1" if settings.pause_on_focus_loss else "0"
     # The in-game FPS counter (F key / Home menu FPS DISPLAY).
     env["PSX_FPS_OSD"] = "1" if settings.fps_overlay else "0"
+    # Widescreen object range (crash2_wide_spawn.h): how many camera-path
+    # nodes early objects spawn, and late they leave, at 16:9. The runtime
+    # scales it to the live aspect and does nothing at 4:3. Developer mode
+    # only for now, so always written: 0 is the game's own behaviour.
+    env["PSX_CRASH2_WIDE_SPAWN"] = str(config.widescreen_object_range_active(settings))
 
     # Frame pacing. Note the runtime treats vsync and its wall-clock pacer as
     # mutually exclusive, and vsync only really clocks ~60 Hz panels.
@@ -501,16 +506,16 @@ def apply_config_settings(layout: Layout, settings: Settings) -> None:
             #   False - GTE X-squash + stretched present, the DuckStation/Beetle
             #           widescreen hack. Works on any title, at the cost of
             #           stretching the HUD.
-            # Both modes widen the field of view past the edge Crash 2's levels
-            # were authored to, so scenery appears and vanishes at the frame
-            # border. That is a level-data limit, not something either mode can
-            # fix - see tuning/NOTES.md "Widescreen, part 6". The default
-            # presets avoid it by presenting a 14:9 render into a 16:9 canvas
-            # instead (part 7), which is why native_wide stays off here.
+            # Both modes widen the field of view past the 4:3 view Crash 2 was
+            # authored for. Objects are spawned for it by the object range
+            # (crash2_wide_spawn.h, NOTES "Widescreen, part 8"); native-wide's
+            # per-polygon screen test is widened by crash2_wide_reject.h
+            # (part 9). The default presets present a 14:9 render into a 16:9
+            # canvas instead (part 7), which is why native_wide stays off here.
             "widescreen": {
                 "offer": True,
                 "offer_ultrawide": False,
-                "native_wide": settings.widescreen_native_wide,
+                "native_wide": config.widescreen_native_wide_active(settings),
                 "gte_game_mode": True,
                 "precise_nclip": True,
             },

@@ -90,9 +90,20 @@ PRESENT_FILTERS = [
     ("Plain - single tap", "plain"),
 ]
 
+# "Needs per-game data" used to be the native-wide label. It never did: the
+# runtime derives the extra columns from the display width (NOTES.md
+# "Widescreen, part 2"); what it costs is GPU memory.
 WIDESCREEN_MODES = [
-    ("Projection hack - works on any title", False),
-    ("Native-wide - needs per-game data", True),
+    ("Squash - light on the GPU", False),
+    ("Native-wide - draws real extra columns", True),
+]
+
+# Widescreen object range: camera-path nodes at 16:9, scaled by the runtime.
+OBJECT_RANGE_UI = [
+    ("Off - as the 4:3 game does", 0),
+    ("Slightly wider", 1),
+    ("Wider", 2),
+    ("Widest", 3),
 ]
 
 # Values are config.CHEAT_AKU_LEVELS; the runtime takes the name verbatim.
@@ -385,11 +396,24 @@ class SettingsPage(QWidget):
         self.ws_mode = self._combo(WIDESCREEN_MODES,
                                    self.settings.widescreen_native_wide,
                                    self._on_ws_mode)
+        self.widescreen_object_range = self._combo(
+            OBJECT_RANGE_UI, self.settings.widescreen_object_range,
+            self._on_object_range)
         self.scaling = self._combo(SCALING_MODES_UI, self.settings.scaling_mode,
                                    self._on_scaling)
         self.output_aspect = self._combo(OUTPUT_ASPECTS_UI,
                                          self.settings.output_aspect,
                                          self._on_output_aspect)
+        # Native-wide and the object range are developer previews for now:
+        # _sync_dependent_controls shows these only in developer mode, and
+        # config.widescreen_*_active() keeps them off everywhere else.
+        self.ws_mode_row = row("Widescreen mode", self.ws_mode)
+        self.object_range_row = row("Object range", self.widescreen_object_range)
+        self.ws_mode_note = dim("Native-wide looks sharper but uses far more GPU "
+                                "memory at high internal resolution.")
+        self.object_range_note = dim("Object range spawns enemies and crates for "
+                                     "the wider view, so they stop popping at "
+                                     "the edges. Experimental.")
 
         return self._wrap(
             card(
@@ -406,12 +430,13 @@ class SettingsPage(QWidget):
                 row("Internal resolution", self.scale),
                 self.scale_warning,
                 row("Gameplay aspect", self.aspect),
-                row("Widescreen mode", self.ws_mode),
+                self.ws_mode_row,
+                self.object_range_row,
                 dim("Gameplay aspect is what the game draws; Screen shape is "
                     "the window. 4:3 gameplay with Zoom fills a wide screen "
                     "without pop-in at the edges."),
-                dim("Keep Widescreen mode on the projection hack: "
-                    "native-wide needs data Crash 2 doesn't have."),
+                self.ws_mode_note,
+                self.object_range_note,
             ),
         )
 
@@ -824,9 +849,21 @@ class SettingsPage(QWidget):
         self.interp_fps.setToolTip(
             "" if on else "Enable frame interpolation to choose a target.")
 
+        developer = self.settings.developer_mode
+
+        # Widescreen settings do nothing while the game draws 4:3. Native-wide
+        # and the object range are developer previews: hidden, and not applied
+        # (config.widescreen_*_active), outside developer mode.
+        wide = self.settings.aspect != "4:3"
+        for box in (self.ws_mode, self.widescreen_object_range):
+            box.setEnabled(wide)
+            box.setToolTip("" if wide else "Only with a widescreen gameplay aspect.")
+        for w in (self.ws_mode_row, self.object_range_row,
+                  self.ws_mode_note, self.object_range_note):
+            w.setVisible(developer)
+
         # 120 refines 60; it cannot apply on its own. And it is a developer
         # preview: hidden, and not applied, outside developer mode.
-        developer = self.settings.developer_mode
         self.native_120fps.setVisible(developer)
         self.native_120fps_note.setVisible(developer)
         sixty = self.settings.native_60fps
@@ -875,6 +912,7 @@ class SettingsPage(QWidget):
             (self.fullscreen, self.settings.fullscreen_mode),
             (self.rewind, self.settings.rewind),
             (self.ws_mode, self.settings.widescreen_native_wide),
+            (self.widescreen_object_range, self.settings.widescreen_object_range),
             (self.scaling, self.settings.scaling_mode),
             (self.output_aspect, self.settings.output_aspect),
             (self.present_zoom, self.settings.present_zoom),
@@ -993,6 +1031,11 @@ class SettingsPage(QWidget):
 
     def _on_ws_mode(self, index: int) -> None:
         self.settings.widescreen_native_wide = self.ws_mode.itemData(index)
+        self._touch()
+
+    def _on_object_range(self, index: int) -> None:
+        self.settings.widescreen_object_range = \
+            self.widescreen_object_range.itemData(index)
         self._touch()
 
     def _on_scaling(self, index: int) -> None:
