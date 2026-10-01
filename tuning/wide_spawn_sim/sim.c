@@ -25,6 +25,9 @@ static void     ram_w16(uint32_t a, uint16_t v) { memcpy(g_ram + (a & 0x1FFFFF),
 #define C2WS_R32(a)    ram_r32(a)
 #define C2WS_R16(a)    ram_r16(a)
 #define C2WS_R8(a)     ram_r8(a)
+#define C2WG_R32(a)    ram_r32(a)   /* crash2_wide_geom.h */
+#define C2WG_R16(a)    ram_r16(a)
+#define C2WG_R8(a)     ram_r8(a)
 #define C2WS_W32(a, v) ram_w32((a), (v))
 
 /* ---- the runtime pieces the header touches ------------------------------ */

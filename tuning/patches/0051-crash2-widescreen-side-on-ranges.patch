@@ -1,0 +1,1093 @@
+Widescreen ranges for side-on paths, and scenery across path ends.
+
+Reported after 0049/0050: objects and scenery still pop in at the edges in
+side-scrolling scenes (bonus rounds, Snow Go). Measured on the disc:
+
+- Camera paths of kind 3 (and 8, property 0x029) look at the play from the
+  side. Every object on them appears where its offset along the path from the
+  camera is 0.94-2.3x its distance off the path (median 1.1) and vanishes at
+  the mirror value: the 4:3 frame's side edges. A 16:9 frame sees each one
+  a third of that offset earlier: 5-7 nodes typically, past 14 for some. The
+  fixed window (k = 2) covered 1% of them.
+- Paths are short (26-30 nodes) and joined end to end (1,815 of 1,990 at both
+  ends), so long windows mostly stopped at a path's end.
+
+crash2_wide_geom.h (new, read only): resident-entry lookup as 0x80014B90 does
+it, the property accessor's search, path points, object positions (draw-list
+value -> entity, checked on all 53,862 values), camera links (0x109, all
+3,837 checked), zone world tables. 27 code words checked.
+
+crash2_wide_spawn.h: on side-on paths each object's own reach, from its
+position where the original starts or stops showing it (k elsewhere; never
+less than k, at most 24 nodes; load/unload rules unchanged).
+
+crash2_wide_slst.h: on side-on paths a per-path window, the 90th percentile of
+its objects' reaches (met 98% of their needs; 7 nodes at 16:9 without enough
+objects; at most 20), with up to as many polygons again as the game's list.
+Past either end the window continues into the linked path's lists, world
+slots remapped by EID to the current zone's (the renderer's), unmapped
+polygons dropped.
+
+New counters: wide_spawn side / side_miss; wide_slst side / joined / kw.
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/crash2_wide_spawn.h
++++ b/runtime/src/crash2_wide_spawn.h
+@@ -54,9 +54,25 @@
+  *     Home menu, a 4:3 FMV), the next node re-checks every queued entity, not
+  *     just the nearby ones, so nothing we kept can be left behind.
+  *
++ * How far, on paths that look at the play from the side (kind 3 and 8, see
++ * crash2_wide_geom.h): there the camera moves ACROSS the view, and k nodes
++ * were far too few. An object enters the 4:3 frame where its offset along
++ * the path from the camera is a, about its distance off the path; the wider
++ * frame sees it a * margin/256 earlier along the path (a third, at 16:9), and
++ * keeps it as much longer. So on those paths each object's own reach, in
++ * nodes, is that distance over the node spacing at the node where the
++ * original starts or stops showing it - read from its position and the path's
++ * points. Across the game that is 5 to 7 nodes typically, past 14 for some,
++ * at 16:9; k (2) covered 1% of them. Never less than k, never more than
++ * C2WS_MAX_REACH; where the geometry is not understood, k. Other paths move
++ * the camera INTO the view, where things appear far ahead, near the middle:
++ * k there, as before. The load and unload rules above hold for every reach.
++ *
+  * Off unless PSX_CRASH2_WIDE_SPAWN > 0. The window is 0 - retire only - at 4:3
+  * and on frames presented 4:3 (same gate as crash2_wide_bbox.h). Every code
+  * word it depends on is checked first; any mismatch leaves the game alone. */
++
++#include "crash2_wide_geom.h"
+ 
+ #define C2WS_FN          0x8001A13Cu  /* queue one node's draw-list rows        */
+ #define C2WS_RA_STEP     0x8002052Cu  /* return from the per-node walk call     */
+@@ -73,9 +89,10 @@
+ #define C2WS_P_LOAD_A    0x208
+ #define C2WS_P_LOAD_B    0x209
+ #define C2WS_MAX_ROWS    256
+-#define C2WS_MAX_CAND    96
++#define C2WS_MAX_CAND    192
+ #define C2WS_MAX_EVENTS  48
+ #define C2WS_MAX_K       8
++#define C2WS_MAX_REACH   24           /* nodes, an object's own reach (side-on) */
+ 
+ #ifndef C2WS_R32
+ extern uint32_t psx_read_word(uint32_t a);
+@@ -97,10 +114,13 @@
+ static int c2ws_sig = -1;             /* code words: -1 unchecked, 0 bad, 1 ok  */
+ static int c2ws_last_k = -1;          /* window used at the previous node       */
+ static int c2ws_full_pass = 1;        /* re-check every queued entity next node */
++static int c2ws_geo = -1;             /* crash2_wide_geom.h's words: -1, 0, 1  */
++static float c2ws_side_scale;         /* side-on reach per unit along the path  */
+ static struct { int armed; uint32_t ra, cam; int node, dir, k; } c2ws_call;
+ static unsigned long long c2ws_arrivals, c2ws_early, c2ws_kept, c2ws_retired,
+                           c2ws_unsafe_load, c2ws_unsafe_unload, c2ws_full,
+-                          c2ws_bad;
++                          c2ws_bad, c2ws_side, c2ws_side_miss;
++static C2wgVec c2ws_pts[C2WG_MAX_PTS];  /* the side-on path's points            */
+ 
+ static int c2ws_is_ram(uint32_t a) { return a >= 0x80000000u && a < 0x801FFFF0u; }
+ 
+@@ -221,15 +241,41 @@
+     return d > 0 ? c2ws_row_at(lb, j - 1) : c2ws_row_at(la, j + 1);
+ }
+ 
++/* A side-on path's points and zone, for this arrival. */
++typedef struct { const C2wgVec *pts; int n; uint32_t zone; } C2wsSide;
++
++/* How many nodes from x the window reaches for this entity, x being the node
++ * where the original starts or stops showing it: k, or on a side-on path the
++ * nodes the camera covers while the object crosses the extra columns. */
++static int c2ws_reach(const C2wsCand *c, int x, int k, const C2wsSide *side)
++{
++    if (!side) return k;
++    C2wgVec p;
++    float along, step;
++    if (!c2wg_object_pos(side->zone, c->value, &p) ||
++        !c2wg_edge(side->pts, side->n, x, &p, &along, &step)) {
++        c2ws_side_miss++;
++        return k;
++    }
++    int r = (int)ceilf(along * c2ws_side_scale / step);
++    if (r < k) r = k;
++    if (r > C2WS_MAX_REACH) r = C2WS_MAX_REACH;
++    c2ws_side++;
++    return r;
++}
++
+ /* Whether the window wants an entity the original does not, at node n. */
+ static int c2ws_window_wants(const C2wsCand *c, const C2wsProp *la,
+-                             const C2wsProp *lb, int n, int d, int k)
+-{
++                             const C2wsProp *lb, int n, int d, int k,
++                             const C2wsSide *side)
++{
++    const int far = side ? C2WS_MAX_REACH : k;
+     /* Ahead in the direction of travel: spawn early, if its data was already
+      * requested (no load row up to the node where the original spawns it). */
+-    for (int t = 1; t <= k; t++) {
++    for (int t = 1; t <= far; t++) {
+         const int x = n + d * t;
+         if (!c2ws_present(c, x)) continue;
++        if (t > c2ws_reach(c, x, k, side)) break;
+         for (int j = n + d; ; j += d) {
+             if (c2ws_loads_at(la, lb, j, d)) { c2ws_unsafe_load++; goto behind; }
+             if (j == x) break;
+@@ -239,9 +285,10 @@
+ behind:
+     /* Behind: keep alive, unless something was unloaded since the node where
+      * the original killed it. */
+-    for (int t = 1; t <= k; t++) {
++    for (int t = 1; t <= far; t++) {
+         const int x = n - d * t;
+         if (!c2ws_present(c, x)) continue;
++        if (t > c2ws_reach(c, x, k, side)) return 0;
+         for (int j = x + d; ; j += d) {
+             if (c2ws_unloads_at(la, lb, j, d)) { c2ws_unsafe_unload++; return 0; }
+             if (j == n) break;
+@@ -262,7 +309,16 @@
+         return;
+     }
+     const int d = dir == 2 ? 1 : -1;
+-    const int reach = k > 0 ? k : 0;
++    if (k < 0) k = 0;
++    /* A side-on path: each object gets its own reach (crash2_wide_geom.h). */
++    C2wsSide side_on, *side = NULL;
++    if (k > 0 && c2ws_side_scale > 0.0f && c2ws_geo == 1 && c2wg_side_on(cam)) {
++        side_on.zone = c2wg_zone_of(cam);
++        side_on.n = side_on.zone ? c2wg_path_points(cam, c2ws_pts, C2WG_MAX_PTS) : 0;
++        side_on.pts = c2ws_pts;
++        if (side_on.n > 0) side = &side_on;
++    }
++    const int reach = side ? C2WS_MAX_REACH : k;
+ 
+     /* Candidates: every entity with a row close enough for the window to
+      * change its state here, and - after a load or a window change - every
+@@ -324,7 +380,7 @@
+          * last node an A row there); anything else is left to the game. */
+         if (cd->e[0].on == 0 || cd->e[cd->n - 1].on == 1) continue;
+         if (c2ws_present(cd, n)) continue;   /* the original's, entirely */
+-        const int want = c2ws_window_wants(cd, &la, &lb, n, d, reach);
++        const int want = c2ws_window_wants(cd, &la, &lb, n, d, k, side);
+         const int qi = c2ws_q_find(cd->key);
+         if (qi == -2) { c2ws_bad++; return; }
+         const uint32_t act = qi >= 0 ? C2WS_R32(C2WS_Q_BASE + (uint32_t)qi * 12u + 8u) : 0u;
+@@ -377,14 +433,18 @@
+ 
+ /* The window for this frame's widening. The launcher's value is for 16:9
+  * (85 px revealed per side); 14:9 reveals half that, 21:9 more. 0 when the
+- * frame is not widened - which still retires anything kept earlier. */
++ * frame is not widened - which still retires anything kept earlier. The
++ * side-on scale is the columns revealed per side over the 4:3 half width
++ * (256): the launcher's 2 is what the geometry says, 3 half as much again. */
+ static int c2ws_window(void)
+ {
+     GpuWsDebug ws;
+     gpu_ws_get_debug(&ws);
++    c2ws_side_scale = 0.0f;
+     if (ws.present_native_43) return 0;
+     if (!((ws.mode == 1 && ws.active) || (ws.mode == 2 && ws.nw_extra > 0))) return 0;
+     const int margin = ws.x_margin > 0 ? ws.x_margin : 85;
++    c2ws_side_scale = (float)margin / 256.0f * (float)c2ws_base_k / 2.0f;
+     int k = (c2ws_base_k * margin + 42) / 85;
+     if (k < 1) k = 1;
+     return k > C2WS_MAX_K ? C2WS_MAX_K : k;
+@@ -405,14 +465,18 @@
+     if (reset) {
+         c2ws_arrivals = c2ws_early = c2ws_kept = c2ws_retired = 0;
+         c2ws_unsafe_load = c2ws_unsafe_unload = c2ws_full = c2ws_bad = 0;
+-    }
+-}
+-
+-void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k, int *sig)
++        c2ws_side = c2ws_side_miss = 0;
++    }
++}
++
++/* out[8] side = reaches taken from an object's position on a side-on path,
++ * out[9] side_miss = side-on objects whose position did not fit (k instead). */
++void crash2_wide_spawn_stats(unsigned long long out[10], int *base_k, int *k, int *sig)
+ {
+     out[0] = c2ws_arrivals;  out[1] = c2ws_early;          out[2] = c2ws_kept;
+     out[3] = c2ws_retired;   out[4] = c2ws_unsafe_load;    out[5] = c2ws_unsafe_unload;
+     out[6] = c2ws_full;      out[7] = c2ws_bad;
++    out[8] = c2ws_side;      out[9] = c2ws_side_miss;
+     if (base_k) *base_k = c2ws_base_k < 0 ? 0 : c2ws_base_k;
+     if (k) *k = c2ws_last_k < 0 ? 0 : c2ws_last_k;
+     if (sig) *sig = c2ws_sig;
+@@ -431,13 +495,15 @@
+         if (c2ws_base_k == 0) return;
+         if (ra != C2WS_RA_STEP && ra != C2WS_RA_ENTRY_0 && ra != C2WS_RA_ENTRY_L) return;
+         if (!c2ws_code_ok(cpu)) return;
++        if (c2ws_geo < 0) c2ws_geo = c2wg_code_ok();   /* else: side-on paths use k */
+         const int k = c2ws_window();
+         if (k != c2ws_last_k) {
+             c2ws_full_pass = 1;
+             if (k > 0)
+                 fprintf(stdout, "psxrecomp: widescreen object range: %d camera "
+-                                "node%s either side (crash2_wide_spawn)\n",
+-                        k, k == 1 ? "" : "s");
++                                "node%s either side, side-on paths by each "
++                                "object's position%s (crash2_wide_spawn)\n",
++                        k, k == 1 ? "" : "s", c2ws_geo == 1 ? "" : " - off, code differs");
+         }
+         c2ws_last_k = k;
+         c2ws_call.armed = 1;
+--- a/runtime/src/crash2_wide_slst.h
++++ b/runtime/src/crash2_wide_slst.h
+@@ -39,10 +39,35 @@
+  *     frame draws the game's list.
+  *   - Off (identity) at 4:3 and on frames presented 4:3.
+  *
++ * How far (crash2_wide_geom.h for the level data):
++ *
++ *   - Paths that look at the play from the side (kind 3 and 8) move the camera
++ *     ACROSS the view, and there two nodes were far too few: what the wider
++ *     frame shows at its edges, the 4:3 frame shows only 5 to 7 nodes (some
++ *     paths past 14) further along. On those paths the window is read from
++ *     the path's own objects, which stand where the play is: each one's
++ *     offset along the path where the 4:3 frame starts or stops showing it,
++ *     times margin/256, over the node spacing - the 90th percentile of them
++ *     (it met 98% of the objects' own needs across the game; the plain
++ *     growth of the lists met 37%). Seven nodes at 16:9 where a path has too
++ *     few objects, never less than k, never more than C2SL_MAX_KW; and up to
++ *     as many polygons again as the game's list instead of half as many.
++ *   - Paths are short (26 to 30 nodes), so a window that long would mostly
++ *     stop at a path's end: past either end it continues into the path the
++ *     camera link (0x109) joins there, when that path's SLST is resident and
++ *     the link is a single one. Its polygon ids name worlds by the joined
++ *     zone's slots, so they are mapped to this zone's (the renderer's) by
++ *     world EID, and dropped where this zone has no such world. Across the
++ *     game that mapping leaves joined lists 5% apart at the shared node, as
++ *     close as two lists of one zone (4%); unmapped they differ by 71%.
++ *   - Elsewhere: k nodes either side, as before, and across path ends too.
++ *
+  * PSX_CRASH2_WIDE_SLST=N: nodes either side at 16:9, scaled by the live
+- * widescreen margin like the object range (crash2_wide_spawn.h). The c2_slst
+- * debug command changes it live and reports counters; the heartbeat carries
+- * them as "wide_slst". */
++ * widescreen margin like the object range (crash2_wide_spawn.h); N/2 scales
++ * the side-on window. The c2_slst debug command changes it live and reports
++ * counters; the heartbeat carries them as "wide_slst". */
++
++#include "crash2_wide_geom.h"
+ 
+ #define C2SL_ENTRY_RA    0x8002037Cu  /* after 0x80014260: $v0 = SLST entry  */
+ #define C2SL_RENDER_FN   0x80041E5Cu
+@@ -62,6 +87,9 @@
+ #define C2SL_PRIM_POLY   64u          /* bytes allowed per added polygon      */
+ #define C2SL_PRIM_RESERVE 0x4000u
+ #define C2SL_MAX_K       8
++#define C2SL_MAX_KW      20           /* nodes, the side-on window's longest   */
++#define C2SL_SIDE_FALLBACK 7          /* nodes at 16:9 without enough objects  */
++#define C2SL_CACHE       4            /* entries: this path, both joins, one   */
+ #define C2SL_SENT        0xFFFF00
+ 
+ #ifndef C2SL_R32
+@@ -145,24 +173,44 @@
+     uint16_t *ids;
+ } C2slEntry;
+ 
++/* The path joined at one end: its lists, which way walking on enters them,
++ * and its world slots mapped to this zone's (0xFF: not one of ours). */
++typedef struct {
++    const C2slEntry *e;
++    uint32_t entry;
++    int at_start;
++    uint8_t map[C2WG_MAX_WORLDS];
++} C2slJoin;
++
+ static int      c2sl_base_k = -1;           /* -1 = not yet read from env      */
+ static int      c2sl_last_k = -1;
++static int      c2sl_last_kw = -1;          /* the window last used            */
+ static int      c2sl_code = -1;             /* -1 unchecked, 0 changed, 1 ok   */
++static int      c2sl_geo = -1;              /* crash2_wide_geom.h's words      */
++static float    c2sl_side_scale;            /* see c2sl_window                 */
+ static uint32_t c2sl_cap_entry, c2sl_cap_cam;
+-static C2slEntry c2sl_cache[2];
++static C2slEntry c2sl_cache[C2SL_CACHE];
+ static uint32_t c2sl_clock;
+ static uint32_t c2sl_buf;                   /* guest buffer for the merged list */
+-/* The merged list for one (entry, node, list, count, k): built once per node. */
++/* The merged list for one (entry, node, list, count, window, joins): built
++ * once per node. */
+ static struct {
+-    uint32_t entry, list; int node, count, k, first, last;
++    uint32_t entry, list; int node, count, k, kw, first, last;
++    uint32_t join[2];
+     int valid, widen, added;
+ } c2sl_built;
++/* The side-on window of one path. */
++static struct { uint32_t cam, zone; int nodes, base, margin, kw; } c2sl_side;
++static C2wgVec c2sl_pts[C2WG_MAX_PTS];
++static float    c2sl_reach[512];
+ static unsigned long long c2sl_n_built, c2sl_n_used, c2sl_n_mismatch, c2sl_n_bad,
+-                          c2sl_n_prim_skips, c2sl_added_max;
++                          c2sl_n_prim_skips, c2sl_added_max, c2sl_n_side,
++                          c2sl_n_joined;
+ static uint16_t c2sl_tmp_a[C2SL_MAX_LIST], c2sl_tmp_b[C2SL_MAX_LIST];
+ static uint16_t c2sl_item[C2SL_MAX_ITEM_HW];
+ static uint16_t c2sl_merged[C2SL_MAX_LIST], c2sl_next[C2SL_MAX_LIST];
+ static uint16_t c2sl_game[C2SL_MAX_LIST];   /* the game's list the merge came from */
++static uint16_t c2sl_mapped[C2SL_MAX_LIST]; /* a joined path's list, our worlds  */
+ static uint16_t c2sl_pos[65536];
+ static uint8_t  c2sl_have[65536 / 8];
+ 
+@@ -346,33 +394,62 @@
+ 
+ static C2slEntry *c2sl_entry(uint32_t entry)
+ {
+-    for (int i = 0; i < 2; ++i)
++    for (int i = 0; i < C2SL_CACHE; ++i)
+         if (c2sl_cache[i].entry == entry && c2sl_is_ram(entry, 16) &&
+             C2SL_R32(entry + 4) == c2sl_cache[i].eid) {
+             c2sl_cache[i].stamp = ++c2sl_clock;
+             return &c2sl_cache[i];
+         }
+-    C2slEntry *e = c2sl_cache[0].stamp <= c2sl_cache[1].stamp ? &c2sl_cache[0] : &c2sl_cache[1];
++    C2slEntry *e = &c2sl_cache[0];
++    for (int i = 1; i < C2SL_CACHE; ++i)
++        if (c2sl_cache[i].stamp < e->stamp) e = &c2sl_cache[i];
+     c2sl_build_entry(e, entry);
+     if (!e->ok) c2sl_n_bad++;
+     return e;
+ }
+ 
++/* The list of node nb - this path's, or past an end the joined path's, its
++ * worlds mapped to ours and polygons of other worlds left out. NULL if none. */
++static const uint16_t *c2sl_list_at(const C2slEntry *e, int nb, const C2slJoin *joins, int *nn)
++{
++    if (nb >= 0 && nb < e->nodes) {
++        *nn = e->len[nb];
++        return e->ids + e->off[nb];
++    }
++    const C2slJoin *jn = &joins[nb < 0 ? 0 : 1];
++    if (!jn->e) return NULL;
++    /* steps past the shared node (the joined path's first or last) */
++    const int idx = nb < 0 ? -nb : nb - (e->nodes - 1);
++    const int at = jn->at_start ? idx : jn->e->nodes - 1 - idx;
++    if (at < 0 || at >= jn->e->nodes) return NULL;
++    const uint16_t *src = jn->e->ids + jn->e->off[at];
++    int n = 0;
++    for (int i = 0; i < jn->e->len[at]; ++i) {
++        const unsigned w = jn->map[src[i] >> 13];
++        if (w < C2WG_MAX_WORLDS) c2sl_mapped[n++] = (uint16_t)((w << 13) | (src[i] & 0x1FFFu));
++    }
++    *nn = n;
++    return c2sl_mapped;
++}
++
+ /* m = the game's list; add the polygons of the neighbour lists in the order
+  * given, each once, right after its predecessor in that list. */
+-static int c2sl_merge(const C2slEntry *e, int node, int k, int m, int cap)
++static int c2sl_merge(const C2slEntry *e, int node, int k, int m, int cap,
++                      const C2slJoin *joins, int *joined)
+ {
+     memset(c2sl_have, 0, sizeof c2sl_have);
+     for (int i = 0; i < m; ++i) {
+         const uint16_t key = c2sl_key(c2sl_merged[i]);
+         c2sl_have[key >> 3] |= (uint8_t)(1u << (key & 7));
+     }
++    *joined = 0;
+     for (int j = 1; j <= k && m < cap; ++j) {
+         for (int side = -1; side <= 1 && m < cap; side += 2) {
+             const int nb = node + side * j;
+-            if (nb < 0 || nb >= e->nodes) continue;
+-            const uint16_t *nl = e->ids + e->off[nb];
+-            const int nn = e->len[nb];
++            int nn = 0;
++            const uint16_t *nl = c2sl_list_at(e, nb, joins, &nn);
++            if (!nl) continue;
++            const int before = m;
+             for (int i = 0; i < m; ++i) c2sl_pos[c2sl_key(c2sl_merged[i])] = (uint16_t)i;
+             /* insertion anchor per neighbour polygon: position in the current
+              * list after which it goes (0 keeps the game's first entry first) */
+@@ -407,9 +484,78 @@
+             }
+             memcpy(c2sl_merged, c2sl_next, sizeof(uint16_t) * (size_t)w);
+             m = w;
++            if (nb < 0 || nb >= e->nodes) *joined += m - before;
+         }
+     }
+     return m;
++}
++
++/* The path joined at one end of `cam` (end 0 its start, 1 its end), mapped to
++ * the renderer's zone. Leaves jn->e NULL when there is none to use. */
++static void c2sl_join(uint32_t cam, int nodes, int end, uint32_t zone, C2slJoin *jn)
++{
++    memset(jn, 0, sizeof *jn);
++    int at_start = 0;
++    const uint32_t path = c2wg_link(cam, end, nodes, &at_start);
++    const uint32_t entry = path ? c2wg_slst_of(path) : 0u;
++    const uint32_t pz = path ? c2wg_zone_of(path) : 0u;
++    if (!entry || !pz) return;
++    for (unsigned w = 0; w < C2WG_MAX_WORLDS; ++w) {
++        jn->map[w] = 0xFF;
++        const uint32_t eid = c2wg_world(pz, w);
++        for (unsigned i = 0; eid && i < C2WG_MAX_WORLDS; ++i)
++            if (c2wg_world(zone, i) == eid) { jn->map[w] = (uint8_t)i; break; }
++    }
++    const C2slEntry *je = c2sl_entry(entry);
++    if (!je->ok || je->nodes < 2) return;
++    jn->e = je;
++    jn->entry = entry;
++    jn->at_start = at_start;
++}
++
++/* The side-on window of `cam`: the 90th percentile, over the objects its own
++ * lists start or stop showing inside the path, of how many nodes the camera
++ * covers while one crosses the extra columns. Cached per path. */
++static int c2sl_side_window(uint32_t cam, int nodes, int k, int margin)
++{
++    const uint32_t zone = c2wg_zone_of(cam);
++    if (c2sl_side.cam == cam && c2sl_side.zone == zone && c2sl_side.nodes == nodes &&
++        c2sl_side.base == c2sl_base_k && c2sl_side.margin == margin && zone)
++        return c2sl_side.kw < k ? k : c2sl_side.kw;
++    int kw = (int)ceilf((float)C2SL_SIDE_FALLBACK * c2sl_side_scale / (85.0f / 256.0f));
++    const int n = zone ? c2wg_path_points(cam, c2sl_pts, C2WG_MAX_PTS) : 0;
++    int got = 0;
++    for (int pass = 0; n == nodes && pass < 2; ++pass) {
++        C2wgProp p;
++        if (!c2wg_prop(cam, pass ? 0x13C : 0x13B, &p) || p.esize != 4u || !(p.flags & 0x20u))
++            continue;
++        for (int r = 0; r < p.rows && got < (int)(sizeof c2sl_reach / sizeof c2sl_reach[0]); ++r) {
++            uint32_t v;
++            int c, node;
++            if (!c2wg_row(&p, r, &v, &c, &node)) break;
++            if (node <= 0 || node >= n - 1) continue;      /* path ends: carried over */
++            for (int i = 0; i < c && got < (int)(sizeof c2sl_reach / sizeof c2sl_reach[0]); ++i) {
++                C2wgVec o;
++                float along, step;
++                if (c2wg_object_pos(zone, C2SL_R32(v + 4u * (uint32_t)i), &o) &&
++                    c2wg_edge(c2sl_pts, n, node, &o, &along, &step))
++                    c2sl_reach[got++] = along / step;
++            }
++        }
++    }
++    if (got >= 3) {
++        for (int i = 1; i < got; ++i) {                     /* insertion sort */
++            const float t = c2sl_reach[i];
++            int j = i - 1;
++            while (j >= 0 && c2sl_reach[j] > t) { c2sl_reach[j + 1] = c2sl_reach[j]; j--; }
++            c2sl_reach[j + 1] = t;
++        }
++        kw = (int)ceilf(c2sl_reach[(got * 9) / 10] * c2sl_side_scale);
++    }
++    if (kw > C2SL_MAX_KW) kw = C2SL_MAX_KW;
++    c2sl_side.cam = cam; c2sl_side.zone = zone; c2sl_side.nodes = nodes;
++    c2sl_side.base = c2sl_base_k; c2sl_side.margin = margin; c2sl_side.kw = kw;
++    return kw < k ? k : kw;
+ }
+ 
+ static int c2sl_code_ok(CPUState *cpu)
+@@ -420,13 +566,20 @@
+     return 1;
+ }
+ 
++/* k for this frame, and the side-on scale: the columns revealed per side over
++ * the 4:3 half width (256), the launcher's 2 as the geometry says. */
++static int c2sl_margin = 85;
++
+ static int c2sl_window(void)
+ {
+     GpuWsDebug ws;
+     gpu_ws_get_debug(&ws);
++    c2sl_side_scale = 0.0f;
+     if (ws.present_native_43) return 0;
+     if (!((ws.mode == 1 && ws.active) || (ws.mode == 2 && ws.nw_extra > 0))) return 0;
+     const int margin = ws.x_margin > 0 ? ws.x_margin : 85;
++    c2sl_margin = margin;
++    c2sl_side_scale = (float)margin / 256.0f * (float)c2sl_base_k / 2.0f;
+     int k = (c2sl_base_k * margin + 42) / 85;
+     if (k < 1) k = 1;
+     return k > C2SL_MAX_K ? C2SL_MAX_K : k;
+@@ -437,6 +590,7 @@
+     c2sl_code = -1;
+     c2sl_cap_entry = c2sl_cap_cam = 0;
+     c2sl_built.valid = 0;
++    memset(&c2sl_side, 0, sizeof c2sl_side);
+ }
+ 
+ void crash2_wide_slst_control(int k, int reset)
+@@ -444,17 +598,22 @@
+     if (k >= 0) {
+         c2sl_base_k = k > C2SL_MAX_K ? C2SL_MAX_K : k;
+         c2sl_built.valid = 0;
++        memset(&c2sl_side, 0, sizeof c2sl_side);
+     }
+     if (reset)
+         c2sl_n_built = c2sl_n_used = c2sl_n_mismatch = c2sl_n_bad =
+-            c2sl_n_prim_skips = c2sl_added_max = 0;
+-}
+-
+-void crash2_wide_slst_stats(unsigned long long out[6], int *base_k, int *k,
++            c2sl_n_prim_skips = c2sl_added_max = c2sl_n_side = c2sl_n_joined = 0;
++}
++
++/* out[6] side = lists built with a side-on window, out[7] joined = lists that
++ * took polygons from a joined path, out[8] = the window last used (nodes). */
++void crash2_wide_slst_stats(unsigned long long out[9], int *base_k, int *k,
+                             int *code_ok, int *added)
+ {
+     out[0] = c2sl_n_built;   out[1] = c2sl_n_used;  out[2] = c2sl_n_mismatch;
+     out[3] = c2sl_n_bad;     out[4] = c2sl_n_prim_skips; out[5] = c2sl_added_max;
++    out[6] = c2sl_n_side;    out[7] = c2sl_n_joined;
++    out[8] = c2sl_last_kw < 0 ? 0u : (unsigned long long)c2sl_last_kw;
+     if (base_k)  *base_k = c2sl_base_k < 0 ? 0 : c2sl_base_k;
+     if (k)       *k = c2sl_last_k < 0 ? 0 : c2sl_last_k;
+     if (code_ok) *code_ok = c2sl_code;
+@@ -472,6 +631,7 @@
+     if (c2sl_base_k == 0) return;
+     if (c2sl_code < 0) c2sl_code = c2sl_code_ok(cpu);
+     if (!c2sl_code) return;
++    if (c2sl_geo < 0) c2sl_geo = c2wg_code_ok();   /* else: k, inside the path */
+     if (pc == C2SL_ENTRY_RA) {
+         /* The camera update just resolved its path's SLST entry; it does so
+          * whenever it is about to step to another node. */
+@@ -522,12 +682,35 @@
+             c2sl_game[i] = c2sl_merged[i] = C2SL_R16(list + 4u + 2u * (uint32_t)i);
+         for (int i = 0; i < count; ++i)
+             if (c2sl_key(c2sl_merged[i]) != c2sl_key(mine[i])) { c2sl_n_mismatch++; return; }
++        /* The window: k, or a side-on path's own; past the path's ends into
++         * the joined paths, when the camera's zone is this path's (whose world
++         * slots the renderer has). */
++        int kw = k, side_on = 0, joined = 0;
++        C2slJoin joins[2];
++        memset(joins, 0, sizeof joins);
++        if (c2sl_geo == 1) {
++            side_on = c2wg_side_on(c2sl_cap_cam);
++            if (side_on) kw = c2sl_side_window(c2sl_cap_cam, e->nodes, k, c2sl_margin);
++            const uint32_t zone = c2wg_zone_of(c2sl_cap_cam);
++            if (zone && zone == C2SL_R32(C2WG_ZONE)) {
++                if (node - kw < 0) c2sl_join(c2sl_cap_cam, e->nodes, 0, zone, &joins[0]);
++                if (node + kw > e->nodes - 1) c2sl_join(c2sl_cap_cam, e->nodes, 1, zone, &joins[1]);
++            }
++        }
++        c2sl_last_kw = kw;
++        c2sl_built.kw = kw;
++        c2sl_built.join[0] = joins[0].entry;
++        c2sl_built.join[1] = joins[1].entry;
+         /* At most half as many again: by polygon, two nodes either side add
+-         * 14% on average and 38% at the 99th percentile across the game. */
+-        int cap = count + count / 2 + 32;
++         * 14% on average and 38% at the 99th percentile across the game. A
++         * side-on window adds about 60% (its 90th percentile, 100%): as many
++         * again there. */
++        int cap = side_on ? count + count + 32 : count + count / 2 + 32;
+         if (cap > C2SL_MAX_LIST) cap = C2SL_MAX_LIST;
+-        const int m = c2sl_merge(e, node, k, count, cap);
++        const int m = c2sl_merge(e, node, kw, count, cap, joins, &joined);
+         if (m <= count) return;
++        if (side_on) c2sl_n_side++;
++        if (joined) c2sl_n_joined++;
+         if (!c2sl_buf) c2sl_buf = C2SL_ALLOC(4u + 2u * C2SL_MAX_LIST);
+         if (!c2sl_buf) return;
+         C2SL_W16(c2sl_buf, (uint16_t)m);
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8313,22 +8313,25 @@
+  * retired = those killed again once the window let go; unsafe_load /
+  * unsafe_unload = held back because level data loads or unloads in between;
+  * full = spawns skipped because the game's queue was near its end; bad =
+- * data this did not understand (it then leaves the game alone). */
++ * data this did not understand (it then leaves the game alone); side = reaches
++ * taken from an object's position on a side-on path; side_miss = side-on
++ * objects whose position did not fit (k used instead). */
+ extern void crash2_wide_spawn_control(int k, int reset);
+-extern void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k,
++extern void crash2_wide_spawn_stats(unsigned long long out[10], int *base_k, int *k,
+                                     int *sig);
+ static void handle_c2_spawn(int id, const char *json)
+ {
+     crash2_wide_spawn_control(json_get_int(json, "k", -1),
+                               json_get_int(json, "reset", 0));
+-    unsigned long long s[8];
++    unsigned long long s[10];
+     int base_k = 0, k = 0, sig = 0;
+     crash2_wide_spawn_stats(s, &base_k, &k, &sig);
+     send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
+              "\"arrivals\":%llu,\"early\":%llu,\"kept\":%llu,\"retired\":%llu,"
+              "\"unsafe_load\":%llu,\"unsafe_unload\":%llu,\"full\":%llu,"
+-             "\"bad\":%llu}",
+-             id, base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
++             "\"bad\":%llu,\"side\":%llu,\"side_miss\":%llu}",
++             id, base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
++             s[8], s[9]);
+ }
+ 
+ /* Crash 2's per-polygon screen test in native-wide (crash2_wide_reject.h).
+@@ -8365,21 +8368,25 @@
+  * added = polygons the current one adds; added_max = the most so far;
+  * mismatch = the game's list was not the rebuilt list of its node (left
+  * alone); bad = SLST entries this could not rebuild; prim_skips = frames whose
+- * primitive buffer had too little room left (drawn as the game built them). */
++ * primitive buffer had too little room left (drawn as the game built them);
++ * side = lists built with a side-on path's own window; joined = lists that
++ * took polygons from the path joined at an end; kw = the window last used. */
+ extern void crash2_wide_slst_control(int k, int reset);
+-extern void crash2_wide_slst_stats(unsigned long long out[6], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[9], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ static void handle_c2_slst(int id, const char *json)
+ {
+     crash2_wide_slst_control(json_get_int(json, "k", -1),
+                              json_get_int(json, "reset", 0));
+-    unsigned long long s[6];
++    unsigned long long s[9];
+     int base_k = 0, k = 0, code_ok = 0, added = 0;
+     crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+     send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
+              "\"added\":%d,\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,"
+-             "\"bad\":%llu,\"prim_skips\":%llu,\"added_max\":%llu}",
+-             id, base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5]);
++             "\"bad\":%llu,\"prim_skips\":%llu,\"added_max\":%llu,"
++             "\"side\":%llu,\"joined\":%llu,\"kw\":%llu}",
++             id, base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
++             s[6], s[7], s[8]);
+ }
+ 
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -77,7 +77,7 @@
+ extern int      crash2_cheat_god_active(void);
+ /* Widescreen object window (crash2_wide_spawn.h): whether it is doing
+  * anything, so a report of an object misbehaving at a screen edge can say. */
+-extern void crash2_wide_spawn_stats(unsigned long long out[8], int *base_k, int *k,
++extern void crash2_wide_spawn_stats(unsigned long long out[10], int *base_k, int *k,
+                                     int *sig);
+ /* Native-wide polygon test (crash2_wide_reject.h): a report of missing
+  * polygons at the edges in native-wide can say whether it ran. */
+@@ -85,7 +85,7 @@
+                                      int *code_ok, int *off);
+ /* Widescreen scenery range (crash2_wide_slst.h): whether it is drawing the
+  * neighbouring nodes' polygons, and why not when it is not. */
+-extern void crash2_wide_slst_stats(unsigned long long out[6], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[9], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+@@ -929,17 +929,18 @@
+         const int gl_n = gl_renderer_cost_json(gl_json, sizeof(gl_json));
+         if (gl_n <= 0 || gl_n >= (int)sizeof(gl_json)) strcpy(gl_json, "null");
+     }
+-    char ws_json[320];
++    char ws_json[384];
+     {
+-        unsigned long long s[8];
++        unsigned long long s[10];
+         int base_k = 0, k = 0, sig = 0;
+         crash2_wide_spawn_stats(s, &base_k, &k, &sig);
+         snprintf(ws_json, sizeof(ws_json),
+                  "{\"base_k\":%d,\"k\":%d,\"code_ok\":%d,\"arrivals\":%llu,"
+                  "\"early\":%llu,\"kept\":%llu,\"retired\":%llu,"
+                  "\"unsafe_load\":%llu,\"unsafe_unload\":%llu,\"full\":%llu,"
+-                 "\"bad\":%llu}",
+-                 base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
++                 "\"bad\":%llu,\"side\":%llu,\"side_miss\":%llu}",
++                 base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
++                 s[8], s[9]);
+     }
+     char wr_json[160];
+     {
+@@ -951,16 +952,18 @@
+                  "\"kept\":%llu,\"mismatch\":%llu}",
+                  on, code_ok, off, s[0], s[1], s[2]);
+     }
+-    char sl_json[256];
++    char sl_json[320];
+     {
+-        unsigned long long s[6];
++        unsigned long long s[9];
+         int base_k = 0, k = 0, code_ok = 0, added = 0;
+         crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+         snprintf(sl_json, sizeof(sl_json),
+                  "{\"base_k\":%d,\"k\":%d,\"code_ok\":%d,\"added\":%d,"
+                  "\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,\"bad\":%llu,"
+-                 "\"prim_skips\":%llu,\"added_max\":%llu}",
+-                 base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5]);
++                 "\"prim_skips\":%llu,\"added_max\":%llu,\"side\":%llu,"
++                 "\"joined\":%llu,\"kw\":%llu}",
++                 base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
++                 s[6], s[7], s[8]);
+     }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),
+--- /dev/null
++++ b/runtime/src/crash2_wide_geom.h
+@@ -0,0 +1,376 @@
++/* SCUS-94154 only: where things are along Crash 2's camera paths, for the
++ * widescreen range hooks (crash2_wide_spawn.h, crash2_wide_slst.h). Read only:
++ * nothing here writes guest memory or makes the game load anything.
++ *
++ * Level data in memory (found in the executable, checked against every level
++ * file on the disc):
++ *
++ *   - An entry: 0x0100FFFF, EID, type, item count, then a pointer per item.
++ *     Zones are type 7, SLST entries type 4.
++ *   - A zone's item 0 is its header. Word 0 counts its worlds, 48 bytes each
++ *     from +4, each starting with the world's reference; the renderer's world
++ *     slots are copied from the CURRENT zone's (0x800608CC) every frame
++ *     (0x80011BBC..0x80011C80), and a polygon id's top three bits index them.
++ *     +0x184 is the item of its first camera path (three items per path),
++ *     +0x188 the number of camera items, +0x190 / +0x194 its neighbour zones
++ *     (count, references). Item 1 starts with the zone's origin (3 x int32).
++ *   - An entity's word +4 is its zone (filled at load; the camera code reads
++ *     it at 0x800265E4). Properties are found the way the accessor 0x80031AE8
++ *     finds them.
++ *   - A camera path: 0x04B its node points (int16 x,y,z from the zone's
++ *     origin), 0x029 its kind, 0x103 its SLST, 0x109 its links: a row per end
++ *     (the row's node 0 or the last), each record byte 0 = the end of the
++ *     next path the camera enters by (1 its start, else its end), byte 1 that
++ *     path's index, byte 2 its zone's slot in this zone's neighbour list
++ *     (0x800265B4..0x8002668C).
++ *   - An object (a draw-list value: entity index << 24 | id << 8 | zone slot)
++ *     is item index + [+0x184] + [+0x188] of that zone (func_80019098), id in
++ *     0x09F, position 0x04B in units of 4 from the zone's origin.
++ *   - A reference is an EID until the game resolves it in place to its 8-byte
++ *     record {entry, EID} (0x80014260). The record's entry word has bit 0 set
++ *     while the entry is not resident. EIDs are found as 0x80014B90 finds them.
++ *
++ * Kind 3 (and 8) paths look at the play from the side. On every one of them,
++ * across the game, objects appear and vanish where their offset along the
++ * path from the camera is 0.94 to 2.3 times their distance off it (median
++ * 1.1): the 4:3 frame's side edges. Every number above was checked on the
++ * disc: all 53,862 draw-list values resolve to their entity, all 3,837 camera
++ * links to a path. */
++
++#ifndef CRASH2_WIDE_GEOM_H
++#define CRASH2_WIDE_GEOM_H
++
++#include <math.h>
++
++#define C2WG_MAGIC      0x0100FFFFu
++#define C2WG_T_ZONE     7u
++#define C2WG_T_SLST     4u
++#define C2WG_NULL_REF   0x6396347Fu
++#define C2WG_HASH       0x80057590u   /* [ ] = the first record of each bucket  */
++#define C2WG_RECS       0x80057594u   /* [ ] = the records, 8 bytes {entry, EID} */
++#define C2WG_NSD        0x800575A0u   /* [[ ] + 1028] = how many records         */
++#define C2WG_ZONE       0x800608CCu   /* the camera's current zone               */
++#define C2WG_MAX_PTS    1024
++#define C2WG_MAX_NEIGH  16
++#define C2WG_MAX_WORLDS 8
++
++#ifndef C2WG_R32
++extern uint32_t psx_read_word(uint32_t a);
++extern uint16_t psx_read_half(uint32_t a);
++extern uint8_t  psx_read_byte(uint32_t a);
++#define C2WG_R32(a) psx_read_word(a)
++#define C2WG_R16(a) psx_read_half(a)
++#define C2WG_R8(a)  psx_read_byte(a)
++#endif
++
++typedef struct { float x, y, z; } C2wgVec;
++typedef struct { uint32_t data; unsigned flags, esize; int rows; } C2wgProp;
++
++static const uint32_t c2wg_words[][2] = {
++    /* EID lookup, bounded (0x80014B90) */
++    { 0x80014B94u, 0x8C427590u },  /* lw $v0, 0x7590($v0): bucket heads   */
++    { 0x80014B98u, 0x00041B42u },  /* srl $v1, $a0, 13                    */
++    { 0x80014B9Cu, 0x306303FCu },  /* andi $v1, $v1, 0x3FC                */
++    { 0x80014BC0u, 0x8C4275A0u },  /* lw $v0, 0x75A0($v0)                 */
++    { 0x80014BC8u, 0x8CC67594u },  /* lw $a2, 0x7594($a2): records        */
++    { 0x80014BCCu, 0x8C450404u },  /* lw $a1, 1028($v0): record count     */
++    /* references: EID (bit 0) replaced in place by the record; bit 0 of the
++     * record's entry word = not resident (0x80014260) */
++    { 0x80014298u, 0x30820001u },  /* andi $v0, $a0, 1                    */
++    { 0x800142B4u, 0xAE020000u },  /* sw $v0, 0($s0)                      */
++    { 0x800142CCu, 0x30820001u },  /* andi $v0, $a0, 1                    */
++    /* the renderer's world slots: the current zone's header worlds */
++    { 0x80011BC0u, 0x8C4208CCu },  /* lw $v0, 0x8CC($v0)                  */
++    { 0x80011BD0u, 0x8C460000u },  /* lw $a2, 0($v0): world count         */
++    { 0x80011BE0u, 0x2445002Cu },  /* addiu $a1, $v0, 44                  */
++    { 0x80011C78u, 0x24A50030u },  /* addiu $a1, $a1, 48                  */
++    { 0x80041FC4u, 0x3174E000u },  /* andi $s4, $t3, 0xE000: id -> world  */
++    /* neighbour zones at +0x190 / +0x194 */
++    { 0x80020628u, 0x8E820190u },  /* lw $v0, 400($s4)                    */
++    { 0x80020638u, 0x34130194u },  /* ori $s3, $zero, 0x194               */
++    /* camera links (0x109): entity +4 = zone, path = index*3 + [+0x184] */
++    { 0x800265B4u, 0x34050109u },  /* ori $a1, $zero, 0x109               */
++    { 0x800265E4u, 0x8C840004u },  /* lw $a0, 4($a0)                      */
++    { 0x800265ECu, 0x92220002u },  /* lbu $v0, 2($s1): zone slot          */
++    { 0x80026600u, 0x24420194u },  /* addiu $v0, $v0, 404                 */
++    { 0x80026614u, 0x92240001u },  /* lbu $a0, 1($s1): path index         */
++    { 0x80026618u, 0x8C650184u },  /* lw $a1, 388($v1)                    */
++    { 0x8002661Cu, 0x00041840u },  /* sll $v1, $a0, 1                     */
++    { 0x80026620u, 0x00641821u },  /* addu $v1, $v1, $a0                  */
++    { 0x8002664Cu, 0x92220000u },  /* lbu $v0, 0($s1): end entered by     */
++    /* an object's entity: index + [+0x184] + [+0x188] (func_80019098) */
++    { 0x800190E0u, 0x8C430184u },  /* lw $v1, 388($v0)                    */
++    { 0x800190E4u, 0x8C420188u },  /* lw $v0, 392($v0)                    */
++};
++
++static int c2wg_code_ok(void)
++{
++    for (size_t i = 0; i < sizeof(c2wg_words) / sizeof(c2wg_words[0]); ++i)
++        if (C2WG_R32(c2wg_words[i][0]) != c2wg_words[i][1]) return 0;
++    return 1;
++}
++
++static int c2wg_ram(uint32_t a, uint32_t n)
++{
++    return (a & 0xE0000000u) == 0x80000000u &&
++           (a & 0x1FFFFFFFu) < 0x200000u && n <= 0x200000u - (a & 0x1FFFFFFFu);
++}
++
++/* The entry a reference names, if it is resident; 0 otherwise. */
++static uint32_t c2wg_entry(uint32_t ref)
++{
++    if (ref == 0u || ref == C2WG_NULL_REF) return 0u;
++    uint32_t rec = ref;
++    if (ref & 1u) {
++        const uint32_t hash = C2WG_R32(C2WG_HASH), recs = C2WG_R32(C2WG_RECS);
++        const uint32_t nsd = C2WG_R32(C2WG_NSD);
++        if (!c2wg_ram(hash, 1024u) || !c2wg_ram(recs, 8u) || !c2wg_ram(nsd, 1032u)) return 0u;
++        const uint32_t count = C2WG_R32(nsd + 1028u);
++        rec = C2WG_R32(hash + ((ref >> 13) & 0x3FCu));
++        for (;;) {
++            if (rec < recs || (rec - recs) / 8u >= count || !c2wg_ram(rec, 8u)) return 0u;
++            if (C2WG_R32(rec + 4u) == ref) break;
++            rec += 8u;
++        }
++    }
++    if (!c2wg_ram(rec, 8u)) return 0u;
++    const uint32_t entry = C2WG_R32(rec);
++    if ((entry & 1u) || !c2wg_ram(entry, 16u) || C2WG_R32(entry) != C2WG_MAGIC ||
++        C2WG_R32(entry + 4u) != C2WG_R32(rec + 4u))
++        return 0u;
++    return entry;
++}
++
++/* The EID a reference names, resolved or not; 0 if it is not one. */
++static uint32_t c2wg_eid(uint32_t ref)
++{
++    if (ref & 1u) return ref;
++    return c2wg_ram(ref, 8u) ? C2WG_R32(ref + 4u) : 0u;
++}
++
++static uint32_t c2wg_typed(uint32_t entry, uint32_t type)
++{
++    return (c2wg_ram(entry, 16u) && C2WG_R32(entry) == C2WG_MAGIC &&
++            C2WG_R32(entry + 8u) == type) ? entry : 0u;
++}
++
++static uint32_t c2wg_item(uint32_t entry, uint32_t i)
++{
++    if (!c2wg_ram(entry, 16u)) return 0u;
++    const uint32_t n = C2WG_R32(entry + 12u);
++    if (n > 4096u || i >= n || !c2wg_ram(entry + 16u, 4u * (n + 1u))) return 0u;
++    const uint32_t it = C2WG_R32(entry + 16u + 4u * i);
++    return c2wg_ram(it, 16u) ? it : 0u;
++}
++
++/* A property, found as 0x80031AE8 finds it: binary search over the 8-byte
++ * headers at entity+16 (count at +12), along the +8 chain. */
++static int c2wg_prop(uint32_t ent, int id, C2wgProp *p)
++{
++    for (int depth = 0; ent != 0u && depth < 4; depth++) {
++        if (!c2wg_ram(ent, 16u)) return 0;
++        int lo = 0, hi = (int16_t)C2WG_R16(ent + 12u) - 1;
++        if (hi > 512) return 0;
++        while (lo <= hi) {
++            const int mid = (lo + hi) >> 1;
++            const uint32_t h = ent + 16u + (uint32_t)mid * 8u;
++            const int hid = (int16_t)C2WG_R16(h);
++            if (hid == id) {
++                p->data = ent + 12u + C2WG_R16(h + 2u);
++                p->flags = C2WG_R8(h + 4u);
++                p->esize = C2WG_R8(h + 5u);
++                p->rows = C2WG_R16(h + 6u);
++                return c2wg_ram(p->data, 4u) && p->rows >= 1 && p->rows <= 1024;
++            }
++            if (hid < id) lo = mid + 1; else hi = mid - 1;
++        }
++        ent = C2WG_R32(ent + 8u);
++    }
++    return 0;
++}
++
++/* Row r of a property: flag 0x40 = a count per row, else one for all; flag
++ * 0x20 = a node per row (*meta); values from the next 4-byte boundary. */
++static int c2wg_row(const C2wgProp *p, int r, uint32_t *vals, int *count, int *meta)
++{
++    if (r < 0 || r >= p->rows) return 0;
++    uint32_t q = p->data, counts = 0u, metas = 0u;
++    int common = 0;
++    if (p->flags & 0x40u) { counts = q; q += 2u * (uint32_t)p->rows; }
++    else { common = C2WG_R16(q); q += 2u; }
++    if (p->flags & 0x20u) { metas = q; q += 2u * (uint32_t)p->rows; }
++    q = (q + 3u) & ~3u;
++    uint32_t off = 0u;
++    for (int i = 0; i <= r; i++) {
++        const int c = counts ? (int)C2WG_R16(counts + 2u * (uint32_t)i) : common;
++        if (c < 0 || c > 4096) return 0;
++        if (i == r) {
++            *vals = q + off * p->esize;
++            *count = c;
++            if (meta) *meta = metas ? (int16_t)C2WG_R16(metas + 2u * (uint32_t)i) : 0;
++            return c2wg_ram(*vals, (uint32_t)c * p->esize + 4u);
++        }
++        off += (uint32_t)c;
++    }
++    return 0;
++}
++
++static uint32_t c2wg_zone_of(uint32_t ent)
++{
++    return c2wg_ram(ent, 8u) ? c2wg_typed(C2WG_R32(ent + 4u), C2WG_T_ZONE) : 0u;
++}
++
++static int c2wg_origin(uint32_t zone, C2wgVec *o)
++{
++    const uint32_t i1 = c2wg_item(zone, 1u);
++    if (!i1) return 0;
++    o->x = (float)(int32_t)C2WG_R32(i1);
++    o->y = (float)(int32_t)C2WG_R32(i1 + 4u);
++    o->z = (float)(int32_t)C2WG_R32(i1 + 8u);
++    return 1;
++}
++
++/* Slot `slot` of a zone's neighbour list, if that zone is resident. */
++static uint32_t c2wg_neighbour(uint32_t zone, unsigned slot)
++{
++    const uint32_t h = c2wg_item(zone, 0u);
++    if (!h || !c2wg_ram(h, 0x194u + 4u * C2WG_MAX_NEIGH)) return 0u;
++    const uint32_t n = C2WG_R32(h + 0x190u);
++    if (slot >= n || n > C2WG_MAX_NEIGH) return 0u;
++    return c2wg_typed(c2wg_entry(C2WG_R32(h + 0x194u + 4u * slot)), C2WG_T_ZONE);
++}
++
++/* World i of a zone, as an EID (0 if none). */
++static uint32_t c2wg_world(uint32_t zone, unsigned i)
++{
++    const uint32_t h = c2wg_item(zone, 0u);
++    if (!h) return 0u;
++    const uint32_t n = C2WG_R32(h);
++    if (i >= n || n > C2WG_MAX_WORLDS) return 0u;
++    return c2wg_eid(C2WG_R32(h + 4u + 48u * i));
++}
++
++/* A camera path's kind (0x029); -1 if it has none. */
++static int c2wg_kind(uint32_t cam)
++{
++    C2wgProp p;
++    uint32_t v;
++    int c;
++    if (!c2wg_prop(cam, 0x029, &p) || p.esize != 1u || !c2wg_row(&p, 0, &v, &c, NULL) || c < 1)
++        return -1;
++    return C2WG_R8(v);
++}
++
++static int c2wg_side_on(uint32_t cam)
++{
++    const int kind = c2wg_kind(cam);
++    return kind == 3 || kind == 8;
++}
++
++/* A camera path's node points, in world units; how many (0 on any doubt). */
++static int c2wg_path_points(uint32_t cam, C2wgVec *pts, int max)
++{
++    const uint32_t zone = c2wg_zone_of(cam);
++    C2wgVec o;
++    C2wgProp p;
++    uint32_t v;
++    int c;
++    if (!zone || !c2wg_origin(zone, &o) || !c2wg_prop(cam, 0x04B, &p) || p.esize != 6u ||
++        !c2wg_row(&p, 0, &v, &c, NULL) || c < 2 || c > max)
++        return 0;
++    for (int i = 0; i < c; i++) {
++        const uint32_t e = v + 6u * (uint32_t)i;
++        pts[i].x = o.x + (float)(int16_t)C2WG_R16(e);
++        pts[i].y = o.y + (float)(int16_t)C2WG_R16(e + 2u);
++        pts[i].z = o.z + (float)(int16_t)C2WG_R16(e + 4u);
++    }
++    return c;
++}
++
++/* Where the object a draw-list value names is, in world units. `zone` is the
++ * zone of the path whose list holds the value. */
++static int c2wg_object_pos(uint32_t zone, uint32_t value, C2wgVec *out)
++{
++    const uint32_t z = c2wg_neighbour(zone, value & 0xFFu);
++    const uint32_t h = c2wg_item(z, 0u);
++    if (!h) return 0;
++    const uint32_t ent = c2wg_item(z, (value >> 24) + C2WG_R32(h + 0x184u) + C2WG_R32(h + 0x188u));
++    C2wgProp p;
++    uint32_t v;
++    int c;
++    if (!ent || !c2wg_prop(ent, 0x09F, &p) || p.esize != 4u || !c2wg_row(&p, 0, &v, &c, NULL) ||
++        c < 1 || C2WG_R32(v) != ((value >> 8) & 0xFFFFu))
++        return 0;
++    C2wgVec o;
++    if (!c2wg_prop(ent, 0x04B, &p) || p.esize != 6u || !c2wg_row(&p, 0, &v, &c, NULL) || c < 1 ||
++        !c2wg_origin(z, &o))
++        return 0;
++    out->x = o.x + 4.0f * (float)(int16_t)C2WG_R16(v);
++    out->y = o.y + 4.0f * (float)(int16_t)C2WG_R16(v + 2u);
++    out->z = o.z + 4.0f * (float)(int16_t)C2WG_R16(v + 4u);
++    return 1;
++}
++
++/* How far along the path, ahead of or behind the camera at `node`, point p
++ * lies (*along, always >= 0) and the node spacing there. 0 unless p is where
++ * a side-on path's 4:3 frame has its edge: |along| between 0.5 and 4 times its
++ * distance off the path (the game: 0.94 to 2.3). Anything else appeared or
++ * vanished for another reason - behind something, out of the dark. */
++static int c2wg_edge(const C2wgVec *pts, int n, int node, const C2wgVec *p,
++                     float *along, float *step)
++{
++    if (node < 0 || node >= n || n < 2) return 0;
++    const int lo = node > 0 ? node - 1 : node, hi = node < n - 1 ? node + 1 : node;
++    float ux = pts[hi].x - pts[lo].x, uy = pts[hi].y - pts[lo].y, uz = pts[hi].z - pts[lo].z;
++    const float len = sqrtf(ux * ux + uy * uy + uz * uz);
++    if (!(len >= 1.0f)) return 0;
++    ux /= len; uy /= len; uz /= len;
++    const float dx = p->x - pts[node].x, dy = p->y - pts[node].y, dz = p->z - pts[node].z;
++    const float a = dx * ux + dy * uy + dz * uz;
++    const float off2 = dx * dx + dy * dy + dz * dz - a * a;
++    const float off = off2 > 0.0f ? sqrtf(off2) : 0.0f;
++    if (!(off >= 1.0f) || fabsf(a) < 0.5f * off || fabsf(a) > 4.0f * off) return 0;
++    *along = fabsf(a);
++    *step = len / (float)(hi - lo);
++    return 1;
++}
++
++/* The path joined to `cam` at its start (end 0) or its end (end 1), and
++ * whether walking on enters it at its start (*at_start). Only a single link:
++ * where the path forks, which way the camera goes is for the game to say. */
++static uint32_t c2wg_link(uint32_t cam, int end, int nodes, int *at_start)
++{
++    C2wgProp p;
++    const uint32_t zone = c2wg_zone_of(cam);
++    if (!zone || !c2wg_prop(cam, 0x109, &p) || p.esize != 4u || !(p.flags & 0x20u)) return 0u;
++    for (int r = 0; r < p.rows && r < 4; r++) {
++        uint32_t v;
++        int c, meta;
++        if (!c2wg_row(&p, r, &v, &c, &meta)) return 0u;
++        if (meta != (end ? nodes - 1 : 0)) continue;
++        if (c != 1) return 0u;
++        const uint32_t rec = C2WG_R32(v);
++        const uint32_t z = c2wg_neighbour(zone, (rec >> 16) & 0xFFu);
++        const uint32_t h = c2wg_item(z, 0u);
++        if (!h) return 0u;
++        const uint32_t path = c2wg_item(z, ((rec >> 8) & 0xFFu) * 3u + C2WG_R32(h + 0x184u));
++        C2wgProp q;
++        if (!path || c2wg_zone_of(path) != z || !c2wg_prop(path, 0x103, &q)) return 0u;
++        *at_start = (rec & 0xFFu) == 1u;
++        return path;
++    }
++    return 0u;
++}
++
++/* A camera path's SLST entry, if resident. */
++static uint32_t c2wg_slst_of(uint32_t cam)
++{
++    C2wgProp p;
++    uint32_t v;
++    int c;
++    if (!c2wg_prop(cam, 0x103, &p) || p.esize != 4u || !c2wg_row(&p, 0, &v, &c, NULL) || c < 1)
++        return 0u;
++    return c2wg_typed(c2wg_entry(C2WG_R32(v)), C2WG_T_SLST);
++}
++
++#endif /* CRASH2_WIDE_GEOM_H */

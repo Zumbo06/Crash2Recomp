@@ -44,6 +44,9 @@ static uint32_t mod_alloc(uint32_t n)
 }
 #define C2SL_R32(a)    r32(a)
 #define C2SL_R16(a)    r16(a)
+#define C2WG_R32(a)    r32(a)       /* crash2_wide_geom.h */
+#define C2WG_R16(a)    r16(a)
+#define C2WG_R8(a)     ((uint8_t)(r16((a) & ~1u) >> (((a) & 1u) * 8u)))
 #define C2SL_W16(a, v) w16((a), (v))
 #define C2SL_ALLOC(n)  mod_alloc(n)
 
@@ -135,7 +138,10 @@ static int check_merge(const C2slEntry *ce, int node, int k, int cap, int verbos
     const uint16_t *game = ce->ids + ce->off[node];
     const int count = ce->len[node];
     memcpy(c2sl_merged, game, sizeof(uint16_t) * (size_t)count);
-    const int m = c2sl_merge(ce, node, k, count, cap);
+    C2slJoin no_joins[2];
+    int joined = 0;
+    memset(no_joins, 0, sizeof no_joins);          /* inside one path */
+    const int m = c2sl_merge(ce, node, k, count, cap, no_joins, &joined);
     int bad = 0;
     /* P1: the game's list is a subsequence, in order, starting at element 0 */
     int gi = 0;
