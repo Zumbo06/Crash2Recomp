@@ -1,0 +1,222 @@
+Native-wide: keep the margins of the border rows in step with the picture.
+
+Crash 2 draws into 512x216 at y=12 of a 512x240 display (SetDefDrawEnv at
+0x80016130). The 12 rows above and below the picture are written only by
+fills and uploads, and are black. In native-wide, the side margins of those
+rows could turn white and stay white beside the black 4:3 centre: white
+corners, top and bottom, after a white flash.
+
+Two ways led there, both fixed in gpu_gl_renderer.c (OpenGL and Direct3D 12):
+
+- The full-screen overlay rect (fades, flashes) has its own wide pass,
+  wide_flat_rect_direct. It drew with a full-surface scissor, so it filled
+  the margins of every row the rect covered, while the canonical rect stopped
+  at the drawing area. Every other mirror pass, and the software reference
+  (rt_wide()), keeps to the drawing area's rows; so does this one now.
+- The wide surface never follows an upload, and follows a fill only while
+  native-wide is active and at a display buffer's base. Whatever else
+  reached the border rows' margins stayed there. Each present now copies the
+  canonical frame's outermost g_wide_off columns of the displayed rows no
+  clipped draw reached since the last present into the two margins,
+  wide_fill_border_rows. The rows are tracked per wide surface at hr_begin,
+  as the union of the drawing areas used while it was the mirror target. It
+  is an unscaled framebuffer copy, like wide_blit_center, so it runs the
+  same through the Direct3D 12 layer; it does nothing on a repeated frame or
+  when the drawn rows belong to another band. The gl cost JSON counts the
+  copies as "border_fills".
+
+tuning/renderer_parity checks it on both APIs ("wide border rows"): stale
+white margins, a picture in rows 12-227 and an overlay rect drawn with a
+drawing area of rows 100-150. Without either half the check fails.
+
+Native-wide only (Developer mode); 4:3 and squash never run this code. No file
+here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -705,6 +705,13 @@
+                                               * collapsed to 12fps); with the RB
+                                               * attached the pass costs ~2us. */
+ static int    s_wide_base[WIDE_MAX_SURF];    /* base_x per surface (-1 = free) */
++/* Per surface: the VRAM rows (inclusive) the game's clipped draws could reach
++ * since that surface was last presented - the union of the drawing areas used
++ * while it was the mirror target. y1 > y2 = none. Displayed rows outside it
++ * are border rows, which wide_fill_border_rows keeps in step with the
++ * canonical frame. */
++static int    s_wide_drawn_y1[WIDE_MAX_SURF], s_wide_drawn_y2[WIDE_MAX_SURF];
++static unsigned long long s_wide_border_fills;
+ static int    g_wide_w        = 0;           /* wide width (native px); 0 = disabled */
+ static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
+ static GLuint g_wide_cur      = 0;           /* active mirror FBO (0 = no mirror) */
+@@ -1505,8 +1512,19 @@
+     }
+ }
+ 
++/* Record the drawing area against the surface being mirrored into. */
++static void wide_note_drawn_rows(void) {
++    for (int i = 0; i < WIDE_MAX_SURF; i++)
++        if (s_wide_fbo[i] && s_wide_fbo[i] == g_wide_cur) {
++            if (s_area_y1 < s_wide_drawn_y1[i]) s_wide_drawn_y1[i] = s_area_y1;
++            if (s_area_y2 > s_wide_drawn_y2[i]) s_wide_drawn_y2[i] = s_area_y2;
++            return;
++        }
++}
++
+ /* ---- hr FBO render-state bracket ---------------------------------------- */
+ static void hr_begin(int clip_to_draw_area) {
++    if (clip_to_draw_area && g_wide_cur) wide_note_drawn_rows();
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+     glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
+     glEnable(GL_SCISSOR_TEST);
+@@ -1970,6 +1988,7 @@
+ void gl_renderer_set_wide_fast(int on) { s_wide_fast = on ? 1 : 0; }
+ int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
+ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h); /* def below */
++static void wide_fill_border_rows(GLuint wide_fbo, int base_x, int disp_y, int disp_h);
+ /* True if [lo,hi] (canonical draw-x) lies strictly inside the 4:3 frame, so the
+  * prim adds nothing to either reveal margin and its mirror can be skipped. */
+ static int mirror_x_center_only(int lo, int hi) {
+@@ -2457,10 +2476,10 @@
+ }
+ 
+ /* Draw a flat-colored rect (GEO program) DIRECTLY into the active wide surface
+- * at wide-space coords [wx, wx+ww) × [y, y+h). Used only by the full-screen-
+- * overlay path; positions are already in wide space so u_xoff stays 0. Mirrors
+- * raster_flat_rect(&wt, ...) in sw_draw_flat_rect. Caller stays inside
+- * hr_begin/hr_end. */
++ * at wide-space coords [wx, wx+ww) × [y, y+h), clipped to the drawing area's
++ * rows. Used only by the full-screen-overlay path; positions are already in
++ * wide space so u_xoff stays 0. Mirrors raster_flat_rect(&wt, ...) in
++ * sw_draw_flat_rect. Caller stays inside hr_begin/hr_end. */
+ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int semi) {
+     if (ww <= 0 || h <= 0) return;
+     float r = ((c & 0x1F) << 3) / 255.0f;
+@@ -2472,12 +2491,22 @@
+         fx0,fy0,r,g,b,a,  fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,
+         fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,  fx1,fy1,r,g,b,a,
+     };
+-    /* Wide target: positions already wide-space so u_xoff = 0; full-width
+-     * scissor; u_xhalf = g_wide_w/2. */
++    /* Wide target: positions already wide-space so u_xoff = 0; u_xhalf =
++     * g_wide_w/2. The scissor is the full width but only the drawing area's
++     * rows, like rt_wide() and wide_target_begin: the canonical rect stops at
++     * them. A full-height scissor let a fade or flash rect paint the margins
++     * of rows the canonical frame never draws, such as the 12-row borders
++     * above and below Crash 2's 216-row drawing area. */
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+     glEnable(GL_SCISSOR_TEST);
+-    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);  /* full surface (rt_wide) */
++    {
++        int sy = s_area_y1, sh = s_area_y2 - s_area_y1 + 1;
++        if (sy < 0) { sh += sy; sy = 0; }
++        if (sy + sh > VRAM_H) sh = VRAM_H - sy;
++        if (sh < 0) sh = 0;
++        glScissor(0, sy * s_scale, g_wide_w * s_scale, sh * s_scale);
++    }
+     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+     mask_stencil(s_mask_set);
+     p_glUseProgram(s_geo_prog);
+@@ -3891,6 +3920,7 @@
+         if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
+         if (s_wide_rb[i])  { p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0; }
+         s_wide_base[i] = -1;
++        s_wide_drawn_y1[i] = VRAM_H; s_wide_drawn_y2[i] = -1;
+     }
+     g_wide_cur = 0;
+     s_wide_alloc_failed = 0;
+@@ -3945,6 +3975,7 @@
+             glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+             s_wide_base[i] = base_x;
++            s_wide_drawn_y1[i] = VRAM_H; s_wide_drawn_y2[i] = -1;
+             return s_wide_fbo[i];
+         }
+     }
+@@ -4082,6 +4113,7 @@
+     flush_tex_batch();
+     flush_cpu_upload();
+     wide_blit_center(fbo, base_x, disp_y, disp_h);   /* fast-path: authoritative centre before readback */
++    wide_fill_border_rows(fbo, base_x, disp_y, disp_h);
+     glFinish();
+ 
+     int W = g_wide_w * s_scale;
+@@ -4479,7 +4511,7 @@
+         "\"stencil_rebuilds\":%llu,\"stencil_px\":%llu,"
+         "\"sync_reads\":%llu,\"sync_skips\":%llu,\"sync_us\":%llu,"
+         "\"hold_copies\":%llu,\"hold_px\":%llu,\"pack_px\":%llu,"
+-        "\"mirror_passes\":%llu,"
++        "\"mirror_passes\":%llu,\"border_fills\":%llu,"
+         "\"gpu_frames\":%llu,\"gpu_scene_us\":%llu,\"gpu_present_us\":%llu,"
+         "\"gpu_scene_max_us\":%llu}",
+         s_scale, g_wide_w > 0 ? 1 : 0, s_pf_on,
+@@ -4494,6 +4526,7 @@
+         (unsigned long long)c.sync_us,
+         (unsigned long long)c.hold_copies, (unsigned long long)c.hold_px,
+         (unsigned long long)c.pack_px, (unsigned long long)c.mirror_passes,
++        s_wide_border_fills,
+         (unsigned long long)c.gpu_frames, (unsigned long long)c.gpu_scene_us,
+         (unsigned long long)c.gpu_present_us, (unsigned long long)c.gpu_scene_max_us);
+ }
+@@ -5077,6 +5110,53 @@
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+ }
+ 
++/* The reveal margins of the displayed band's BORDER rows: rows no clipped draw
++ * could reach since the last present. Crash 2 draws into 512x216 at y=12 of a
++ * 512x240 display (SetDefDrawEnv at 0x80016130), so the 12 scanlines above and
++ * below the picture are written only by fills and uploads. The wide mirror
++ * follows those only in part - never an upload, and a fill only while
++ * native-wide is active - so these margins could keep a white flash beside the
++ * canonical black long after it. Make them match the canonical frame: copy its
++ * outermost g_wide_off columns of those rows into each margin. Crash 2's border
++ * rows are one colour, so that carries the edge colour out. It is an unscaled
++ * copy between two framebuffers, like wide_blit_center, so it works the same
++ * through the Direct3D 12 layer. Nothing happens when nothing was drawn since
++ * the last present (a paused or repeated frame keeps its margins) or when what
++ * was drawn belongs to another band. */
++static void wide_fill_border_rows(GLuint wide_fbo, int base_x, int disp_y, int disp_h) {
++    if (g_wide_w <= 0 || g_wide_off <= 0) return;
++    int i = 0;
++    while (i < WIDE_MAX_SURF && !(s_wide_fbo[i] && s_wide_fbo[i] == wide_fbo)) i++;
++    if (i == WIDE_MAX_SURF) return;
++    const int y1 = s_wide_drawn_y1[i], y2 = s_wide_drawn_y2[i];
++    if (y1 > y2) return;
++    int b0 = disp_y, b1 = disp_y + disp_h;
++    if (b0 < 0) b0 = 0;
++    if (b1 > VRAM_H) b1 = VRAM_H;
++    if (b1 <= b0 || y2 < b0 || y1 >= b1) return;
++    s_wide_drawn_y1[i] = VRAM_H; s_wide_drawn_y2[i] = -1;
++    const int off = g_wide_off, native_w = g_wide_w - 2 * g_wide_off, S = s_scale;
++    if (native_w < off) return;
++    const int rows[2][2] = { { b0, y1 < b1 ? y1 : b1 }, { y2 + 1 > b0 ? y2 + 1 : b0, b1 } };
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
++    glDisable(GL_SCISSOR_TEST);
++    for (int r = 0; r < 2; r++) {
++        const int r0 = rows[r][0], r1 = rows[r][1];
++        if (r1 <= r0) continue;
++        p_glBlitFramebuffer(base_x * S, r0 * S, (base_x + off) * S, r1 * S,
++                            0, r0 * S, off * S, r1 * S,
++                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        p_glBlitFramebuffer((base_x + native_w - off) * S, r0 * S,
++                            (base_x + native_w) * S, r1 * S,
++                            (off + native_w) * S, r0 * S, (2 * off + native_w) * S, r1 * S,
++                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        s_wide_border_fills++;
++    }
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++}
++
+ /* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
+  * to the window (no glReadPixels / glFinish CPU round-trip). The wide surface is
+  * g_wide_w wide × VRAM_H tall (at scale S); present its [0,g_wide_w] × [disp_y,
+@@ -5117,6 +5197,7 @@
+     int lx, ly, lw, lh;
+     present_rect_cropped(ww, wh, 0, &lx, &ly, &lw, &lh);
+     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
++    wide_fill_border_rows(fbo, disp_x, disp_y, disp_h);
+ 
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+     glDisable(GL_SCISSOR_TEST);

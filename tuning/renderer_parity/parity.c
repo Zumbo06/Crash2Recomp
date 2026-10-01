@@ -216,6 +216,73 @@ static void bench_frame(const GpuRenderBackend *b, int frame) {
 #undef RND
 }
 
+/* ---- native-wide border rows ------------------------------------------- *
+ * Crash 2 draws into rows 12-227 of a 240-row display; the rows above and
+ * below are written only by fills and uploads, which the wide surface does not
+ * always follow. The frame: the canonical fill is one the mirror missed, so
+ * the surface's margins still hold a white flash; a picture across the full
+ * wide width in the drawing area; and a full-screen overlay rect drawn with a
+ * drawing area of rows 100-150 only. Expected, in the margins as in the
+ * centre: the border colour in the border rows, the picture at row 50, the
+ * overlay at row 120 only. */
+#define WB_BORDER  rgb15(6, 2, 12, 0)
+#define WB_STALE   rgb15(31, 31, 31, 0)
+#define WB_PICTURE rgb15(2, 18, 26, 0)
+#define WB_OVERLAY rgb15(31, 16, 2, 0)
+
+static void wide_border_frame(const GpuRenderBackend *b) {
+    b->set_draw_area(0, 0, 319, 239);
+    b->set_draw_offset(0, 0);
+    b->set_semi_transparency(0, 0);
+    b->fill_rect(0, 0, 320, 240, WB_BORDER);         /* canonical only */
+    b->wide_set_target(0);
+    b->wide_clear(0, 0, 240, WB_STALE);
+    b->set_draw_area(0, 12, 319, 227);
+    b->draw_flat_triangle(-40, 12, 360, 12, -40, 228, WB_PICTURE);
+    b->draw_flat_triangle(360, 12, -40, 228, 360, 228, WB_PICTURE);
+    b->set_draw_area(0, 100, 319, 150);
+    b->draw_flat_rect(0, 0, 320, 240, WB_OVERLAY);
+    b->set_draw_area(0, 0, 319, 239);
+    b->wide_disable_target();
+}
+
+static int wb_near(uint32_t px, uint16_t c) {
+    const int r = (int)(px >> 16) & 255, g = (int)(px >> 8) & 255, bl = (int)px & 255;
+    const int er = (c & 31) * 255 / 31, eg = ((c >> 5) & 31) * 255 / 31;
+    const int eb = ((c >> 10) & 31) * 255 / 31;
+    return abs(r - er) <= 8 && abs(g - eg) <= 8 && abs(bl - eb) <= 8;
+}
+
+/* Reads the wide surface for the buffer at x=0 (render_wide_display, which
+ * runs the present's own border pass first) and checks the rows above. */
+static void wide_border_check(const GpuRenderBackend *b, const char *what) {
+    const int S = b->scale(), W = 400 * S, H = 240 * S;
+    uint32_t *px = (uint32_t *)malloc((size_t)W * H * 4);
+    if (!px) return;
+    if (b->render_wide_display(px, W * 4, 0, 0, 240) <= 0) {
+        printf("wide border rows (%s): no wide surface\n", what);
+        free(px);
+        return;
+    }
+    const struct { int y; uint16_t c; const char *name; } rows[] = {
+        { 5, WB_BORDER, "top border" }, { 234, WB_BORDER, "bottom border" },
+        { 50, WB_PICTURE, "picture" },  { 120, WB_OVERLAY, "overlay" },
+    };
+    static const int xs[3] = { 20, 200, 380 };   /* left margin, centre, right margin */
+    int bad = 0;
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 3; k++) {
+            const uint32_t p = px[(size_t)(rows[r].y * S + S / 2) * W + xs[k] * S + S / 2];
+            if (!wb_near(p, rows[r].c)) {
+                printf("   %s, row %d x %d: %06X\n", rows[r].name, rows[r].y, xs[k],
+                       (unsigned)(p & 0xFFFFFF));
+                bad++;
+            }
+        }
+    printf("wide border rows (%s): %s\n", what, bad ? "FAILED" : "ok");
+    free(px);
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: parity gl|d3d12 scale prefix\n"); return 2; }
     const int d3d = strcmp(argv[1], "d3d12") == 0;
@@ -371,6 +438,20 @@ int main(int argc, char **argv) {
         gl_renderer_set_display_aspect(5, 3);
         gl_renderer_invalidate_present();
         if (!gl_renderer_present_wide_fbo(0, 0, 240, 1)) printf("wide present unavailable\n");
+        gl_renderer_set_display_aspect(4, 3);
+    }
+
+    /* 5b. Native-wide border rows (wide_border_frame), through each present:
+     *     the GPU-direct one, then checked from the surface it showed; and the
+     *     readback one the CPU present path uses. */
+    {
+        gl_renderer_set_display_aspect(5, 3);
+        wide_border_frame(b);
+        gl_renderer_invalidate_present();
+        if (!gl_renderer_present_wide_fbo(0, 0, 240, 1)) printf("wide present unavailable\n");
+        wide_border_check(b, "GPU present");
+        wide_border_frame(b);
+        wide_border_check(b, "readback present");
         gl_renderer_set_display_aspect(4, 3);
     }
 

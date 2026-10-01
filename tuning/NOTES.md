@@ -3606,3 +3606,71 @@ heartbeat's `wide_slst` report:
   should already be there.
 - **A/B.** `c2_slst {"k":0}` against `{"k":2}` on the same spot.
 - **Performance.** Watch the 60 FPS readout for the extra world polygons.
+
+## Widescreen, part 11: white corners in the border rows
+
+Patch 0050. In native-wide the warp room showed white blocks in all four
+corners: the side margins of the 12 rows above and below the picture, beside
+a black 4:3 centre.
+
+### Why
+
+- **The border rows.** Crash 2 draws into 512x216 at y=12 of its 512x240
+  display (`SetDefDrawEnv` at `0x80016130`). Rows 0-11 and 228-239 are written
+  only by fills and uploads, and they are black.
+- **Two ways their margins went white**, both in `gpu_gl_renderer.c`:
+  - **The overlay rect.** A flat rect covering the whole 4:3 frame (fades,
+    flashes) has its own wide pass, `wide_flat_rect_direct`. It drew with a
+    full-surface scissor, so it filled the margins of every row the rect
+    covered, while the canonical rect stopped at the drawing area. Every other
+    mirror pass clips to the drawing area's rows, and so does the software
+    renderer's `rt_wide()`.
+  - **Fills and uploads.** The wide surface never follows an upload, and
+    follows a fill only while native-wide is active and the fill starts at a
+    display buffer's base. Anything else that reached those margins stayed.
+- **Nothing repaints them.** The game's own drawing stops at row 227, so a
+  margin painted once stays painted.
+
+Which of the two made the screenshot can't be told without the game; the fix
+covers both.
+
+### The fix
+
+- **The overlay's wide pass keeps to the drawing area's rows.**
+- **Each wide present repairs the border rows.** `wide_fill_border_rows`
+  finds the displayed rows that no clipped draw reached since the last
+  present, and copies the canonical frame's outermost columns of those rows
+  into each margin.
+  - The drawn rows are tracked per wide surface at `hr_begin`.
+  - The copy is an unscaled framebuffer blit, like the centre blit, so it runs
+    the same through the Direct3D 12 layer.
+  - It does nothing on a repeated frame.
+  - The gl cost JSON counts the copies as `border_fills`.
+- **A block, not a stretched column.** The Direct3D 12 layer only does
+  unscaled blits, so the margin gets the edge block rather than the edge
+  column stretched. On a one-colour row that is the same thing. A picture
+  uploaded into the border rows would repeat its edge strip in the corners.
+
+### Checked without the game
+
+- **The harness.** `tuning/renderer_parity` gained the case, as section 5b:
+  - stale white margins;
+  - a picture in rows 12-227;
+  - an overlay rect drawn with a drawing area of rows 100-150.
+
+  It reads the wide surface back after both presents, GPU-direct and readback.
+  Both pass on OpenGL and Direct3D 12. The old renderer fails, and so does
+  each half of the fix on its own.
+- **The test.** `tuning/tests/renderer_parity_check.py` builds and runs the
+  harness, about 10 s. It checks:
+  - the harness's own checks on both APIs;
+  - OpenGL against Direct3D 12: VRAM exact, presents within 2/255.
+
+### To check in play (Developer mode, Native-wide)
+
+- **The corners.** They stay black through the warp-room flash and through
+  the fades in and out of levels.
+- **The fades.** They still cover the whole wide picture; only the 12-row
+  borders are left alone.
+- **The counter.** `border_fills` in the heartbeat's `gl` climbs with wide
+  presents.
