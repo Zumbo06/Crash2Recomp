@@ -1,0 +1,5 @@
+sim.exe
+*.pdb
+*.ilk
+*.bin
+__pycache__/

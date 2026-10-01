@@ -322,16 +322,20 @@ class Settings:
     #   See tuning/NOTES.md "Widescreen, part 5" and "part 6".
     #   Developer mode only for now: widescreen_native_wide_active().
     widescreen_native_wide: bool = False
-    # Widescreen object range (PSX_CRASH2_WIDE_SPAWN, runtime
-    # crash2_wide_spawn.h), 0..3. Crash 2 creates and removes enemies, crates
-    # and platforms at camera-path nodes authored for the 4:3 view, so a wider
-    # view shows them popping in and out at its edges. Above 0 the runtime
-    # creates them that many nodes early and keeps them that many nodes longer
-    # (scaled by how much wider the view is), never across a point where the
-    # game loads or unloads the data they use. Works in both widescreen modes;
-    # does nothing at 4:3. See tuning/NOTES.md "Widescreen, part 8".
-    # Developer mode only for now: widescreen_object_range_active().
-    widescreen_object_range: int = 0
+    # Widescreen edge range, 0..3 camera-path nodes (the launcher's "Edge
+    # range"; the name predates the scenery half). Crash 2 decides at
+    # camera-path nodes authored for the 4:3 view both which objects exist and
+    # which level polygons are drawn, so a wider view shows both popping in and
+    # out at its edges. Above 0 the runtime widens both, scaled by how much
+    # wider the view is:
+    #   objects  PSX_CRASH2_WIDE_SPAWN (crash2_wide_spawn.h): created that many
+    #            nodes early, kept that many longer, never across a point
+    #            where the game loads or unloads their data (NOTES part 8);
+    #   scenery  PSX_CRASH2_WIDE_SLST (crash2_wide_slst.h): the polygon lists
+    #            of that many neighbouring nodes are drawn too (part 10).
+    # Works in both widescreen modes; does nothing at 4:3. Developer mode only
+    # for now (widescreen_object_range_active), where it defaults to Wider.
+    widescreen_object_range: int = 2
 
     # --- image quality (settings.toml only - no env override exists) -------
     texture_filter: str = "nearest"     # nearest | bilinear

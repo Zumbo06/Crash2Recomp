@@ -3494,3 +3494,115 @@ Native-wide and the object range are developer previews for now, like
   `widescreen_object_range_active()` keep them off otherwise, even if a
   settings file still has them on.
 - **Preset.** The Widescreen preset no longer sets the object range.
+
+## Widescreen, part 10: the scenery lists, widened
+
+Patch 0049. After part 9 no code anywhere still clipped drawing to the old
+screen:
+
+- **Main executable.** A full scan for screen-bound idioms found only the
+  seven polygon tests (0047) and the box cull (0016). The other hits were
+  texture packing, vertex-depth checks and a setup routine.
+- **Level code.** The overlay captures in both build trees (448 regions) hold
+  no screen tests. Their 512/682 compares are angle clamps: 45° and 60° in
+  12-bit units.
+
+One mechanism was left, and it applies to squash as much as to native-wide.
+
+### Which polygons get drawn: the SLST lists
+
+Each camera path carries an SLST entry: one polygon list per camera node,
+stored as the list at node 0, a delta per step and the list at the last node.
+
+- **Resolving.** The camera update resolves the entry (property 0x103 of the
+  path, through `0x80014260`; `$v0` at `0x8002037C`).
+- **Stepping.** It steps node by node through `func_80029800`, with the
+  forward delta at `0x8003AE54`, into the current list `[gp+0x214]` =
+  `0x8005F390`.
+- **Recording.** It stores the node and the path at `0x800608E8` and
+  `0x800608D4`.
+- **Drawing.** `func_80041E5C` draws the list:
+  - it walks it from the end;
+  - each id is `(world<<13)|index`, with 0x1800 marking a quad;
+  - each polygon goes into the ordering table by summed depth, so the list's
+    order only settles ties.
+
+**The lists are 4:3-tight.** Across all 1,986 entries on the disc, merging a
+node's list with its neighbours' adds, by polygon, about 7% for one node
+either side and 13.5% for two. Counted by exact id it looks twice that,
+because a quad's variant bits are per-node draw state (4% of shared polygons
+change them from one node to the next). Part 4's verdict, that the lists
+already cover a wider view, came from a probe that projected world vertices
+with the camera rotation alone, without its translation. It proved nothing.
+
+### The fix: draw the neighbours' lists too
+
+`crash2_wide_slst.h`:
+
+- **What it draws.** At node n it draws the union of the lists of nodes n-k
+  to n+k. The renderer's own tests still drop anything that is not on screen:
+  backface, depth, and the screen test that 0047 widens in native-wide.
+- **The game's list stays as built**, repeats included (936 lists hold an
+  exact repeat).
+  - Polygons are only added, each once. A quad is matched on its index.
+  - Nearest node first; each goes right after the polygon that precedes it in
+    the neighbour's list.
+  - The added polygons are capped at half the game's list plus 32, and the
+    total at 1520, the game's own list size.
+- **Lists are rebuilt here.** A C port of the forward delta reproduces all
+  63,854 node lists. The 4 entries whose last list the reference does not
+  close are refused, so they are simply not widened.
+  - The rebuilt list of the current node must equal the game's list. That is
+    checked on every call, so a merged list is never drawn over a list it was
+    not built for.
+- **Nothing of the game's is written.** The merged list lives in mod memory,
+  and only the render call's `$a0` points at it.
+  - Reads from there take the runtime's slow load path. That costs one call
+    per polygon id.
+- **The primitive buffer.** The renderer appends to a per-frame buffer of
+  0x16400 bytes (allocated at `0x80016288`; 0x2C800 in one mode) and never
+  checks its end.
+  - A merged list is used only while the room left holds 64 bytes per added
+    polygon plus 16 KB.
+  - The census put normal use around 28 KB, so this should rarely bind;
+    `prim_skips` counts when it does.
+- **Guarded.** 50 code words are checked. Identity at 4:3 and on 4:3 frames.
+
+`PSX_CRASH2_WIDE_SLST=N` scales like the object range. The launcher's
+*Object range* became **Edge range** and drives both: it is still Developer
+mode only, and now defaults to Wider. The `c2_slst` debug command and the
+heartbeat's `wide_slst` report:
+
+- `built` and `used`;
+- `added` and `added_max`;
+- `mismatch` and `bad`;
+- `prim_skips`.
+
+### Checked without the game
+
+`tuning/wide_slst_sim`:
+
+- `export.py` writes every SLST entry on the disc, with hashes of the
+  reference node lists, to a temporary file: they are game data.
+- `sim.c` checks three things:
+  - **The rebuild.** 63,854 of 63,854 node lists match.
+  - **The merge.** 65,895 merges over every level for k = 1 to 3 obey the
+    rules above, with the union complete whenever the cap does not bind
+    (255 hit it).
+  - **The hook end to end.** It does nothing when:
+    - the game's list is not the node's;
+    - the camera path changed;
+    - the primitive buffer is nearly full;
+    - the frame is 4:3, or presented 4:3;
+    - the range is 0;
+    - a code word changed.
+    It widens in squash and in native-wide, and 14:9 reaches one node.
+
+### To check in play (Developer mode, a widescreen aspect)
+
+- **Counters.** In the heartbeat's `wide_slst`, `used` should climb and
+  `mismatch`, `bad` and `prim_skips` should stay at or near 0.
+- **The view.** Scenery that used to appear at the sides as the camera moved
+  should already be there.
+- **A/B.** `c2_slst {"k":0}` against `{"k":2}` on the same spot.
+- **Performance.** Watch the 60 FPS readout for the extra world polygons.

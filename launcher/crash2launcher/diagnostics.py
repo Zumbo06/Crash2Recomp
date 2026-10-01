@@ -74,6 +74,10 @@ HEARTBEAT_KEYS = ("backend", "frame_count", "total_checks", "dispatch_count",
                   # polygons drawn in the revealed margins; mismatch should
                   # stay 0.
                   "wide_reject",
+                  # Scenery range (crash2_wide_slst.h): used counts frames
+                  # drawing the neighbours' polygons; mismatch and bad should
+                  # stay 0, prim_skips near it.
+                  "wide_slst",
                   "cheat_lives", "cheat_aku_level", "cheat_god_active")
 SAMPLE_KEYS = ("wall", "frame", "exc_re", "in_exc", "tcp_ms")
 RATE_KEYS = ("vblank_raise_count", "game_loop_count",

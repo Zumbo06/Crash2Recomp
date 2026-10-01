@@ -98,7 +98,8 @@ WIDESCREEN_MODES = [
     ("Native-wide - draws real extra columns", True),
 ]
 
-# Widescreen object range: camera-path nodes at 16:9, scaled by the runtime.
+# Widescreen edge range (objects and scenery): camera-path nodes at 16:9,
+# scaled by the runtime.
 OBJECT_RANGE_UI = [
     ("Off - as the 4:3 game does", 0),
     ("Slightly wider", 1),
@@ -408,12 +409,13 @@ class SettingsPage(QWidget):
         # _sync_dependent_controls shows these only in developer mode, and
         # config.widescreen_*_active() keeps them off everywhere else.
         self.ws_mode_row = row("Widescreen mode", self.ws_mode)
-        self.object_range_row = row("Object range", self.widescreen_object_range)
+        self.object_range_row = row("Edge range", self.widescreen_object_range)
         self.ws_mode_note = dim("Native-wide looks sharper but uses far more GPU "
                                 "memory at high internal resolution.")
-        self.object_range_note = dim("Object range spawns enemies and crates for "
-                                     "the wider view, so they stop popping at "
-                                     "the edges. Experimental.")
+        self.object_range_note = dim("Edge range spawns enemies and crates, and "
+                                     "draws level scenery, for the wider view, "
+                                     "so they stop popping in at the edges. "
+                                     "Costs a little CPU.")
 
         return self._wrap(
             card(

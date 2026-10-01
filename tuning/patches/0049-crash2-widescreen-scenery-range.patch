@@ -1,0 +1,722 @@
+Widescreen scenery range: draw the level polygons the widened view shows.
+
+Crash 2 does not decide per frame which level polygons to draw. Each camera
+path carries an SLST entry, authored offline: a polygon list for every camera
+node, stored as the list at node 0, a delta per node step and the list at the
+last node. The camera update resolves the entry (property 0x103 of the path,
+0x80014260 returning it at 0x8002037C), func_80029800 applies each step's
+delta (forward: 0x8003AE54) to the current list [gp+0x214] = 0x8005F390, and
+the node and path go to 0x800608E8 / 0x800608D4. func_80041E5C draws the list.
+
+The lists hold what each node's 4:3 view sees. Across every SLST entry on the
+disc, two nodes either side add 13.5% to a node's list on average (by
+polygon). So any wider view - squash or native-wide - showed level scenery
+appearing and vanishing at its edges: it was never sent to the renderer.
+
+crash2_wide_slst.h (new) draws, at node n, the union of the lists of nodes
+n-k..n+k. The renderer's own tests (backface, depth, and the screen test that
+crash2_wide_reject.h widens in native-wide) still drop what is not on screen.
+
+- The game's list is drawn exactly as the game built it, repeats included;
+  polygons are only added, each once (a quad matched on its index: its
+  variant bits are per-node draw state), nearest node first, right after the
+  polygon that precedes it in the neighbour's own list. At most half as many
+  again (+32), and never over the game's own 1520-entry list size.
+- The lists are rebuilt here with a C port of the game's forward delta, which
+  reproduces all 63,854 node lists of the 1,986 entries the Python reference
+  closes (tuning/wide_slst_sim). The rebuilt list of the current node must
+  equal the game's list, checked on every call, or the game's list is drawn
+  untouched.
+- The game's list and its buffers are never written: the merged list lives in
+  runtime memory (psx_mod_memory_alloc) and only the call's $a0 points at it.
+- The renderer appends primitives to a per-frame buffer (0x16400 bytes,
+  allocated at 0x80016288) and never checks its end. A merged list is used
+  only while the room left holds 64 bytes per added polygon plus 16 KB.
+- 50 code words are checked (the entry lookup, the node walk, the stores of
+  node and path, the delta, the renderer's list and primitive handling, both
+  render calls, the buffer size). Identity at 4:3 and on 4:3 frames.
+
+PSX_CRASH2_WIDE_SLST=N: nodes either side at 16:9, scaled by the live
+widescreen margin like the object range (0046). The c2_slst debug command
+changes it live and reports counters, carried by the heartbeat as
+"wide_slst".
+
+No file here is in codegen_hash_sources.cmake; overlay shards are unaffected.
+
+--- /dev/null
++++ b/runtime/src/crash2_wide_slst.h
+@@ -0,0 +1,554 @@
++/* SCUS-94154 only: draw the scenery the widened view shows, not just the 4:3 one.
++ *
++ * Crash 2 does not decide per frame which level polygons to draw. Each camera
++ * path carries an SLST entry, authored offline: a polygon list for every
++ * camera node, stored as the list at node 0, a delta per node step and the
++ * list at the last node. The camera update (0x80020200..0x80020830) resolves
++ * the entry (property 0x103 of the path, 0x80014260), and every node step runs
++ * func_80029800, which applies the step's delta (forward, 0x8003AE54) to the
++ * current list [gp+0x214] = 0x8005F390. The node and path then go to
++ * 0x800608E8 / 0x800608D4. func_80041E5C draws that list, polygon by polygon
++ * (ids (world<<13)|index; 0x1800 marks a quad, its variant bits draw state).
++ *
++ * The lists hold what each node's 4:3 view sees: across every level a node's
++ * neighbours add 7% (one node either side) to 14% (two) polygons to its list.
++ * So a wider view showed scenery appearing and vanishing at its edges,
++ * in squash and native-wide alike - nothing at the edge was ever sent to the
++ * renderer.
++ *
++ * This draws, at node n, the union of the lists of nodes n-k..n+k: polygons
++ * the 4:3 view at a neighbouring node sees, which is where the wider view's
++ * edges go. The renderer's own tests (backface, depth, the screen test, which
++ * crash2_wide_reject.h widens in native-wide) still reject any that are not
++ * actually on screen.
++ *
++ *   - The game's list is drawn exactly as the game built it, repeats and all;
++ *     polygons are only added, each once, nearest node first, right after the
++ *     polygon that precedes it in the neighbour's own list.
++ *   - The lists are rebuilt here from the entry with the game's forward delta
++ *     (ported from 0x8003AE54 and checked on every SLST entry of every level:
++ *     start + all deltas == end). Before anything is added, the rebuilt list
++ *     for the current node must match the game's own list; otherwise the game
++ *     is left alone (counted as a mismatch).
++ *   - The game's list and its buffers are never written. The merged list goes
++ *     to runtime memory (psx_mod_memory_alloc) and only this call's $a0
++ *     points at it.
++ *   - The renderer appends primitives to a per-frame buffer (0x16400 bytes)
++ *     without ever checking its end. Polygons are added only while the space
++ *     left can hold 64 bytes for each of them plus a reserve; otherwise this
++ *     frame draws the game's list.
++ *   - Off (identity) at 4:3 and on frames presented 4:3.
++ *
++ * PSX_CRASH2_WIDE_SLST=N: nodes either side at 16:9, scaled by the live
++ * widescreen margin like the object range (crash2_wide_spawn.h). The c2_slst
++ * debug command changes it live and reports counters; the heartbeat carries
++ * them as "wide_slst". */
++
++#define C2SL_ENTRY_RA    0x8002037Cu  /* after 0x80014260: $v0 = SLST entry  */
++#define C2SL_RENDER_FN   0x80041E5Cu
++#define C2SL_RA_SITE1    0x80011CB8u
++#define C2SL_RA_SITE2    0x80018464u
++#define C2SL_LIST_PTR    0x8005F390u  /* [gp+0x214], the current list         */
++#define C2SL_NODE        0x800608E8u
++#define C2SL_CAM         0x800608D4u
++#define C2SL_FRAME0      0x8006345Cu  /* the two frame structs, 8340 bytes    */
++#define C2SL_FRAME_SIZE  8340u
++#define C2SL_MAGIC       0x0100FFFFu
++#define C2SL_TYPE        4u
++#define C2SL_MAX_LIST    1520         /* the game's list buffers hold 1520    */
++#define C2SL_MAX_ITEMS   1025
++#define C2SL_MAX_ITEM_HW 8192         /* halfwords in one item                */
++#define C2SL_PRIM_SIZE   0x16400u     /* per-frame primitive buffer           */
++#define C2SL_PRIM_POLY   64u          /* bytes allowed per added polygon      */
++#define C2SL_PRIM_RESERVE 0x4000u
++#define C2SL_MAX_K       8
++#define C2SL_SENT        0xFFFF00
++
++#ifndef C2SL_R32
++extern uint32_t psx_read_word(uint32_t a);
++extern uint16_t psx_read_half(uint32_t a);
++extern void     psx_write_half(uint32_t a, uint16_t v);
++extern uint32_t psx_mod_memory_alloc(uint32_t size, uint32_t alignment);
++#define C2SL_R32(a)     psx_read_word(a)
++#define C2SL_R16(a)     psx_read_half(a)
++#define C2SL_W16(a, v)  psx_write_half((a), (v))
++#define C2SL_ALLOC(n)   psx_mod_memory_alloc((n), 4u)
++#endif
++
++static const uint32_t c2sl_words[][2] = {
++    /* entry lookup: property 0x103 of the path, resolved; v0 = SLST entry */
++    { 0x80020344u, 0x34050103u },  /* ori $a1, $zero, 0x0103 */
++    { 0x80020364u, 0x0C00C6BAu },  /* jal 0x80031AE8 */
++    { 0x80020374u, 0x0C005098u },  /* jal 0x80014260 */
++    { 0x8002037Cu, 0x3C048006u },  /* lui $a0, 0x8006 */
++    { 0x80020380u, 0x8C8408E8u },  /* lw $a0, 2280($a0) */
++    { 0x80020384u, 0x00409821u },  /* addu $s3, $v0, $zero */
++    /* path entry from either end (item 0 / item fp) */
++    { 0x800203F0u, 0x8E640010u },  /* lw $a0, 16($s3) */
++    { 0x800203F4u, 0x8F850214u },  /* lw $a1, 532($gp) */
++    { 0x800203F8u, 0x0C00A600u },  /* jal 0x80029800 */
++    { 0x80020408u, 0xAF820214u },  /* sw $v0, 532($gp) */
++    { 0x8002042Cu, 0x001E1080u },  /* sll $v0, $fp, 2 */
++    { 0x80020430u, 0x00531021u },  /* addu $v0, $v0, $s3 */
++    { 0x80020434u, 0x8C440010u },  /* lw $a0, 16($v0) */
++    { 0x80020440u, 0x0C00A600u },  /* jal 0x80029800 */
++    { 0x80020454u, 0xAF820214u },  /* sw $v0, 532($gp) */
++    /* node steps: item [s3+16], list [gp+0x214] */
++    { 0x800204A0u, 0x26730004u },  /* addiu $s3, $s3, 4 */
++    { 0x800204A4u, 0x8E640010u },  /* lw $a0, 16($s3) */
++    { 0x800204A8u, 0x8F850214u },  /* lw $a1, 532($gp) */
++    { 0x800204B0u, 0x0C00A600u },  /* jal 0x80029800 */
++    { 0x800204C4u, 0xAF820214u },  /* sw $v0, 532($gp) */
++    { 0x800204E8u, 0x8C440010u },  /* lw $a0, 16($v0) */
++    { 0x800204F8u, 0x0C00A600u },  /* jal 0x80029800 */
++    { 0x8002050Cu, 0xAF820214u },  /* sw $v0, 532($gp) */
++    /* node and path stored after the walk */
++    { 0x800205E4u, 0xAC3508D4u },  /* sw $s5, 2260($at) */
++    { 0x800205ECu, 0xAC3708E8u },  /* sw $s7, 2280($at) */
++    { 0x800206E0u, 0xAC3508D4u },  /* sw $s5, 2260($at) */
++    { 0x800206E8u, 0xAC3708E8u },  /* sw $s7, 2280($at) */
++    /* list application and the forward delta */
++    { 0x80029800u, 0x27BDFFE0u },  /* addiu $sp, $sp, -32 */
++    { 0x80029804u, 0xAFB00010u },  /* sw $s0, 16($sp) */
++    { 0x80029808u, 0x00808021u },  /* addu $s0, $a0, $zero */
++    { 0x8003AE54u, 0x3C011F80u },  /* lui $at, 0x1F80 */
++    { 0x8003AE58u, 0xAC300000u },  /* sw $s0, 0($at) */
++    { 0x8003AE5Cu, 0xAC310004u },  /* sw $s1, 4($at) */
++    /* renderer: list header, end pointer, primitive pointer */
++    { 0x80041E5Cu, 0x27BDFFBCu },  /* addiu $sp, $sp, -68 */
++    { 0x80041EA8u, 0x84990000u },  /* lh $t9, 0($a0) */
++    { 0x80041EACu, 0x24BE0018u },  /* addiu $fp, $a1, 24 */
++    { 0x80041EB4u, 0x20840002u },  /* addi $a0, $a0, 2 */
++    { 0x80041EB8u, 0x0019C840u },  /* sll $t9, $t9, 1 */
++    { 0x80041EBCu, 0x0324E821u },  /* addu $sp, $t9, $a0 */
++    { 0x80041EC0u, 0x24840002u },  /* addiu $a0, $a0, 2 */
++    { 0x80041EC4u, 0xAC64009Cu },  /* sw $a0, 156($v1) */
++    { 0x80041F84u, 0x8FD7FFF0u },  /* lw $s7, -16($fp) */
++    { 0x800423E0u, 0xAFD7FFF0u },  /* sw $s7, -16($fp) */
++    /* both render calls */
++    { 0x80011CB0u, 0x0C010797u },  /* jal 0x80041E5C */
++    { 0x8001845Cu, 0x0C010797u },  /* jal 0x80041E5C */
++    /* per-frame primitive buffer: 0x16400 bytes (0x2C800 in one mode) */
++    { 0x80016288u, 0x3C040001u },  /* lui $a0, 0x0001 */
++    { 0x8001628Cu, 0x34846400u },  /* ori $a0, $a0, 0x6400 */
++    { 0x80016298u, 0x3C040002u },  /* lui $a0, 0x0002 */
++    { 0x8001629Cu, 0x3484C800u },  /* ori $a0, $a0, 0xC800 */
++    { 0x800162ACu, 0xAE020004u },  /* sw $v0, 4($s0) */
++};
++
++typedef struct {
++    uint32_t entry, eid, stamp;  /* guest entry, its EID, LRU stamp           */
++    int      nodes;              /* lists: one per node                        */
++    int      ok;                 /* 1 = rebuilt and verified, 0 = unusable     */
++    uint32_t *off;               /* per node: offset of its list in ids[]      */
++    uint16_t *len;
++    uint16_t *ids;
++} C2slEntry;
++
++static int      c2sl_base_k = -1;           /* -1 = not yet read from env      */
++static int      c2sl_last_k = -1;
++static int      c2sl_code = -1;             /* -1 unchecked, 0 changed, 1 ok   */
++static uint32_t c2sl_cap_entry, c2sl_cap_cam;
++static C2slEntry c2sl_cache[2];
++static uint32_t c2sl_clock;
++static uint32_t c2sl_buf;                   /* guest buffer for the merged list */
++/* The merged list for one (entry, node, list, count, k): built once per node. */
++static struct {
++    uint32_t entry, list; int node, count, k, first, last;
++    int valid, widen, added;
++} c2sl_built;
++static unsigned long long c2sl_n_built, c2sl_n_used, c2sl_n_mismatch, c2sl_n_bad,
++                          c2sl_n_prim_skips, c2sl_added_max;
++static uint16_t c2sl_tmp_a[C2SL_MAX_LIST], c2sl_tmp_b[C2SL_MAX_LIST];
++static uint16_t c2sl_item[C2SL_MAX_ITEM_HW];
++static uint16_t c2sl_merged[C2SL_MAX_LIST], c2sl_next[C2SL_MAX_LIST];
++static uint16_t c2sl_game[C2SL_MAX_LIST];   /* the game's list the merge came from */
++static uint16_t c2sl_pos[65536];
++static uint8_t  c2sl_have[65536 / 8];
++
++static int c2sl_is_ram(uint32_t a, uint32_t n)
++{
++    return (a & 0xE0000000u) == 0x80000000u &&
++           (a & 0x1FFFFFFFu) < 0x200000u && n <= 0x200000u - (a & 0x1FFFFFFFu);
++}
++
++/* A quad's variant bits are draw state that changes from node to node; the
++ * polygon is the same, so it is matched on its index alone. */
++static uint16_t c2sl_key(uint16_t id)
++{
++    return (id & 0x1800u) ? (uint16_t)(id | 0x1800u) : id;
++}
++
++/* One item (source or delta) into c2sl_item; returns its length in halfwords. */
++static int c2sl_load_item(uint32_t p)
++{
++    if (!c2sl_is_ram(p, 8)) return -1;
++    const int count = (int16_t)C2SL_R16(p);
++    const int hw = 2 + count;
++    if (count < 0 || hw > C2SL_MAX_ITEM_HW || !c2sl_is_ram(p, 2u * (uint32_t)hw)) return -1;
++    for (int i = 0; i < hw; ++i) c2sl_item[i] = C2SL_R16(p + 2u * (uint32_t)i);
++    return hw;
++}
++
++static uint32_t c2sl_rd(int hw, int byte_off)
++{
++    const int i = byte_off >> 1;
++    return (byte_off >= 0 && i < hw) ? c2sl_item[i] : 0xFFFFu;
++}
++
++static void c2sl_dec(int hw, int *p, int lim, int *t, int *n, int *nxt)
++{
++    const uint32_t at = c2sl_rd(hw, *p);
++    *p += 2;
++    *n = 0; *t = C2SL_SENT; *nxt = 0;
++    if (*p < lim && at != 0xFFFFu) {
++        *t = (int)(at & 0xFFFu);
++        *n = (int)((at & 0xF000u) >> 12) + 1;
++    }
++    if (*n > 0) { *nxt = (int)c2sl_rd(hw, *p); *p += 2; }
++}
++
++/* The game's forward delta (0x8003AE54), step for step: the item in c2sl_item
++ * applied to src[0..gp). Returns the new length, or -1 on anything it does not
++ * recognise. */
++static int c2sl_fwd(int hw, const uint16_t *src, int gp, uint16_t *out)
++{
++    const int count = (int16_t)c2sl_item[0], typ = (int16_t)c2sl_item[1];
++    const int addidx = (int16_t)c2sl_item[2], swapidx = (int16_t)c2sl_item[3];
++    if (hw < 4 || typ != 1) return -1;
++    const int sp = 4 + 2 * addidx, fp = 4 + 2 * swapidx, end = 4 + 2 * count;
++    int n = 0, v1 = 0, t5 = 0, t6 = 0, pos = 8, guard = 0;
++    int t1, t3, t8, t7 = sp, t0, t2, s7;
++    c2sl_dec(hw, &pos, sp, &t1, &t3, &t8);
++    c2sl_dec(hw, &t7, fp, &t0, &t2, &s7);
++    while (v1 < gp || t2 > 0 || t3 > 0) {
++        if (++guard > 100000) return -1;
++        if (v1 < gp && t3 > 0 && t1 - 1 - v1 == 0) {          /* remove */
++            t3--; t5++; v1++; t6++;
++            if (t3 > 0) { t8 = (int)c2sl_rd(hw, pos); pos += 2; }
++            else c2sl_dec(hw, &pos, sp, &t1, &t3, &t8);
++            continue;
++        }
++        if (t2 > 0 && t0 + t5 - v1 == 0) {                      /* add */
++            if (n >= C2SL_MAX_LIST) return -1;
++            out[n++] = (uint16_t)s7;
++            t2--;
++            if (t2 > 0) { s7 = (int)c2sl_rd(hw, t7); t7 += 2; }
++            else c2sl_dec(hw, &t7, fp, &t0, &t2, &s7);
++            continue;
++        }
++        if (v1 < gp) {                                          /* copy a run */
++            int at = t1 - v1 - 1, a3 = t0 + t5 - v1;
++            if (!(at < a3)) at = a3;
++            a3 = gp - v1 - 1;
++            if (!(at < a3)) at = a3;
++            if (at < 2) at = 1;
++            if (t6 + at > gp || n + at > C2SL_MAX_LIST) return -1;
++            for (int i = 0; i < at; ++i) out[n++] = src[t6++];
++            v1 += at;
++            continue;
++        }
++        return -1;                       /* an add pending past the source end */
++    }
++    (void)t8;
++    /* Swaps and variant toggles, on the output. */
++    int q = fp, s4 = 0;
++    while (q < end) {
++        uint32_t at = c2sl_rd(hw, q);
++        int s3;
++        q += 2;
++        if (at == 0xFFFFu) break;
++        if (at & 0x8000u) {
++            s3 = (int)((at & 0x7800u) >> 11); s4 = (int)(at & 0x7FFu);
++        } else if (at & 0x4000u) {
++            s3 = (int)(at & 0x1Fu) + 16; s4 += (int)((at & 0x3FE0u) >> 5);
++        } else if (at & 0x2000u) {
++            s4 = (int)(at & 0x7FFu);
++            if (s4 >= n) return -1;
++            out[s4] ^= (uint16_t)(at & 0x1800u);
++            continue;
++        } else {
++            s4 = (int)(at & 0xFFFu);
++            at = c2sl_rd(hw, q); q += 2;
++            s3 = (int)(at & 0xFFFu);
++        }
++        const int j = s4 + s3 + 1;
++        if (s4 < 0 || j >= n) return -1;
++        const uint16_t tmp = out[s4]; out[s4] = out[j]; out[j] = tmp;
++    }
++    return n;
++}
++
++static void c2sl_free(C2slEntry *e)
++{
++    free(e->off); free(e->len); free(e->ids);
++    memset(e, 0, sizeof *e);
++}
++
++/* Rebuild every node's list of the entry at `entry`. ok = 0 on any doubt. */
++static void c2sl_build_entry(C2slEntry *e, uint32_t entry)
++{
++    c2sl_free(e);
++    e->entry = entry;
++    e->stamp = ++c2sl_clock;
++    if (!c2sl_is_ram(entry, 16)) return;
++    e->eid = C2SL_R32(entry + 4);
++    if (C2SL_R32(entry) != C2SL_MAGIC || C2SL_R32(entry + 8) != C2SL_TYPE) return;
++    const uint32_t items = C2SL_R32(entry + 12);
++    if (items < 2 || items > C2SL_MAX_ITEMS || !c2sl_is_ram(entry + 16, 4 * items)) return;
++    const int nodes = (int)items - 1;
++    size_t cap = (size_t)nodes * 700u, used = 0;
++    e->off = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)nodes);
++    e->len = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)nodes);
++    e->ids = (uint16_t *)malloc(sizeof(uint16_t) * cap);
++    if (!e->off || !e->len || !e->ids) {
++        const uint32_t eid = e->eid;
++        c2sl_free(e); e->entry = entry; e->eid = eid; return;
++    }
++    uint16_t *cur = c2sl_tmp_a, *nxt = c2sl_tmp_b;
++    int curn;
++    {
++        const int hw = c2sl_load_item(C2SL_R32(entry + 16));
++        if (hw < 2 || (int16_t)c2sl_item[1] != 0) return;
++        curn = hw - 2;
++        if (curn > C2SL_MAX_LIST) return;
++        memcpy(cur, c2sl_item + 2, sizeof(uint16_t) * (size_t)curn);
++    }
++    for (int node = 0; node < nodes; ++node) {
++        if (node > 0) {
++            const int hw = c2sl_load_item(C2SL_R32(entry + 16 + 4u * (uint32_t)node));
++            if (hw < 4) return;
++            const int nn = c2sl_fwd(hw, cur, curn, nxt);
++            if (nn < 0) return;
++            uint16_t *t = cur; cur = nxt; nxt = t; curn = nn;
++        }
++        if (used + (size_t)curn > cap) {
++            cap = (used + (size_t)curn) * 2u;
++            uint16_t *grown = (uint16_t *)realloc(e->ids, sizeof(uint16_t) * cap);
++            if (!grown) return;
++            e->ids = grown;
++        }
++        e->off[node] = (uint32_t)used;
++        e->len[node] = (uint16_t)curn;
++        memcpy(e->ids + used, cur, sizeof(uint16_t) * (size_t)curn);
++        used += (size_t)curn;
++    }
++    /* The rebuilt last list must be the entry's own end list. */
++    {
++        const int hw = c2sl_load_item(C2SL_R32(entry + 16 + 4u * (uint32_t)nodes));
++        if (hw < 2 || (int16_t)c2sl_item[1] != 0 || hw - 2 != curn) return;
++        for (int i = 0; i < curn; ++i)
++            if (c2sl_key(c2sl_item[2 + i]) != c2sl_key(cur[i])) return;
++    }
++    e->nodes = nodes;
++    e->ok = 1;
++}
++
++static C2slEntry *c2sl_entry(uint32_t entry)
++{
++    for (int i = 0; i < 2; ++i)
++        if (c2sl_cache[i].entry == entry && c2sl_is_ram(entry, 16) &&
++            C2SL_R32(entry + 4) == c2sl_cache[i].eid) {
++            c2sl_cache[i].stamp = ++c2sl_clock;
++            return &c2sl_cache[i];
++        }
++    C2slEntry *e = c2sl_cache[0].stamp <= c2sl_cache[1].stamp ? &c2sl_cache[0] : &c2sl_cache[1];
++    c2sl_build_entry(e, entry);
++    if (!e->ok) c2sl_n_bad++;
++    return e;
++}
++
++/* m = the game's list; add the polygons of the neighbour lists in the order
++ * given, each once, right after its predecessor in that list. */
++static int c2sl_merge(const C2slEntry *e, int node, int k, int m, int cap)
++{
++    memset(c2sl_have, 0, sizeof c2sl_have);
++    for (int i = 0; i < m; ++i) {
++        const uint16_t key = c2sl_key(c2sl_merged[i]);
++        c2sl_have[key >> 3] |= (uint8_t)(1u << (key & 7));
++    }
++    for (int j = 1; j <= k && m < cap; ++j) {
++        for (int side = -1; side <= 1 && m < cap; side += 2) {
++            const int nb = node + side * j;
++            if (nb < 0 || nb >= e->nodes) continue;
++            const uint16_t *nl = e->ids + e->off[nb];
++            const int nn = e->len[nb];
++            for (int i = 0; i < m; ++i) c2sl_pos[c2sl_key(c2sl_merged[i])] = (uint16_t)i;
++            /* insertion anchor per neighbour polygon: position in the current
++             * list after which it goes (0 keeps the game's first entry first) */
++            int anchor = 0, adds = 0, w = 0;
++            static uint16_t add_id[C2SL_MAX_LIST], add_at[C2SL_MAX_LIST];
++            for (int i = 0; i < nn; ++i) {
++                const uint16_t key = c2sl_key(nl[i]);
++                if (c2sl_have[key >> 3] & (1u << (key & 7))) {
++                    if (c2sl_pos[key] < m) anchor = c2sl_pos[key];
++                    continue;
++                }
++                if (m + adds >= cap) break;
++                c2sl_have[key >> 3] |= (uint8_t)(1u << (key & 7));
++                c2sl_pos[key] = 0xFFFFu;              /* not in the list yet */
++                add_id[adds] = nl[i];
++                add_at[adds] = (uint16_t)anchor;
++                adds++;
++            }
++            if (!adds) continue;
++            /* Anchors are not in list order (the neighbour orders some polygons
++             * differently), so sort the additions by anchor, stably. */
++            static uint16_t start[C2SL_MAX_LIST + 1], order[C2SL_MAX_LIST];
++            memset(start, 0, sizeof(uint16_t) * (size_t)(m + 1));
++            for (int a = 0; a < adds; ++a) start[add_at[a] + 1]++;
++            for (int p = 1; p <= m; ++p) start[p] = (uint16_t)(start[p] + start[p - 1]);
++            for (int a = 0; a < adds; ++a) order[start[add_at[a]]++] = (uint16_t)a;
++            /* Rebuild: after position p, the polygons anchored at p (in order). */
++            int a = 0;
++            for (int p = 0; p < m; ++p) {
++                c2sl_next[w++] = c2sl_merged[p];
++                while (a < adds && add_at[order[a]] == p) c2sl_next[w++] = add_id[order[a++]];
++            }
++            memcpy(c2sl_merged, c2sl_next, sizeof(uint16_t) * (size_t)w);
++            m = w;
++        }
++    }
++    return m;
++}
++
++static int c2sl_code_ok(CPUState *cpu)
++{
++    (void)cpu;
++    for (size_t i = 0; i < sizeof(c2sl_words) / sizeof(c2sl_words[0]); ++i)
++        if (C2SL_R32(c2sl_words[i][0]) != c2sl_words[i][1]) return 0;
++    return 1;
++}
++
++static int c2sl_window(void)
++{
++    GpuWsDebug ws;
++    gpu_ws_get_debug(&ws);
++    if (ws.present_native_43) return 0;
++    if (!((ws.mode == 1 && ws.active) || (ws.mode == 2 && ws.nw_extra > 0))) return 0;
++    const int margin = ws.x_margin > 0 ? ws.x_margin : 85;
++    int k = (c2sl_base_k * margin + 42) / 85;
++    if (k < 1) k = 1;
++    return k > C2SL_MAX_K ? C2SL_MAX_K : k;
++}
++
++void crash2_wide_slst_note_restore(void)
++{
++    c2sl_code = -1;
++    c2sl_cap_entry = c2sl_cap_cam = 0;
++    c2sl_built.valid = 0;
++}
++
++void crash2_wide_slst_control(int k, int reset)
++{
++    if (k >= 0) {
++        c2sl_base_k = k > C2SL_MAX_K ? C2SL_MAX_K : k;
++        c2sl_built.valid = 0;
++    }
++    if (reset)
++        c2sl_n_built = c2sl_n_used = c2sl_n_mismatch = c2sl_n_bad =
++            c2sl_n_prim_skips = c2sl_added_max = 0;
++}
++
++void crash2_wide_slst_stats(unsigned long long out[6], int *base_k, int *k,
++                            int *code_ok, int *added)
++{
++    out[0] = c2sl_n_built;   out[1] = c2sl_n_used;  out[2] = c2sl_n_mismatch;
++    out[3] = c2sl_n_bad;     out[4] = c2sl_n_prim_skips; out[5] = c2sl_added_max;
++    if (base_k)  *base_k = c2sl_base_k < 0 ? 0 : c2sl_base_k;
++    if (k)       *k = c2sl_last_k < 0 ? 0 : c2sl_last_k;
++    if (code_ok) *code_ok = c2sl_code;
++    if (added)   *added = c2sl_built.valid ? c2sl_built.added : 0;
++}
++
++static void crash2_wide_slst(CPUState *cpu, uint32_t pc)
++{
++    if (pc != C2SL_ENTRY_RA && pc != C2SL_RENDER_FN) return;
++    if (c2sl_base_k < 0) {
++        const char *env = getenv("PSX_CRASH2_WIDE_SLST");
++        const int v = env ? atoi(env) : 0;
++        c2sl_base_k = v < 0 ? 0 : (v > C2SL_MAX_K ? C2SL_MAX_K : v);
++    }
++    if (c2sl_base_k == 0) return;
++    if (c2sl_code < 0) c2sl_code = c2sl_code_ok(cpu);
++    if (!c2sl_code) return;
++    if (pc == C2SL_ENTRY_RA) {
++        /* The camera update just resolved its path's SLST entry; it does so
++         * whenever it is about to step to another node. */
++        c2sl_cap_entry = cpu->gpr[2];
++        c2sl_cap_cam = cpu->gpr[21];
++        return;
++    }
++    const uint32_t ra = cpu->gpr[31];
++    if (ra != C2SL_RA_SITE1 && ra != C2SL_RA_SITE2) return;
++    const int k = c2sl_window();
++    if (k != c2sl_last_k && k > 0)
++        fprintf(stdout, "psxrecomp: widescreen scenery range: %d camera node%s "
++                        "either side (crash2_wide_slst)\n", k, k == 1 ? "" : "s");
++    c2sl_last_k = k;
++    if (k <= 0) return;
++
++    const uint32_t list = cpu->gpr[4];
++    if (list != C2SL_R32(C2SL_LIST_PTR) || !c2sl_is_ram(list, 4)) return;
++    if (!c2sl_cap_entry || C2SL_R32(C2SL_CAM) != c2sl_cap_cam) return;
++    const int node = (int)C2SL_R32(C2SL_NODE);
++    const int count = (int16_t)C2SL_R16(list);
++    if (count < 1 || count > C2SL_MAX_LIST || !c2sl_is_ram(list, 4u + 2u * (uint32_t)count))
++        return;
++    const int first = C2SL_R16(list + 4), last = C2SL_R16(list + 2u + 2u * (uint32_t)count);
++
++    int hit = c2sl_built.valid && c2sl_built.entry == c2sl_cap_entry &&
++              c2sl_built.node == node && c2sl_built.list == list &&
++              c2sl_built.count == count && c2sl_built.k == k &&
++              c2sl_built.first == first && c2sl_built.last == last;
++    /* Every call, the game's list must still be the one the merge came from:
++     * a merged list is never drawn over a list it was not built for. */
++    for (int i = 0; hit && i < count; ++i)
++        if (C2SL_R16(list + 4u + 2u * (uint32_t)i) != c2sl_game[i]) hit = 0;
++    if (!hit) {
++        c2sl_built.valid = 1;
++        c2sl_built.entry = c2sl_cap_entry; c2sl_built.node = node;
++        c2sl_built.list = list; c2sl_built.count = count; c2sl_built.k = k;
++        c2sl_built.first = first; c2sl_built.last = last;
++        c2sl_built.widen = 0; c2sl_built.added = 0;
++        for (int i = 0; i < count; ++i)                 /* for the per-call check */
++            c2sl_game[i] = C2SL_R16(list + 4u + 2u * (uint32_t)i);
++        const C2slEntry *e = c2sl_entry(c2sl_cap_entry);
++        if (!e->ok || node < 0 || node >= e->nodes) return;
++        /* The game's list must be this node's list, or nothing here applies. */
++        if (e->len[node] != count) { c2sl_n_mismatch++; return; }
++        const uint16_t *mine = e->ids + e->off[node];
++        for (int i = 0; i < count; ++i)
++            c2sl_game[i] = c2sl_merged[i] = C2SL_R16(list + 4u + 2u * (uint32_t)i);
++        for (int i = 0; i < count; ++i)
++            if (c2sl_key(c2sl_merged[i]) != c2sl_key(mine[i])) { c2sl_n_mismatch++; return; }
++        /* At most half as many again: by polygon, two nodes either side add
++         * 14% on average and 38% at the 99th percentile across the game. */
++        int cap = count + count / 2 + 32;
++        if (cap > C2SL_MAX_LIST) cap = C2SL_MAX_LIST;
++        const int m = c2sl_merge(e, node, k, count, cap);
++        if (m <= count) return;
++        if (!c2sl_buf) c2sl_buf = C2SL_ALLOC(4u + 2u * C2SL_MAX_LIST);
++        if (!c2sl_buf) return;
++        C2SL_W16(c2sl_buf, (uint16_t)m);
++        C2SL_W16(c2sl_buf + 2u, C2SL_R16(list + 2u));
++        for (int i = 0; i < m; ++i) C2SL_W16(c2sl_buf + 4u + 2u * (uint32_t)i, c2sl_merged[i]);
++        c2sl_built.widen = 1;
++        c2sl_built.added = m - count;
++        if ((unsigned long long)(m - count) > c2sl_added_max) c2sl_added_max = (unsigned long long)(m - count);
++        c2sl_n_built++;
++    }
++    if (!c2sl_built.widen) return;
++
++    /* Room in this frame's primitive buffer for every added polygon. */
++    const uint32_t frame = cpu->gpr[5];
++    if (frame != C2SL_FRAME0 && frame != C2SL_FRAME0 + C2SL_FRAME_SIZE) return;
++    const uint32_t base = C2SL_R32(frame + 4), cur = C2SL_R32(frame + 8);
++    if (!c2sl_is_ram(base, C2SL_PRIM_SIZE) || cur < base) return;
++    const uint32_t used = cur - base;
++    const uint32_t need = C2SL_PRIM_POLY * (uint32_t)c2sl_built.added + C2SL_PRIM_RESERVE;
++    if (used >= C2SL_PRIM_SIZE || C2SL_PRIM_SIZE - used < need) { c2sl_n_prim_skips++; return; }
++
++    cpu->gpr[4] = c2sl_buf;
++    c2sl_n_used++;
++}
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -798,6 +798,10 @@
+      * words it depends on: they are guest RAM, and a state replaced them. */
+     extern void crash2_wide_reject_note_restore(void);
+     crash2_wide_reject_note_restore();
++    /* The scenery range (crash2_wide_slst.h) forgets its path and merged list:
++     * both describe guest RAM the state just replaced. */
++    extern void crash2_wide_slst_note_restore(void);
++    crash2_wide_slst_note_restore();
+     /* Absolute guest-cycle timestamps from the pre-load timeline are invalid
+      * once psx_cycle_count rewinds (typical: save → play N seconds → load).
+      * Leaving post_exception_cooldown_until in the future blocks every IRQ
+@@ -2101,6 +2105,7 @@
+ #include "crash2_wide_bbox.h"
+ #include "crash2_wide_spawn.h"
+ #include "crash2_wide_reject.h"
++#include "crash2_wide_slst.h"
+ #include "crash2_sim_tick.h"
+ #include "crash2_60fps.h"
+ #include "crash2_cheats.h"
+@@ -2112,6 +2117,7 @@
+     crash2_wide_bbox(cpu, resume_pc);
+     crash2_wide_spawn(cpu, resume_pc);
+     crash2_wide_reject(cpu, resume_pc);
++    crash2_wide_slst(cpu, resume_pc);
+     crash2_sim_tick(cpu, resume_pc);
+     crash2_60fps(cpu, resume_pc);
+     crash2_cheats_tick(cpu, resume_pc);
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8355,6 +8355,33 @@
+              id, on, code_ok, off, s[0], s[1], s[2]);
+ }
+ 
++/* Crash 2's widescreen scenery range (crash2_wide_slst.h). Live, so one launch
++ * can A/B it:
++ *   c2_slst               -> counters
++ *   c2_slst {"k":N}       -> camera-path nodes either side at 16:9, 0 = off
++ *                            (scaled by the live widescreen margin)
++ *   c2_slst {"reset":1}   -> zero the counters
++ * built = merged lists made (one per node); used = render calls that drew one;
++ * added = polygons the current one adds; added_max = the most so far;
++ * mismatch = the game's list was not the rebuilt list of its node (left
++ * alone); bad = SLST entries this could not rebuild; prim_skips = frames whose
++ * primitive buffer had too little room left (drawn as the game built them). */
++extern void crash2_wide_slst_control(int k, int reset);
++extern void crash2_wide_slst_stats(unsigned long long out[6], int *base_k, int *k,
++                                   int *code_ok, int *added);
++static void handle_c2_slst(int id, const char *json)
++{
++    crash2_wide_slst_control(json_get_int(json, "k", -1),
++                             json_get_int(json, "reset", 0));
++    unsigned long long s[6];
++    int base_k = 0, k = 0, code_ok = 0, added = 0;
++    crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
++    send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
++             "\"added\":%d,\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,"
++             "\"bad\":%llu,\"prim_skips\":%llu,\"added_max\":%llu}",
++             id, base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5]);
++}
++
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+  * fire, live extent/camera/DL-count, orig vs final bound). Read-only; small
+  * heap envelope so the per-byte stall of a giant read is never in play. */
+@@ -13956,6 +13983,7 @@
+     { "c2_bbox",           handle_c2_bbox },
+     { "c2_spawn",          handle_c2_spawn },
+     { "c2_reject",         handle_c2_reject },
++    { "c2_slst",           handle_c2_slst },
+     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
+     { "ws_backdrop_margin", handle_ws_backdrop_margin },
+     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -83,6 +83,10 @@
+  * polygons at the edges in native-wide can say whether it ran. */
+ extern void crash2_wide_reject_stats(unsigned long long out[3], int *on,
+                                      int *code_ok, int *off);
++/* Widescreen scenery range (crash2_wide_slst.h): whether it is drawing the
++ * neighbouring nodes' polygons, and why not when it is not. */
++extern void crash2_wide_slst_stats(unsigned long long out[6], int *base_k, int *k,
++                                   int *code_ok, int *added);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+ extern uint32_t i_stat;                        /* memory.c */
+@@ -947,6 +951,17 @@
+                  "\"kept\":%llu,\"mismatch\":%llu}",
+                  on, code_ok, off, s[0], s[1], s[2]);
+     }
++    char sl_json[256];
++    {
++        unsigned long long s[6];
++        int base_k = 0, k = 0, code_ok = 0, added = 0;
++        crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
++        snprintf(sl_json, sizeof(sl_json),
++                 "{\"base_k\":%d,\"k\":%d,\"code_ok\":%d,\"added\":%d,"
++                 "\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,\"bad\":%llu,"
++                 "\"prim_skips\":%llu,\"added_max\":%llu}",
++                 base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5]);
++    }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),
+         "{\n"
+@@ -986,6 +1001,7 @@
+         "  \"cheat_god_active\":%d,\n"
+         "  \"wide_spawn\":%s,\n"
+         "  \"wide_reject\":%s,\n"
++        "  \"wide_slst\":%s,\n"
+         "  \"psx_cycle_count\":%llu,\n"
+         "  \"current_func\":\"0x%08X\",\n"
+         "  \"last_store_pc\":\"0x%08X\",\n"
+@@ -1079,6 +1095,7 @@
+         crash2_cheat_god_active(),
+         ws_json,
+         wr_json,
++        sl_json,
+         (unsigned long long)cyc,
+         cur_fn,
+         last_store,

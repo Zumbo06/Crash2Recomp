@@ -199,11 +199,14 @@ def _build_env(settings: Settings) -> dict[str, str]:
     env["PSX_PAUSE_ON_FOCUS_LOSS"] = "1" if settings.pause_on_focus_loss else "0"
     # The in-game FPS counter (F key / Home menu FPS DISPLAY).
     env["PSX_FPS_OSD"] = "1" if settings.fps_overlay else "0"
-    # Widescreen object range (crash2_wide_spawn.h): how many camera-path
-    # nodes early objects spawn, and late they leave, at 16:9. The runtime
-    # scales it to the live aspect and does nothing at 4:3. Developer mode
-    # only for now, so always written: 0 is the game's own behaviour.
-    env["PSX_CRASH2_WIDE_SPAWN"] = str(config.widescreen_object_range_active(settings))
+    # Widescreen edge range, in camera-path nodes at 16:9: how early objects
+    # spawn and how late they leave (crash2_wide_spawn.h), and how many
+    # neighbouring nodes' level polygons are drawn (crash2_wide_slst.h). The
+    # runtime scales it to the live aspect and does nothing at 4:3. Developer
+    # mode only for now, so always written: 0 is the game's own behaviour.
+    edge_range = str(config.widescreen_object_range_active(settings))
+    env["PSX_CRASH2_WIDE_SPAWN"] = edge_range
+    env["PSX_CRASH2_WIDE_SLST"] = edge_range
 
     # Frame pacing. Note the runtime treats vsync and its wall-clock pacer as
     # mutually exclusive, and vsync only really clocks ~60 Hz panels.
