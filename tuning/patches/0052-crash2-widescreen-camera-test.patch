@@ -1,0 +1,951 @@
+Widescreen ranges: ask the camera what the extra columns show.
+
+Reported after 0051: the side-on ranges helped, artifacts remain. Every
+node-count rule (k, the side-on reach, the side-on window) guesses where the
+camera looks; forward paths, most of the game, still had k = 2. The camera
+itself is readable:
+
+- rotation 0x80060774, loaded into the GTE by 0x8004EF28 just before the
+  world draw (the renderer only clears the translation, 0x80041E9C);
+- position 0x800607F4 (24.8, world units); each frame every world record of
+  the zone header gets origin - camera, +16 the world's info, +20 triangles,
+  +24 quads, +28 vertices (0x80018344..0x800183CC);
+- world geometry: vertices' XY words last-first then Z halves, triangles a
+  word each last-first then a half each, quads 8 bytes; coordinate = field &
+  0xFFF0 from the origin (the renderer, 0x80041FBC..0x80042220). All 1.57M
+  polygon references of the side-on paths decode.
+
+crash2_wide_geom.h: the camera from the GTE, the RTPS projection in integers
+(no translation, no squash), classification of a polygon against the 4:3 and
+the wide frame, the current zone's worlds and polygon corners. 32 more code
+words checked.
+
+crash2_wide_slst.h: per node, candidates = what the lists within 20 nodes
+(and the linked paths') hold that the game's list does not; each frame, the
+ones reaching into the extra columns (outside 4:3, inside the wide frame, in
+front) are drawn, nearest first, after their anchors. Nothing is added inside
+the 4:3 frame - the game's list there is authoritative. Once per node the
+model must put at least half of the game's own list on screen, else the
+node window (0051) draws.
+
+crash2_wide_spawn.h: with that camera, an object the original has not
+spawned (or just killed) is wanted while its position projects into the
+extra columns, on any path; load/unload rules unchanged. Camera y is read
+signed: the game shifts it unsigned (harmless for its 16-bit offsets), but
+it is negative in some levels.
+
+Counters: wide_slst camera / model_bad / model_pct, wide_spawn cam_yes /
+cam_no. tuning/wide_frustum_sim checks it on 72 real cases against a
+separately written reference. No file here is in codegen_hash_sources.cmake;
+overlay shards are unaffected.
+
+--- a/runtime/src/crash2_wide_geom.h
++++ b/runtime/src/crash2_wide_geom.h
+@@ -30,6 +30,19 @@
+  *     record {entry, EID} (0x80014260). The record's entry word has bit 0 set
+  *     while the entry is not resident. EIDs are found as 0x80014B90 finds them.
+  *
++ *   - A world (WGEO, type 3): item 0 its origin (3 x int32) and counts
++ *     (+16 vertices, +20 triangles, +24 quads), item 1 vertices (XY words
++ *     stored last-first, then Z halves), item 2 triangles (a word each,
++ *     last-first, then a half each), item 3 quads (8 bytes). A coordinate is
++ *     the field & 0xFFF0 from the world's origin, in world units; a polygon
++ *     id's top 3 bits pick the world, the low 11 the polygon, 0x1800 a quad.
++ *     All 1.57M polygon references of the side-on paths decode, and lie
++ *     inside the 4:3 angle with the same sharp edge the objects show.
++ *   - The camera: rotation 0x80060774 (loaded into the GTE for the world
++ *     draw), position 0x800607F4 (24.8, world units). Each frame every world
++ *     record gets origin - camera (0x80018344), and the renderer feeds the GTE
++ *     field + that offset with no translation (0x80041E9C).
++ *
+  * Kind 3 (and 8) paths look at the play from the side. On every one of them,
+  * across the game, objects appear and vanish where their offset along the
+  * path from the camera is 0.94 to 2.3 times their distance off it (median
+@@ -41,6 +54,7 @@
+ #define CRASH2_WIDE_GEOM_H
+ 
+ #include <math.h>
++#include <string.h>
+ 
+ #define C2WG_MAGIC      0x0100FFFFu
+ #define C2WG_T_ZONE     7u
+@@ -54,6 +68,11 @@
+ #define C2WG_MAX_NEIGH  16
+ #define C2WG_MAX_WORLDS 8
+ 
++#define C2WG_CAM_ROT    0x80060774u   /* the camera's rotation, 4.12 (0x8004EF28)  */
++#define C2WG_CAM_POS    0x800607F4u   /* its position, 24.8: x, y, z               */
++#define C2WG_GUARD      24            /* px past the frame still counted inside   */
++#define C2WG_FRAME_H    216           /* rows the game draws (y=12..227)           */
++
+ #ifndef C2WG_R32
+ extern uint32_t psx_read_word(uint32_t a);
+ extern uint16_t psx_read_half(uint32_t a);
+@@ -61,6 +80,10 @@
+ #define C2WG_R32(a) psx_read_word(a)
+ #define C2WG_R16(a) psx_read_half(a)
+ #define C2WG_R8(a)  psx_read_byte(a)
++#endif
++#ifndef C2WG_RAMPTR
++extern uint8_t *memory_get_ram_ptr(void);
++#define C2WG_RAMPTR() memory_get_ram_ptr()
+ #endif
+ 
+ typedef struct { float x, y, z; } C2wgVec;
+@@ -101,6 +124,42 @@
+     /* an object's entity: index + [+0x184] + [+0x188] (func_80019098) */
+     { 0x800190E0u, 0x8C430184u },  /* lw $v1, 388($v0)                    */
+     { 0x800190E4u, 0x8C420188u },  /* lw $v0, 392($v0)                    */
++    /* the camera: rotation 0x80060774 loaded for the world draw, position
++     * 0x800607F4 (24.8); each world record gets origin - camera, +16 its info
++     * item, +20 triangles, +24 quads, +28 vertices (0x80018344..0x800183CC) */
++    { 0x80011BB0u, 0x24840774u },  /* addiu $a0, $a0, 0x774               */
++    { 0x80011BB4u, 0x0C013BCAu },  /* jal 0x8004EF28 (load the rotation)  */
++    { 0x8004EF3Cu, 0x48C80000u },  /* ctc2 $t0, r0                        */
++    { 0x80018348u, 0x8C4207F4u },  /* lw $v0, 0x7F4($v0): camera x        */
++    { 0x80018350u, 0x00021203u },  /* sra $v0, $v0, 8                     */
++    { 0x8001835Cu, 0x8C4207F8u },  /* lw $v0, 0x7F8($v0): camera y        */
++    { 0x80018374u, 0x8C4207FCu },  /* lw $v0, 0x7FC($v0): camera z        */
++    { 0x8001838Cu, 0xAE040008u },  /* sw $a0, 8($s0): x offset            */
++    { 0x800183A8u, 0xAE060014u },  /* sw $a2, 20($s0): info               */
++    { 0x800183B4u, 0xAE020020u },  /* sw $v0, 32($s0): vertices           */
++    { 0x800183C0u, 0xAE020018u },  /* sw $v0, 24($s0): triangles          */
++    { 0x800183CCu, 0xAE02001Cu },  /* sw $v0, 28($s0): quads              */
++    /* the world renderer: no translation; vertices and polygons as decoded */
++    { 0x80041E9Cu, 0x48C02800u },  /* ctc2 $zero, r5                      */
++    { 0x80041EA0u, 0x48C03000u },  /* ctc2 $zero, r6                      */
++    { 0x80041EA4u, 0x48C03800u },  /* ctc2 $zero, r7                      */
++    { 0x80041F88u, 0x3C16FFF0u },  /* lui $s6, 0xFFF0: XY mask            */
++    { 0x80041F8Cu, 0x36D6FFF0u },  /* ori $s6, $s6, 0xFFF0                */
++    { 0x80041FDCu, 0x8E98028Cu },  /* lw $t8, 652($s4): quads             */
++    { 0x80041FE0u, 0x0019C8C0u },  /* sll $t9, $t9, 3: 8 bytes a quad     */
++    { 0x80042004u, 0x8E980288u },  /* lw $t8, 648($s4): triangles         */
++    { 0x8004202Cu, 0x8F33FFFCu },  /* lw $s3, -4($t9): word below         */
++    { 0x8004204Cu, 0x8E9F0280u },  /* lw $ra, 640($s4): XY offset         */
++    { 0x80042050u, 0x8E980284u },  /* lw $t8, 644($s4): Z offset          */
++    { 0x80042054u, 0x8E990290u },  /* lw $t9, 656($s4): vertices          */
++    { 0x80042070u, 0x00136C82u },  /* srl $t5, $s3, 18: vertex A          */
++    { 0x80042088u, 0x00137182u },  /* srl $t6, $s3, 6: vertex B           */
++    { 0x800420B4u, 0x001C7882u },  /* srl $t7, $gp, 2: vertex C           */
++    { 0x800420C0u, 0x31A2FFF0u },  /* andi $v0, $t5, 0xFFF0: Z            */
++    { 0x800421E8u, 0x001C7C82u },  /* srl $t7, $gp, 18: quad vertex C     */
++    { 0x80042220u, 0x001C2982u },  /* srl $a1, $gp, 6: quad vertex D      */
++    { 0x80011C10u, 0x8C420014u },  /* lw $v0, 20($v0): triangle count     */
++    { 0x80011C3Cu, 0x8C420010u },  /* lw $v0, 16($v0): vertex count       */
+ };
+ 
+ static int c2wg_code_ok(void)
+@@ -373,4 +432,178 @@
+     return c2wg_typed(c2wg_entry(C2WG_R32(v)), C2WG_T_SLST);
+ }
+ 
++/* ---- the camera and the frame -------------------------------------------- *
++ * The world renderer feeds the GTE camera-relative vertices in world units
++ * with no translation, under the rotation 0x8004EF28 loaded from 0x80060774.
++ * So a point's screen position is the GTE's RTPS of (point - camera). The
++ * camera's position is at 0x800607F4 (24.8). */
++typedef struct {
++    int32_t r[9];        /* rotation, 4.12, row major */
++    int32_t ofx, ofy;    /* screen offsets, 16.16 */
++    int32_t h;           /* projection distance */
++    int32_t margin;      /* extra columns per side the frame shows (0: 4:3) */
++    int ok;              /* this model put the game's own list on screen */
++} C2wgCam;
++
++static C2wgCam c2wg_cam;                    /* as at the last world draw */
++
++static void c2wg_cam_from_gte(C2wgCam *c, const uint32_t *ctrl)
++{
++    for (int i = 0; i < 4; i++) {
++        c->r[2 * i] = (int16_t)ctrl[i];
++        c->r[2 * i + 1] = (int16_t)(ctrl[i] >> 16);
++    }
++    c->r[8] = (int16_t)ctrl[4];
++    c->ofx = (int32_t)ctrl[24];
++    c->ofy = (int32_t)ctrl[25];
++    c->h = (int32_t)(ctrl[26] & 0xFFFFu);
++}
++
++/* The camera's position in world units. The game shifts y unsigned
++ * (0x80018368), harmless there - the renderer keeps only an offset's low 16
++ * bits, the same either way - but a whole position needs the signed value:
++ * camera y is negative in some levels. */
++static void c2wg_cam_pos(int32_t *x, int32_t *y, int32_t *z)
++{
++    *x = (int32_t)C2WG_R32(C2WG_CAM_POS) >> 8;
++    *y = (int32_t)C2WG_R32(C2WG_CAM_POS + 4u) >> 8;
++    *z = (int32_t)C2WG_R32(C2WG_CAM_POS + 8u) >> 8;
++}
++
++/* RTPS of a camera-relative point, without the widescreen squash: 0 unless it
++ * is in front of the eye. */
++static int c2wg_project(const C2wgCam *c, int32_t x, int32_t y, int32_t z, int *sx, int *sy)
++{
++    const int64_t m3 = ((int64_t)c->r[6] * x + (int64_t)c->r[7] * y + (int64_t)c->r[8] * z) >> 12;
++    if (m3 <= 0) return 0;
++    int64_t m1 = ((int64_t)c->r[0] * x + (int64_t)c->r[1] * y + (int64_t)c->r[2] * z) >> 12;
++    int64_t m2 = ((int64_t)c->r[3] * x + (int64_t)c->r[4] * y + (int64_t)c->r[5] * z) >> 12;
++    if (m1 < -0x8000) m1 = -0x8000; else if (m1 > 0x7FFF) m1 = 0x7FFF;
++    if (m2 < -0x8000) m2 = -0x8000; else if (m2 > 0x7FFF) m2 = 0x7FFF;
++    const int64_t sz = m3 > 0xFFFF ? 0xFFFF : m3;
++    /* the GTE's division saturates at 0x1FFFF once H reaches 2 * SZ */
++    int64_t q = (int64_t)c->h >= sz * 2 ? 0x1FFFF : (((int64_t)c->h << 16) + sz / 2) / sz;
++    if (q > 0x1FFFF) q = 0x1FFFF;
++    int64_t px = ((int64_t)c->ofx + m1 * q) >> 16, py = ((int64_t)c->ofy + m2 * q) >> 16;
++    if (px < -1024) px = -1024; else if (px > 1023) px = 1023;
++    if (py < -1024) py = -1024; else if (py > 1023) py = 1023;
++    *sx = (int)px;
++    *sy = (int)py;
++    return 1;
++}
++
++/* How a polygon's corners fall against the frame (camera-relative, world
++ * units): C2WG_OUT behind the eye or wholly past one edge of the frame
++ * `margin` columns wider each side (plus C2WG_GUARD); C2WG_IN43 inside but
++ * never outside the 4:3 columns; C2WG_WIDE reaching into the extra ones. */
++#define C2WG_OUT  0
++#define C2WG_IN43 1
++#define C2WG_WIDE 2
++static int c2wg_classify(const C2wgCam *c, int32_t (*v)[3], int n, int margin)
++{
++    const int lo = -margin - C2WG_GUARD, hi = 512 + margin + C2WG_GUARD;
++    int front = 0, behind = 0, aside = 0;
++    int all_l = 1, all_r = 1, all_t = 1, all_b = 1;
++    for (int i = 0; i < n; i++) {
++        int sx, sy;
++        if (!c2wg_project(c, v[i][0], v[i][1], v[i][2], &sx, &sy)) { behind++; continue; }
++        front++;
++        if (sx >= lo) all_l = 0;
++        if (sx < hi) all_r = 0;
++        if (sy >= -C2WG_GUARD) all_t = 0;
++        if (sy < C2WG_FRAME_H + C2WG_GUARD) all_b = 0;
++        if (sx < 0 || sx >= 512) aside = 1;
++    }
++    if (!front) return C2WG_OUT;
++    /* Crossing the eye plane: the corners in front bound nothing. */
++    if (behind) return aside ? C2WG_WIDE : C2WG_IN43;
++    if (all_l || all_r || all_t || all_b) return C2WG_OUT;
++    return aside ? C2WG_WIDE : C2WG_IN43;
++}
++
++/* ---- the current zone's worlds, as the renderer reads them --------------- */
++typedef struct {
++    uint32_t vbase, tbase, qbase;    /* vertices: XY words below vbase, Z above */
++    int nv, nt, nq;
++    uint32_t ox, oy, oz;             /* world origin - camera, this frame */
++} C2wgWorld;
++
++/* The worlds of `zone` (its header records, as 0x80018344 fills them each
++ * frame); how many could be read (0 on any doubt). */
++static int c2wg_worlds(uint32_t zone, C2wgWorld *w, int max)
++{
++    const uint32_t h = c2wg_item(zone, 0u);
++    if (!h || !c2wg_ram(h, 4u + 48u * C2WG_MAX_WORLDS)) return 0;
++    const uint32_t n = C2WG_R32(h);
++    if (n < 1u || n > (uint32_t)max || n > C2WG_MAX_WORLDS) return 0;
++    for (uint32_t i = 0; i < n; i++) {
++        const uint32_t rec = h + 4u + 48u * i;
++        const uint32_t info = C2WG_R32(rec + 16u), tri = C2WG_R32(rec + 20u);
++        const uint32_t quad = C2WG_R32(rec + 24u), vert = C2WG_R32(rec + 28u);
++        if (!c2wg_ram(info, 28u)) return 0;
++        const int nv = (int)C2WG_R32(info + 16u), nt = (int)C2WG_R32(info + 20u);
++        const int nq = (int)C2WG_R32(info + 24u);
++        if (nv < 0 || nv > 4096 || nt < 0 || nt > 2048 || nq < 0 || nq > 2048) return 0;
++        if (!c2wg_ram(vert, 6u * (uint32_t)nv + 4u) || !c2wg_ram(tri, 6u * (uint32_t)nt + 4u) ||
++            !c2wg_ram(quad, 8u * (uint32_t)nq + 4u))
++            return 0;
++        w[i].vbase = vert + 4u * (uint32_t)nv;
++        w[i].tbase = tri + 4u * (uint32_t)nt;
++        w[i].qbase = quad;
++        w[i].nv = nv; w[i].nt = nt; w[i].nq = nq;
++        w[i].ox = C2WG_R32(rec + 4u);
++        w[i].oy = C2WG_R32(rec + 8u) & 0xFFFEu;    /* as the renderer packs it */
++        w[i].oz = C2WG_R32(rec + 12u);
++    }
++    return (int)n;
++}
++
++static uint32_t c2wg_f32(const uint8_t *ram, uint32_t a)
++{
++    uint32_t v;
++    memcpy(&v, ram + (a & 0x1FFFFFu), 4);
++    return v;
++}
++
++static uint16_t c2wg_f16(const uint8_t *ram, uint32_t a)
++{
++    uint16_t v;
++    memcpy(&v, ram + (a & 0x1FFFFFu), 2);
++    return v;
++}
++
++/* A polygon's corners as the renderer feeds them to the GTE (camera-relative,
++ * 16-bit): 3 or 4, or 0 if its id does not fit its world. Quads give all four
++ * vertex fields (one variant draws three of them: a superset is safe here). */
++static int c2wg_poly(const uint8_t *ram, const C2wgWorld *ws, int nw, uint16_t id, int32_t v[4][3])
++{
++    const int wi = id >> 13;
++    if (wi >= nw) return 0;
++    const C2wgWorld *w = &ws[wi];
++    const uint32_t idx = id & 0x7FFu;
++    uint32_t vi[4];
++    int n;
++    if (id & 0x1800u) {
++        if ((int)idx >= w->nq) return 0;
++        const uint32_t w0 = c2wg_f32(ram, w->qbase + 8u * idx), w1 = c2wg_f32(ram, w->qbase + 8u * idx + 4u);
++        vi[0] = w0 >> 20; vi[1] = (w0 >> 8) & 0xFFFu; vi[2] = w1 >> 20; vi[3] = (w1 >> 8) & 0xFFFu;
++        n = 4;
++    } else {
++        if ((int)idx >= w->nt) return 0;
++        const uint32_t w0 = c2wg_f32(ram, w->tbase - 4u - 4u * idx);
++        const uint32_t hw = c2wg_f16(ram, w->tbase + 2u * idx);
++        vi[0] = w0 >> 20; vi[1] = (w0 >> 8) & 0xFFFu; vi[2] = (hw >> 4) & 0xFFFu;
++        n = 3;
++    }
++    for (int k = 0; k < n; k++) {
++        if ((int)vi[k] >= w->nv) return 0;
++        const uint32_t xy = c2wg_f32(ram, w->vbase - 4u - 4u * vi[k]);
++        const uint32_t z = c2wg_f16(ram, w->vbase + 2u * vi[k]);
++        v[k][0] = (int16_t)(uint16_t)((xy & 0xFFF0u) + w->ox);
++        v[k][1] = (int16_t)(uint16_t)(((xy >> 16) & 0xFFF0u) + w->oy);
++        v[k][2] = (int16_t)(uint16_t)((z & 0xFFF0u) + w->oz);
++    }
++    return n;
++}
++
+ #endif /* CRASH2_WIDE_GEOM_H */
+--- a/runtime/src/crash2_wide_slst.h
++++ b/runtime/src/crash2_wide_slst.h
+@@ -39,7 +39,24 @@
+  *     frame draws the game's list.
+  *   - Off (identity) at 4:3 and on frames presented 4:3.
+  *
+- * How far (crash2_wide_geom.h for the level data):
++ * What, when the camera can say (crash2_wide_geom.h for the level data):
++ *
++ *   - At the render call the GTE holds the rotation the world draw uses, and
++ *     the zone's world records the worlds' offsets from the camera - so every
++ *     polygon can be projected exactly as the renderer will. The candidates
++ *     are the polygons the lists within C2SL_FRUSTUM_K nodes either side (and
++ *     past the ends, the linked paths') hold that the game's list does not;
++ *     each frame, the ones reaching into the extra columns - outside the 4:3
++ *     frame, inside the wide one, in front of the eye - are drawn, nearest
++ *     node first, each after its anchor. Inside the 4:3 frame the game's own
++ *     list stays the whole truth: what it leaves out there it left out on
++ *     purpose (hidden behind something), and adding it would only risk
++ *     polygons sorting through walls.
++ *   - The model is checked once per node: it must put at least half of the
++ *     game's own list on screen, or that node is drawn with the node window
++ *     below instead. Objects (crash2_wide_spawn.h) get the same camera.
++ *
++ * How far, when it cannot (the node window):
+  *
+  *   - Paths that look at the play from the side (kind 3 and 8) move the camera
+  *     ACROSS the view, and there two nodes were far too few: what the wider
+@@ -90,6 +107,8 @@
+ #define C2SL_MAX_KW      20           /* nodes, the side-on window's longest   */
+ #define C2SL_SIDE_FALLBACK 7          /* nodes at 16:9 without enough objects  */
+ #define C2SL_CACHE       4            /* entries: this path, both joins, one   */
++#define C2SL_FRUSTUM_K   20           /* nodes either side the camera test reads */
++#define C2SL_MAX_CAND    6144         /* candidates for the camera test        */
+ #define C2SL_SENT        0xFFFF00
+ 
+ #ifndef C2SL_R32
+@@ -188,6 +207,7 @@
+ static int      c2sl_code = -1;             /* -1 unchecked, 0 changed, 1 ok   */
+ static int      c2sl_geo = -1;              /* crash2_wide_geom.h's words      */
+ static float    c2sl_side_scale;            /* see c2sl_window                 */
++static int      c2sl_margin = 85;           /* extra columns per side, live    */
+ static uint32_t c2sl_cap_entry, c2sl_cap_cam;
+ static C2slEntry c2sl_cache[C2SL_CACHE];
+ static uint32_t c2sl_clock;
+@@ -198,14 +218,23 @@
+     uint32_t entry, list; int node, count, k, kw, first, last;
+     uint32_t join[2];
+     int valid, widen, added;
++    int model;            /* camera model on the game's list: -1 untried, 0, 1 */
+ } c2sl_built;
++/* The node window's list (frames the camera test cannot judge), and the camera
++ * test's candidates: id, the game-list position it follows, by that position. */
++static uint16_t c2sl_fb[C2SL_MAX_LIST], c2sl_out[C2SL_MAX_LIST];
++static int      c2sl_fb_n;
++static uint16_t c2sl_cid[C2SL_MAX_CAND], c2sl_cat[C2SL_MAX_CAND], c2sl_corder[C2SL_MAX_CAND];
++static uint8_t  c2sl_ckeep[C2SL_MAX_CAND];
++static int      c2sl_ncand;
++static int      c2sl_model_seen, c2sl_model_total;
+ /* The side-on window of one path. */
+ static struct { uint32_t cam, zone; int nodes, base, margin, kw; } c2sl_side;
+ static C2wgVec c2sl_pts[C2WG_MAX_PTS];
+ static float    c2sl_reach[512];
+ static unsigned long long c2sl_n_built, c2sl_n_used, c2sl_n_mismatch, c2sl_n_bad,
+                           c2sl_n_prim_skips, c2sl_added_max, c2sl_n_side,
+-                          c2sl_n_joined;
++                          c2sl_n_joined, c2sl_n_frustum, c2sl_n_model_bad;
+ static uint16_t c2sl_tmp_a[C2SL_MAX_LIST], c2sl_tmp_b[C2SL_MAX_LIST];
+ static uint16_t c2sl_item[C2SL_MAX_ITEM_HW];
+ static uint16_t c2sl_merged[C2SL_MAX_LIST], c2sl_next[C2SL_MAX_LIST];
+@@ -558,6 +587,106 @@
+     return kw < k ? k : kw;
+ }
+ 
++/* The camera test's candidates: every polygon the lists within k nodes of
++ * `node` hold (past the path's ends, the joined paths', mapped to our worlds)
++ * that the game's list (c2sl_game, m long) does not - nearest node first, each
++ * with the game-list position it would follow: that of the last polygon before
++ * it in its own list that the game's list holds (0: after the first). Then
++ * c2sl_corder holds them by that position, stably. */
++static int c2sl_candidates(const C2slEntry *e, int node, int k, int m, const C2slJoin *joins)
++{
++    static uint16_t start[C2SL_MAX_LIST + 1];
++    memset(c2sl_have, 0, sizeof c2sl_have);
++    for (int i = 0; i < m; ++i) {
++        const uint16_t key = c2sl_key(c2sl_game[i]);
++        c2sl_have[key >> 3] |= (uint8_t)(1u << (key & 7));
++        c2sl_pos[key] = (uint16_t)i;
++    }
++    int n = 0;
++    for (int j = 1; j <= k && n < C2SL_MAX_CAND; ++j) {
++        for (int side = -1; side <= 1 && n < C2SL_MAX_CAND; side += 2) {
++            int nn = 0;
++            const uint16_t *nl = c2sl_list_at(e, node + side * j, joins, &nn);
++            if (!nl) continue;
++            int anchor = 0;
++            for (int i = 0; i < nn && n < C2SL_MAX_CAND; ++i) {
++                const uint16_t key = c2sl_key(nl[i]);
++                if (c2sl_have[key >> 3] & (1u << (key & 7))) {
++                    if (c2sl_pos[key] < m) anchor = c2sl_pos[key];
++                    continue;
++                }
++                c2sl_have[key >> 3] |= (uint8_t)(1u << (key & 7));
++                c2sl_pos[key] = 0xFFFFu;                  /* not the game's */
++                c2sl_cid[n] = nl[i];
++                c2sl_cat[n] = (uint16_t)anchor;
++                n++;
++            }
++        }
++    }
++    memset(start, 0, sizeof(uint16_t) * (size_t)(m + 1));
++    for (int c = 0; c < n; ++c) start[c2sl_cat[c] + 1]++;
++    for (int p = 1; p <= m; ++p) start[p] = (uint16_t)(start[p] + start[p - 1]);
++    for (int c = 0; c < n; ++c) c2sl_corder[start[c2sl_cat[c]]++] = (uint16_t)c;
++    return n;
++}
++
++/* The camera test, for this frame: the camera the world draw is about to use
++ * (the GTE's rotation and projection; the worlds' offsets from the camera, as
++ * the renderer reads them). Once per node the model must put most of the
++ * game's own list on screen, or this does nothing for that node. Then the
++ * candidates that reach into the extra columns are kept, nearest node first,
++ * at most as many again as the game's list (+32), and each goes after its
++ * anchor. 0 = cannot judge this frame. */
++static int c2sl_frustum(CPUState *cpu, int count, int *out_m)
++{
++    static C2wgWorld ws[C2WG_MAX_WORLDS];
++    const uint32_t zone = c2wg_typed(C2SL_R32(C2WG_ZONE), C2WG_T_ZONE);
++    const int nw = zone ? c2wg_worlds(zone, ws, C2WG_MAX_WORLDS) : 0;
++    const uint8_t *ram = C2WG_RAMPTR();
++    if (nw <= 0 || !ram) return 0;
++    C2wgCam cam;
++    c2wg_cam_from_gte(&cam, cpu->gte_ctrl);
++    cam.margin = c2sl_margin;
++    int32_t v[4][3];
++    if (c2sl_built.model < 0) {
++        int seen = 0, total = 0;
++        for (int i = 0; i < count; ++i) {
++            const int n = c2wg_poly(ram, ws, nw, c2sl_game[i], v);
++            if (!n) continue;
++            total++;
++            if (c2wg_classify(&cam, v, n, 0) != C2WG_OUT) seen++;
++        }
++        c2sl_built.model = total >= 8 && seen * 2 >= total;
++        if (!c2sl_built.model) c2sl_n_model_bad++;
++        c2sl_model_seen = seen;
++        c2sl_model_total = total;
++    }
++    cam.ok = c2sl_built.model;
++    c2wg_cam = cam;                                    /* crash2_wide_spawn.h's */
++    if (!cam.ok) return 0;
++    int budget = count + 32;
++    if (budget > C2SL_MAX_LIST - count) budget = C2SL_MAX_LIST - count;
++    for (int c = 0; c < c2sl_ncand; ++c) {
++        c2sl_ckeep[c] = 0;
++        if (budget <= 0) continue;
++        const int n = c2wg_poly(ram, ws, nw, c2sl_cid[c], v);
++        if (n && c2wg_classify(&cam, v, n, cam.margin) == C2WG_WIDE) {
++            c2sl_ckeep[c] = 1;
++            budget--;
++        }
++    }
++    int w = 0, a = 0;
++    for (int p = 0; p < count; ++p) {
++        c2sl_out[w++] = c2sl_game[p];
++        while (a < c2sl_ncand && c2sl_cat[c2sl_corder[a]] == p) {
++            if (c2sl_ckeep[c2sl_corder[a]]) c2sl_out[w++] = c2sl_cid[c2sl_corder[a]];
++            a++;
++        }
++    }
++    *out_m = w;
++    return 1;
++}
++
+ static int c2sl_code_ok(CPUState *cpu)
+ {
+     (void)cpu;
+@@ -568,8 +697,6 @@
+ 
+ /* k for this frame, and the side-on scale: the columns revealed per side over
+  * the 4:3 half width (256), the launcher's 2 as the geometry says. */
+-static int c2sl_margin = 85;
+-
+ static int c2sl_window(void)
+ {
+     GpuWsDebug ws;
+@@ -591,6 +718,7 @@
+     c2sl_cap_entry = c2sl_cap_cam = 0;
+     c2sl_built.valid = 0;
+     memset(&c2sl_side, 0, sizeof c2sl_side);
++    c2wg_cam.ok = 0;
+ }
+ 
+ void crash2_wide_slst_control(int k, int reset)
+@@ -602,18 +730,26 @@
+     }
+     if (reset)
+         c2sl_n_built = c2sl_n_used = c2sl_n_mismatch = c2sl_n_bad =
+-            c2sl_n_prim_skips = c2sl_added_max = c2sl_n_side = c2sl_n_joined = 0;
++            c2sl_n_prim_skips = c2sl_added_max = c2sl_n_side = c2sl_n_joined =
++            c2sl_n_frustum = c2sl_n_model_bad = 0;
+ }
+ 
+ /* out[6] side = lists built with a side-on window, out[7] joined = lists that
+- * took polygons from a joined path, out[8] = the window last used (nodes). */
+-void crash2_wide_slst_stats(unsigned long long out[9], int *base_k, int *k,
++ * took polygons from a joined path, out[8] = the window last used (nodes),
++ * out[9] camera = frames drawn with the camera test, out[10] model_bad = nodes
++ * where the camera model did not put the game's own list on screen (the node
++ * window drew those), out[11] model_pct = the share of the game's list the
++ * model put on screen at the last node checked. */
++void crash2_wide_slst_stats(unsigned long long out[12], int *base_k, int *k,
+                             int *code_ok, int *added)
+ {
+     out[0] = c2sl_n_built;   out[1] = c2sl_n_used;  out[2] = c2sl_n_mismatch;
+     out[3] = c2sl_n_bad;     out[4] = c2sl_n_prim_skips; out[5] = c2sl_added_max;
+     out[6] = c2sl_n_side;    out[7] = c2sl_n_joined;
+     out[8] = c2sl_last_kw < 0 ? 0u : (unsigned long long)c2sl_last_kw;
++    out[9] = c2sl_n_frustum; out[10] = c2sl_n_model_bad;
++    out[11] = c2sl_model_total > 0
++        ? (unsigned long long)(100 * c2sl_model_seen / c2sl_model_total) : 0u;
+     if (base_k)  *base_k = c2sl_base_k < 0 ? 0 : c2sl_base_k;
+     if (k)       *k = c2sl_last_k < 0 ? 0 : c2sl_last_k;
+     if (code_ok) *code_ok = c2sl_code;
+@@ -646,7 +782,7 @@
+         fprintf(stdout, "psxrecomp: widescreen scenery range: %d camera node%s "
+                         "either side (crash2_wide_slst)\n", k, k == 1 ? "" : "s");
+     c2sl_last_k = k;
+-    if (k <= 0) return;
++    if (k <= 0) { c2wg_cam.ok = 0; return; }
+ 
+     const uint32_t list = cpu->gpr[4];
+     if (list != C2SL_R32(C2SL_LIST_PTR) || !c2sl_is_ram(list, 4)) return;
+@@ -699,29 +835,56 @@
+         }
+         c2sl_last_kw = kw;
+         c2sl_built.kw = kw;
+-        c2sl_built.join[0] = joins[0].entry;
+-        c2sl_built.join[1] = joins[1].entry;
+-        /* At most half as many again: by polygon, two nodes either side add
+-         * 14% on average and 38% at the 99th percentile across the game. A
+-         * side-on window adds about 60% (its 90th percentile, 100%): as many
+-         * again there. */
++        /* The candidates for the camera test (C2SL_FRUSTUM_K nodes either
++         * side, through the joins), before the node window below reuses the
++         * merge buffers. */
++        C2slJoin fj[2];
++        memcpy(fj, joins, sizeof fj);
++        c2sl_ncand = 0;
++        c2sl_built.model = -1;
++        if (c2sl_geo == 1) {
++            const uint32_t zone = c2wg_zone_of(c2sl_cap_cam);
++            if (zone && zone == C2SL_R32(C2WG_ZONE)) {
++                if (node - C2SL_FRUSTUM_K < 0 && !fj[0].e)
++                    c2sl_join(c2sl_cap_cam, e->nodes, 0, zone, &fj[0]);
++                if (node + C2SL_FRUSTUM_K > e->nodes - 1 && !fj[1].e)
++                    c2sl_join(c2sl_cap_cam, e->nodes, 1, zone, &fj[1]);
++                c2sl_ncand = c2sl_candidates(e, node, C2SL_FRUSTUM_K, count, fj);
++            }
++        }
++        c2sl_built.join[0] = fj[0].entry;
++        c2sl_built.join[1] = fj[1].entry;
++        /* The node window, for frames the camera test cannot judge. At most
++         * half as many again: by polygon, two nodes either side add 14% on
++         * average and 38% at the 99th percentile across the game. A side-on
++         * window adds about 60% (its 90th percentile, 100%): as many again
++         * there. */
+         int cap = side_on ? count + count + 32 : count + count / 2 + 32;
+         if (cap > C2SL_MAX_LIST) cap = C2SL_MAX_LIST;
+         const int m = c2sl_merge(e, node, kw, count, cap, joins, &joined);
+-        if (m <= count) return;
+-        if (side_on) c2sl_n_side++;
+-        if (joined) c2sl_n_joined++;
+-        if (!c2sl_buf) c2sl_buf = C2SL_ALLOC(4u + 2u * C2SL_MAX_LIST);
+-        if (!c2sl_buf) return;
+-        C2SL_W16(c2sl_buf, (uint16_t)m);
+-        C2SL_W16(c2sl_buf + 2u, C2SL_R16(list + 2u));
+-        for (int i = 0; i < m; ++i) C2SL_W16(c2sl_buf + 4u + 2u * (uint32_t)i, c2sl_merged[i]);
++        c2sl_fb_n = m;
++        memcpy(c2sl_fb, c2sl_merged, sizeof(uint16_t) * (size_t)m);
++        if (m > count) {
++            if (side_on) c2sl_n_side++;
++            if (joined) c2sl_n_joined++;
++        }
+         c2sl_built.widen = 1;
+-        c2sl_built.added = m - count;
+-        if ((unsigned long long)(m - count) > c2sl_added_max) c2sl_added_max = (unsigned long long)(m - count);
+         c2sl_n_built++;
+     }
+     if (!c2sl_built.widen) return;
++
++    /* This frame's list: the camera test's when it can judge, else the node
++     * window's. */
++    const uint16_t *out = c2sl_fb;
++    int m = c2sl_fb_n;
++    if (c2sl_ncand > 0 && c2sl_frustum(cpu, count, &m)) {
++        out = c2sl_out;
++        c2sl_n_frustum++;
++    }
++    if (m <= count) return;
++    const int added = m - count;
++    c2sl_built.added = added;
++    if ((unsigned long long)added > c2sl_added_max) c2sl_added_max = (unsigned long long)added;
+ 
+     /* Room in this frame's primitive buffer for every added polygon. */
+     const uint32_t frame = cpu->gpr[5];
+@@ -729,9 +892,14 @@
+     const uint32_t base = C2SL_R32(frame + 4), cur = C2SL_R32(frame + 8);
+     if (!c2sl_is_ram(base, C2SL_PRIM_SIZE) || cur < base) return;
+     const uint32_t used = cur - base;
+-    const uint32_t need = C2SL_PRIM_POLY * (uint32_t)c2sl_built.added + C2SL_PRIM_RESERVE;
++    const uint32_t need = C2SL_PRIM_POLY * (uint32_t)added + C2SL_PRIM_RESERVE;
+     if (used >= C2SL_PRIM_SIZE || C2SL_PRIM_SIZE - used < need) { c2sl_n_prim_skips++; return; }
+ 
++    if (!c2sl_buf) c2sl_buf = C2SL_ALLOC(4u + 2u * C2SL_MAX_LIST);
++    if (!c2sl_buf) return;
++    C2SL_W16(c2sl_buf, (uint16_t)m);
++    C2SL_W16(c2sl_buf + 2u, C2SL_R16(list + 2u));
++    for (int i = 0; i < m; ++i) C2SL_W16(c2sl_buf + 4u + 2u * (uint32_t)i, out[i]);
+     cpu->gpr[4] = c2sl_buf;
+     c2sl_n_used++;
+ }
+--- a/runtime/src/crash2_wide_spawn.h
++++ b/runtime/src/crash2_wide_spawn.h
+@@ -54,19 +54,28 @@
+  *     Home menu, a 4:3 FMV), the next node re-checks every queued entity, not
+  *     just the nearby ones, so nothing we kept can be left behind.
+  *
+- * How far, on paths that look at the play from the side (kind 3 and 8, see
+- * crash2_wide_geom.h): there the camera moves ACROSS the view, and k nodes
+- * were far too few. An object enters the 4:3 frame where its offset along
+- * the path from the camera is a, about its distance off the path; the wider
+- * frame sees it a * margin/256 earlier along the path (a third, at 16:9), and
+- * keeps it as much longer. So on those paths each object's own reach, in
+- * nodes, is that distance over the node spacing at the node where the
+- * original starts or stops showing it - read from its position and the path's
+- * points. Across the game that is 5 to 7 nodes typically, past 14 for some,
+- * at 16:9; k (2) covered 1% of them. Never less than k, never more than
+- * C2WS_MAX_REACH; where the geometry is not understood, k. Other paths move
+- * the camera INTO the view, where things appear far ahead, near the middle:
+- * k there, as before. The load and unload rules above hold for every reach.
++ * Which, when the camera can say: crash2_wide_slst.h hands on the camera of
++ * the last world draw once its model has put the game's own polygon list on
++ * screen. An object the original has not spawned (or has just killed) is
++ * then wanted while its own position projects into the extra columns -
++ * outside the 4:3 frame, its body overlapping the wide one, in front of the
++ * eye - whichever way the path runs. Inside the 4:3 frame the original's
++ * lists decide, as before. The rules for loads and unloads above still hold.
++ *
++ * How far, when it cannot - on paths that look at the play from the side
++ * (kind 3 and 8, see crash2_wide_geom.h): there the camera moves ACROSS the
++ * view, and k nodes were far too few. An object enters the 4:3 frame where
++ * its offset along the path from the camera is a, about its distance off the
++ * path; the wider frame sees it a * margin/256 earlier along the path (a
++ * third, at 16:9), and keeps it as much longer. So on those paths each
++ * object's own reach, in nodes, is that distance over the node spacing at the
++ * node where the original starts or stops showing it - read from its position
++ * and the path's points. Across the game that is 5 to 7 nodes typically, past
++ * 14 for some, at 16:9; k (2) covered 1% of them. Never less than k, never
++ * more than C2WS_MAX_REACH; where the geometry is not understood, k. Other
++ * paths move the camera INTO the view, where things appear far ahead, near
++ * the middle: k there, as before. The load and unload rules above hold for
++ * every reach.
+  *
+  * Off unless PSX_CRASH2_WIDE_SPAWN > 0. The window is 0 - retire only - at 4:3
+  * and on frames presented 4:3 (same gate as crash2_wide_bbox.h). Every code
+@@ -93,6 +102,7 @@
+ #define C2WS_MAX_EVENTS  48
+ #define C2WS_MAX_K       8
+ #define C2WS_MAX_REACH   24           /* nodes, an object's own reach (side-on) */
++#define C2WS_BODY        384          /* world units either side of an object  */
+ 
+ #ifndef C2WS_R32
+ extern uint32_t psx_read_word(uint32_t a);
+@@ -119,7 +129,8 @@
+ static struct { int armed; uint32_t ra, cam; int node, dir, k; } c2ws_call;
+ static unsigned long long c2ws_arrivals, c2ws_early, c2ws_kept, c2ws_retired,
+                           c2ws_unsafe_load, c2ws_unsafe_unload, c2ws_full,
+-                          c2ws_bad, c2ws_side, c2ws_side_miss;
++                          c2ws_bad, c2ws_side, c2ws_side_miss, c2ws_cam_yes,
++                          c2ws_cam_no;
+ static C2wgVec c2ws_pts[C2WG_MAX_PTS];  /* the side-on path's points            */
+ 
+ static int c2ws_is_ram(uint32_t a) { return a >= 0x80000000u && a < 0x801FFFF0u; }
+@@ -264,18 +275,46 @@
+     return r;
+ }
+ 
++/* Whether this entity's object, at its own position, stands in the extra
++ * columns of the frame the last world draw used (crash2_wide_slst.h's camera
++ * model): in front, its body (C2WS_BODY either side) overlapping the wide
++ * frame, its middle outside the 4:3 one - inside that, the original's lists
++ * say what is seen. 1 yes, 0 no, -1 cannot tell (the node reach decides). */
++static int c2ws_in_margin(const C2wsCand *c, uint32_t zone)
++{
++    if (!c2wg_cam.ok || !zone) return -1;
++    C2wgVec p;
++    if (!c2wg_object_pos(zone, c->value, &p)) return -1;
++    int32_t cx, cy, cz;
++    c2wg_cam_pos(&cx, &cy, &cz);
++    const int32_t x = (int32_t)p.x - cx, y = (int32_t)p.y - cy, z = (int32_t)p.z - cz;
++    const C2wgCam *m = &c2wg_cam;
++    const int64_t depth = ((int64_t)m->r[6] * x + (int64_t)m->r[7] * y + (int64_t)m->r[8] * z) >> 12;
++    int sx, sy;
++    if (depth <= 0 || !c2wg_project(m, x, y, z, &sx, &sy)) { c2ws_cam_no++; return 0; }
++    int64_t body = (int64_t)m->h * C2WS_BODY / depth;
++    if (body > 256) body = 256;
++    const int lo = -m->margin - C2WG_GUARD - (int)body, hi = 512 + m->margin + C2WG_GUARD + (int)body;
++    const int in = sx >= lo && sx < hi && sy >= -C2WG_GUARD - (int)body &&
++                   sy < C2WG_FRAME_H + C2WG_GUARD + (int)body && (sx < 0 || sx >= 512);
++    if (in) c2ws_cam_yes++; else c2ws_cam_no++;
++    return in;
++}
++
+ /* Whether the window wants an entity the original does not, at node n. */
+ static int c2ws_window_wants(const C2wsCand *c, const C2wsProp *la,
+                              const C2wsProp *lb, int n, int d, int k,
+-                             const C2wsSide *side)
+-{
+-    const int far = side ? C2WS_MAX_REACH : k;
++                             const C2wsSide *side, uint32_t zone)
++{
++    /* The camera, when it can judge; else the node reach. */
++    const int vis = c2ws_in_margin(c, zone);
++    const int far = (side || vis >= 0) ? C2WS_MAX_REACH : k;
+     /* Ahead in the direction of travel: spawn early, if its data was already
+      * requested (no load row up to the node where the original spawns it). */
+     for (int t = 1; t <= far; t++) {
+         const int x = n + d * t;
+         if (!c2ws_present(c, x)) continue;
+-        if (t > c2ws_reach(c, x, k, side)) break;
++        if (vis >= 0 ? !vis : t > c2ws_reach(c, x, k, side)) break;
+         for (int j = n + d; ; j += d) {
+             if (c2ws_loads_at(la, lb, j, d)) { c2ws_unsafe_load++; goto behind; }
+             if (j == x) break;
+@@ -288,7 +327,7 @@
+     for (int t = 1; t <= far; t++) {
+         const int x = n - d * t;
+         if (!c2ws_present(c, x)) continue;
+-        if (t > c2ws_reach(c, x, k, side)) return 0;
++        if (vis >= 0 ? !vis : t > c2ws_reach(c, x, k, side)) return 0;
+         for (int j = x + d; ; j += d) {
+             if (c2ws_unloads_at(la, lb, j, d)) { c2ws_unsafe_unload++; return 0; }
+             if (j == n) break;
+@@ -310,15 +349,17 @@
+     }
+     const int d = dir == 2 ? 1 : -1;
+     if (k < 0) k = 0;
+-    /* A side-on path: each object gets its own reach (crash2_wide_geom.h). */
++    /* The camera decides where it can (c2ws_in_margin); else, on a side-on
++     * path, each object's own reach (crash2_wide_geom.h); else k. */
++    const uint32_t zone = (k > 0 && c2ws_geo == 1) ? c2wg_zone_of(cam) : 0u;
+     C2wsSide side_on, *side = NULL;
+-    if (k > 0 && c2ws_side_scale > 0.0f && c2ws_geo == 1 && c2wg_side_on(cam)) {
+-        side_on.zone = c2wg_zone_of(cam);
+-        side_on.n = side_on.zone ? c2wg_path_points(cam, c2ws_pts, C2WG_MAX_PTS) : 0;
++    if (zone && c2ws_side_scale > 0.0f && c2wg_side_on(cam)) {
++        side_on.zone = zone;
++        side_on.n = c2wg_path_points(cam, c2ws_pts, C2WG_MAX_PTS);
+         side_on.pts = c2ws_pts;
+         if (side_on.n > 0) side = &side_on;
+     }
+-    const int reach = side ? C2WS_MAX_REACH : k;
++    const int reach = (side || (zone && c2wg_cam.ok)) ? C2WS_MAX_REACH : k;
+ 
+     /* Candidates: every entity with a row close enough for the window to
+      * change its state here, and - after a load or a window change - every
+@@ -380,7 +421,7 @@
+          * last node an A row there); anything else is left to the game. */
+         if (cd->e[0].on == 0 || cd->e[cd->n - 1].on == 1) continue;
+         if (c2ws_present(cd, n)) continue;   /* the original's, entirely */
+-        const int want = c2ws_window_wants(cd, &la, &lb, n, d, k, side);
++        const int want = c2ws_window_wants(cd, &la, &lb, n, d, k, side, zone);
+         const int qi = c2ws_q_find(cd->key);
+         if (qi == -2) { c2ws_bad++; return; }
+         const uint32_t act = qi >= 0 ? C2WS_R32(C2WS_Q_BASE + (uint32_t)qi * 12u + 8u) : 0u;
+@@ -465,18 +506,21 @@
+     if (reset) {
+         c2ws_arrivals = c2ws_early = c2ws_kept = c2ws_retired = 0;
+         c2ws_unsafe_load = c2ws_unsafe_unload = c2ws_full = c2ws_bad = 0;
+-        c2ws_side = c2ws_side_miss = 0;
++        c2ws_side = c2ws_side_miss = c2ws_cam_yes = c2ws_cam_no = 0;
+     }
+ }
+ 
+ /* out[8] side = reaches taken from an object's position on a side-on path,
+- * out[9] side_miss = side-on objects whose position did not fit (k instead). */
+-void crash2_wide_spawn_stats(unsigned long long out[10], int *base_k, int *k, int *sig)
++ * out[9] side_miss = side-on objects whose position did not fit (k instead),
++ * out[10] cam_yes / out[11] cam_no = objects the camera found in / not in the
++ * extra columns (the camera decided for them). */
++void crash2_wide_spawn_stats(unsigned long long out[12], int *base_k, int *k, int *sig)
+ {
+     out[0] = c2ws_arrivals;  out[1] = c2ws_early;          out[2] = c2ws_kept;
+     out[3] = c2ws_retired;   out[4] = c2ws_unsafe_load;    out[5] = c2ws_unsafe_unload;
+     out[6] = c2ws_full;      out[7] = c2ws_bad;
+     out[8] = c2ws_side;      out[9] = c2ws_side_miss;
++    out[10] = c2ws_cam_yes;  out[11] = c2ws_cam_no;
+     if (base_k) *base_k = c2ws_base_k < 0 ? 0 : c2ws_base_k;
+     if (k) *k = c2ws_last_k < 0 ? 0 : c2ws_last_k;
+     if (sig) *sig = c2ws_sig;
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8315,23 +8315,25 @@
+  * full = spawns skipped because the game's queue was near its end; bad =
+  * data this did not understand (it then leaves the game alone); side = reaches
+  * taken from an object's position on a side-on path; side_miss = side-on
+- * objects whose position did not fit (k used instead). */
++ * objects whose position did not fit (k used instead); cam_yes / cam_no =
++ * objects the camera found in / not in the extra columns (it decided them). */
+ extern void crash2_wide_spawn_control(int k, int reset);
+-extern void crash2_wide_spawn_stats(unsigned long long out[10], int *base_k, int *k,
++extern void crash2_wide_spawn_stats(unsigned long long out[12], int *base_k, int *k,
+                                     int *sig);
+ static void handle_c2_spawn(int id, const char *json)
+ {
+     crash2_wide_spawn_control(json_get_int(json, "k", -1),
+                               json_get_int(json, "reset", 0));
+-    unsigned long long s[10];
++    unsigned long long s[12];
+     int base_k = 0, k = 0, sig = 0;
+     crash2_wide_spawn_stats(s, &base_k, &k, &sig);
+     send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
+              "\"arrivals\":%llu,\"early\":%llu,\"kept\":%llu,\"retired\":%llu,"
+              "\"unsafe_load\":%llu,\"unsafe_unload\":%llu,\"full\":%llu,"
+-             "\"bad\":%llu,\"side\":%llu,\"side_miss\":%llu}",
++             "\"bad\":%llu,\"side\":%llu,\"side_miss\":%llu,"
++             "\"cam_yes\":%llu,\"cam_no\":%llu}",
+              id, base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+-             s[8], s[9]);
++             s[8], s[9], s[10], s[11]);
+ }
+ 
+ /* Crash 2's per-polygon screen test in native-wide (crash2_wide_reject.h).
+@@ -8370,23 +8372,27 @@
+  * alone); bad = SLST entries this could not rebuild; prim_skips = frames whose
+  * primitive buffer had too little room left (drawn as the game built them);
+  * side = lists built with a side-on path's own window; joined = lists that
+- * took polygons from the path joined at an end; kw = the window last used. */
++ * took polygons from the path joined at an end; kw = the window last used;
++ * camera = frames drawn with the camera test; model_bad = nodes where the
++ * camera model did not put the game's own list on screen; model_pct = the
++ * share it put on screen at the last node checked. */
+ extern void crash2_wide_slst_control(int k, int reset);
+-extern void crash2_wide_slst_stats(unsigned long long out[9], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[12], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ static void handle_c2_slst(int id, const char *json)
+ {
+     crash2_wide_slst_control(json_get_int(json, "k", -1),
+                              json_get_int(json, "reset", 0));
+-    unsigned long long s[9];
++    unsigned long long s[12];
+     int base_k = 0, k = 0, code_ok = 0, added = 0;
+     crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+     send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
+              "\"added\":%d,\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,"
+              "\"bad\":%llu,\"prim_skips\":%llu,\"added_max\":%llu,"
+-             "\"side\":%llu,\"joined\":%llu,\"kw\":%llu}",
++             "\"side\":%llu,\"joined\":%llu,\"kw\":%llu,\"camera\":%llu,"
++             "\"model_bad\":%llu,\"model_pct\":%llu}",
+              id, base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
+-             s[6], s[7], s[8]);
++             s[6], s[7], s[8], s[9], s[10], s[11]);
+ }
+ 
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -77,7 +77,7 @@
+ extern int      crash2_cheat_god_active(void);
+ /* Widescreen object window (crash2_wide_spawn.h): whether it is doing
+  * anything, so a report of an object misbehaving at a screen edge can say. */
+-extern void crash2_wide_spawn_stats(unsigned long long out[10], int *base_k, int *k,
++extern void crash2_wide_spawn_stats(unsigned long long out[12], int *base_k, int *k,
+                                     int *sig);
+ /* Native-wide polygon test (crash2_wide_reject.h): a report of missing
+  * polygons at the edges in native-wide can say whether it ran. */
+@@ -85,7 +85,7 @@
+                                      int *code_ok, int *off);
+ /* Widescreen scenery range (crash2_wide_slst.h): whether it is drawing the
+  * neighbouring nodes' polygons, and why not when it is not. */
+-extern void crash2_wide_slst_stats(unsigned long long out[9], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[12], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+@@ -929,18 +929,19 @@
+         const int gl_n = gl_renderer_cost_json(gl_json, sizeof(gl_json));
+         if (gl_n <= 0 || gl_n >= (int)sizeof(gl_json)) strcpy(gl_json, "null");
+     }
+-    char ws_json[384];
++    char ws_json[448];
+     {
+-        unsigned long long s[10];
++        unsigned long long s[12];
+         int base_k = 0, k = 0, sig = 0;
+         crash2_wide_spawn_stats(s, &base_k, &k, &sig);
+         snprintf(ws_json, sizeof(ws_json),
+                  "{\"base_k\":%d,\"k\":%d,\"code_ok\":%d,\"arrivals\":%llu,"
+                  "\"early\":%llu,\"kept\":%llu,\"retired\":%llu,"
+                  "\"unsafe_load\":%llu,\"unsafe_unload\":%llu,\"full\":%llu,"
+-                 "\"bad\":%llu,\"side\":%llu,\"side_miss\":%llu}",
++                 "\"bad\":%llu,\"side\":%llu,\"side_miss\":%llu,"
++                 "\"cam_yes\":%llu,\"cam_no\":%llu}",
+                  base_k, k, sig, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+-                 s[8], s[9]);
++                 s[8], s[9], s[10], s[11]);
+     }
+     char wr_json[160];
+     {
+@@ -952,18 +953,19 @@
+                  "\"kept\":%llu,\"mismatch\":%llu}",
+                  on, code_ok, off, s[0], s[1], s[2]);
+     }
+-    char sl_json[320];
++    char sl_json[384];
+     {
+-        unsigned long long s[9];
++        unsigned long long s[12];
+         int base_k = 0, k = 0, code_ok = 0, added = 0;
+         crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+         snprintf(sl_json, sizeof(sl_json),
+                  "{\"base_k\":%d,\"k\":%d,\"code_ok\":%d,\"added\":%d,"
+                  "\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,\"bad\":%llu,"
+                  "\"prim_skips\":%llu,\"added_max\":%llu,\"side\":%llu,"
+-                 "\"joined\":%llu,\"kw\":%llu}",
++                 "\"joined\":%llu,\"kw\":%llu,\"camera\":%llu,"
++                 "\"model_bad\":%llu,\"model_pct\":%llu}",
+                  base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
+-                 s[6], s[7], s[8]);
++                 s[6], s[7], s[8], s[9], s[10], s[11]);
+     }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),

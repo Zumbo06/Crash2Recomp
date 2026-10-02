@@ -47,11 +47,12 @@ static uint32_t mod_alloc(uint32_t n)
 #define C2WG_R32(a)    r32(a)       /* crash2_wide_geom.h */
 #define C2WG_R16(a)    r16(a)
 #define C2WG_R8(a)     ((uint8_t)(r16((a) & ~1u) >> (((a) & 1u) * 8u)))
+#define C2WG_RAMPTR()  g_ram
 #define C2SL_W16(a, v) w16((a), (v))
 #define C2SL_ALLOC(n)  mod_alloc(n)
 
 /* ---- the runtime pieces the header touches ------------------------------ */
-typedef struct { uint32_t gpr[32]; } CPUState;
+typedef struct { uint32_t gpr[32]; uint32_t gte_data[32]; uint32_t gte_ctrl[32]; } CPUState;
 typedef struct { int mode, active, present_native_43, x_margin, nw_extra; } GpuWsDebug;
 static GpuWsDebug g_ws = { 2, 0, 0, 85, 170 };
 static void gpu_ws_get_debug(GpuWsDebug *o) { *o = g_ws; }

@@ -3674,3 +3674,126 @@ covers both.
   borders are left alone.
 - **The counter.** `border_fills` in the heartbeat's `gl` climbs with wide
   presents.
+
+## Widescreen, part 12: side-on paths, path ends, and then the camera itself
+
+Patches 0051 and 0052.
+
+### What was still wrong after part 10
+
+Both edge ranges (objects, part 8; scenery, part 10) widened by a fixed number
+of camera-path nodes, k = 2 at 16:9. Measured on the disc, that was far short:
+
+- **Scenery.** Growing the window until the lists gain the 16:9 share (+33%)
+  needs 6 or more nodes at half of all nodes; k = 2 got there at 1.7%.
+- **Objects on side-on paths.** Kind 3 paths (property 0x029; 8 behaves the
+  same) look across the play. Every object on them appears where its offset
+  along the path from the camera is 0.94-2.3 times its distance off it (median
+  1.1) and vanishes at the mirror value: the 4:3 frame's side edges. A 16:9
+  frame sees each a third of that offset earlier: 5-7 nodes, past 14 for some.
+  k = 2 covered 1% of them. This was the "2D side scroll" report.
+- **Path ends.** Paths are 26-30 nodes and joined end to end (1,815 of 1,990 at
+  both ends); a window stopped at a path's end.
+
+### Patch 0051: side-on reach, and scenery across path ends
+
+`crash2_wide_geom.h` (new) reads the level data read-only. Every decoding was
+checked against the files:
+
+- **Entries.** Found as the game's bounded lookup (`0x80014B90`) finds them;
+  resident or not.
+- **Objects.** A draw-list value `(index<<24)|(id<<8)|zone slot` is item
+  `index + [+0x184] + [+0x188]` of that zone. All 53,862 values on the disc
+  resolve to their entity. Positions are in units of 4 from the zone origin.
+- **Camera links.** Property 0x109 is a row per end. The record's byte 0 is the
+  end of the next path entered, byte 1 its path index, byte 2 the zone slot.
+  All 3,837 resolve to a path.
+
+Using it:
+
+- **Objects on side-on paths** get their own reach from their position.
+- **Scenery on side-on paths** gets the 90th percentile of the path's objects'
+  reaches. That met 98% of their needs; growing the lists met 37%.
+- **Past a path's end** the scenery window continues into the linked path. Its
+  polygon ids name worlds by the joined zone's slots, so they are remapped by
+  world EID: unmapped, joined lists differ by 71% at the shared node; mapped, by
+  5%, as close as two lists of one zone.
+
+Reported after 0051: better, still artifacts.
+
+### Patch 0052: ask the camera
+
+Every node-count rule is a guess about where the camera looks. The camera
+itself is readable:
+
+- **Rotation.** At `0x80060774`, loaded into the GTE by `0x8004EF28` just before
+  the world draw. The renderer only clears the translation (`0x80041E9C`).
+- **Position.** At `0x800607F4`, in 24.8. Each frame every world record of the
+  zone header gets origin − camera (`0x80018344`). These are world units, the
+  same as zone origins, path points and object positions.
+- **World geometry** (WGEO, type 3):
+  - item 0 holds the origin and counts;
+  - item 1 vertices: XY words last-first, then Z halves;
+  - item 2 triangles: a word each last-first, then a half each;
+  - item 3 quads, 8 bytes each;
+  - coordinates are the field & 0xFFF0 from the origin.
+
+  All 1.57M polygon references of the side-on paths decode. They lie inside the
+  4:3 angle with the same sharp edge the objects show.
+
+**Scenery** (`crash2_wide_slst.h`), at the render call:
+
+- **Candidates.** Per node, the polygons the lists within 20 nodes either side
+  hold, and the linked paths' lists, that the game's list does not.
+- **Each frame,** every candidate is projected as the renderer will project it.
+  Those reaching into the extra columns are added: outside the 4:3 frame,
+  inside the wide one, in front of the eye.
+- **Inside the 4:3 frame nothing is added.** The game's list there is
+  authoritative: what it omits is hidden, and adding it would risk polygons
+  sorting through walls (the node windows did add such polygons).
+- **Model check.** Once per node, the model must put at least half the game's
+  own list on screen; otherwise the node window draws. The test cases ran at
+  60-96%.
+
+**Objects** (`crash2_wide_spawn.h`): with that camera, an object the original
+has not spawned, or has just killed, is wanted while its position projects
+into the extra columns, on any kind of path. Inside the 4:3 frame the original
+lists decide. The load and unload rules are unchanged.
+
+**A bug the model check caught.** The game shifts camera y unsigned. That is
+harmless for its 16-bit offsets, but camera y is negative in some levels, so a
+whole position needs the signed value.
+
+### Checked without the game
+
+`tuning/wide_frustum_sim` covers 72 cases, two per level: side-on and other
+paths, mid-path and near an end, 70 of them reaching into a linked path.
+
+- **The setup.**
+  - Real zones, worlds and SLSTs are laid out as the game holds them.
+  - The camera sits at the node, rotated to put the node's list on screen.
+  - `frustum_ref.py` is written apart from the C.
+- **The checks.**
+  - Each drawn list equals the reference by length and hash.
+  - All 799 object verdicts match.
+  - The object hook never spawns against the camera's verdict.
+  - It refuses as it should: a camera facing away, unreadable worlds, the wrong
+    zone, linked SLSTs not resident.
+  - A 4-pixel change in the reference's guard band makes cases fail, so the
+    comparison is sensitive.
+- **The cost.** Lists grow 17%; the worst frame, including the once-per-node
+  build, took 1 ms.
+
+### To check in play (Developer mode, a widescreen aspect)
+
+- **`wide_slst`:**
+  - `camera` should climb with frames;
+  - `model_bad` should stay near 0;
+  - `model_pct` should be well over 50.
+
+  If `model_bad` climbs, the model is wrong somewhere, and that node window is
+  what draws.
+- **`wide_spawn`:** `cam_yes` / `cam_no` show the camera deciding objects.
+- **The view.** Side margins in forward sections, side-scrollers and across
+  path ends should no longer fill in late. Nothing should show through walls
+  inside the 4:3 area.
