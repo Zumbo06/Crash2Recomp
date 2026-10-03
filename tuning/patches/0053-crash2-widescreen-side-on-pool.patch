@@ -1,0 +1,568 @@
+Widescreen, side-on paths: fill the black triangles at the edges.
+
+Reported after 0052: black triangles at the outer edges of 2D (side-on)
+scenes - Snow Go's ice cave, the bonus rounds. Only kind 3 and 8 paths
+change; forward paths behave exactly as in 0052.
+
+Measured offline with the game's own camera, now decoded:
+- position: the path point (0x80026A08);
+- angles: the item after the path in the zone, 0x04B, two int16 triples per
+  node, the first x, y, z;
+- matrix: Rz(-z) Rx(-x) Ry(-y) (0x80017BC4), then row 1 times -5/8 and row 2
+  negated (0x80017AF8);
+- H: the path's 0x130.
+
+The triangles are gaps, not wedges: geometry of the zone's own worlds that
+no list within reach holds (1.5% of every side-on view's extra columns,
+mostly where a path starts or ends). Lists of other camera paths hold it: of
+the same zone, or of a neighbour zone.
+
+crash2_wide_slst.h, side-on paths only:
+- the pool: every polygon the zone's other paths and its neighbour zones'
+  paths list, mapped to this zone's world slots by world EID. It joins the
+  camera test's candidates after the nodes' own and is rebuilt when the path,
+  the zone or the resident SLST entries change;
+- a pool polygon is drawn only while it lies wholly in the extra columns of
+  one side, so the 4:3 picture is untouched;
+- a candidate with a corner the GTE cannot place (behind the eye, or
+  H >= 2 SZ) is never added - it would be drawn as a wedge;
+- the three side-on S000000F paths whose SLST rebuilds cleanly but does not
+  end on its own end list (a data quirk; 0052 refused them) are used, node
+  by node, where the game's list matches.
+
+crash2_wide_geom.h: c2wg_placeable; the camera's data in the header notes.
+
+Counters: wide_slst pool / pool_drawn (debug server and heartbeat);
+crash2_wide_slst_stats fills 14 values.
+
+Offline, all 3,069 side-on views (one node in four): extra columns missing
+1.52% -> 0.45% (Snow Go 1.11% -> 0.02%), wedges 8 -> 0, the 4:3 frame as
+with 0052. tuning/wide_frustum_sim checks 122 real cases on the game's
+camera, 50 with a pool. Worst frame 0.74 ms, including a pool build; later
+frames 0.04 ms on average.
+
+No file here is in codegen_hash_sources.cmake.
+
+--- a/runtime/src/crash2_wide_geom.h
++++ b/runtime/src/crash2_wide_geom.h
+@@ -41,7 +41,12 @@
+  *   - The camera: rotation 0x80060774 (loaded into the GTE for the world
+  *     draw), position 0x800607F4 (24.8, world units). Each frame every world
+  *     record gets origin - camera (0x80018344), and the renderer feeds the GTE
+- *     field + that offset with no translation (0x80041E9C).
++ *     field + that offset with no translation (0x80041E9C). At rest it sits
++ *     at its path's point (0x80026A08), turned by the angles the item after
++ *     the path holds for the node (0x04B, two int16 triples a node, the first
++ *     x, y, z in 4096ths of a turn): Rz(-z) Rx(-x) Ry(-y), then row 1 scaled
++ *     by -5/8 and row 2 negated (0x80017BC4, 0x80017AF8); a look toward Crash
++ *     within per-node limits turns it from there (0x800231B0).
+  *
+  * Kind 3 (and 8) paths look at the play from the side. On every one of them,
+  * across the game, objects appear and vanish where their offset along the
+@@ -492,6 +497,17 @@
+     return 1;
+ }
+ 
++/* Whether the GTE can place a camera-relative point at all: in front of the
++ * eye and far enough that its division does not saturate (H < 2 SZ). A
++ * polygon with a corner it cannot place is drawn as a wedge from wherever
++ * that corner's saturated position lands. */
++static int c2wg_placeable(const C2wgCam *c, int32_t x, int32_t y, int32_t z)
++{
++    const int64_t m3 = ((int64_t)c->r[6] * x + (int64_t)c->r[7] * y + (int64_t)c->r[8] * z) >> 12;
++    const int64_t sz = m3 > 0xFFFF ? 0xFFFF : m3;
++    return m3 > 0 && (int64_t)c->h < sz * 2;
++}
++
+ /* How a polygon's corners fall against the frame (camera-relative, world
+  * units): C2WG_OUT behind the eye or wholly past one edge of the frame
+  * `margin` columns wider each side (plus C2WG_GUARD); C2WG_IN43 inside but
+--- a/runtime/src/crash2_wide_slst.h
++++ b/runtime/src/crash2_wide_slst.h
+@@ -56,6 +56,25 @@
+  *     game's own list on screen, or that node is drawn with the node window
+  *     below instead. Objects (crash2_wide_spawn.h) get the same camera.
+  *
++ * Paths that look at the play from the side (kind 3 and 8: the side-scrolling
++ * stretches and the bonus rounds) get two more rules; forward paths neither:
++ *
++ *   - The pool. Rendered offline with the game's own camera (crash2_wide_geom.h),
++ *     the side-on views of every level left 1.5% of the extra columns undrawn
++ *     although the zone's worlds have geometry there - the black triangles at
++ *     the edges, mostly where a path starts or ends. Such a polygon is listed
++ *     by another camera path, of the zone or of a neighbour zone: the 4:3 view
++ *     never sees it from this path's nodes. So the lists of every other path
++ *     of the zone and of its neighbour zones, mapped to this zone's world
++ *     slots by world EID, are candidates too, after the nodes': built once
++ *     per path, again when the zone or the resident SLST entries change.
++ *     A pool polygon is drawn only while it lies wholly in the extra columns
++ *     of one side: inside the 4:3 frame another path's list says nothing about
++ *     this view, and the game's picture there stays untouched.
++ *   - A candidate with a corner the GTE cannot place (behind the eye, or so
++ *     near that its division saturates) is never added: it would be drawn as
++ *     a wedge from wherever that corner lands.
++ *
+  * How far, when it cannot (the node window):
+  *
+  *   - Paths that look at the play from the side (kind 3 and 8) move the camera
+@@ -108,7 +127,9 @@
+ #define C2SL_SIDE_FALLBACK 7          /* nodes at 16:9 without enough objects  */
+ #define C2SL_CACHE       4            /* entries: this path, both joins, one   */
+ #define C2SL_FRUSTUM_K   20           /* nodes either side the camera test reads */
+-#define C2SL_MAX_CAND    6144         /* candidates for the camera test        */
++#define C2SL_MAX_CAND    12288        /* candidates for the camera test        */
++#define C2SL_POOL_MAX    8192         /* side-on pool: other paths' polygons   */
++#define C2SL_POOL_PATHS  256          /* paths the pool reads, all zones       */
+ #define C2SL_SENT        0xFFFF00
+ 
+ #ifndef C2SL_R32
+@@ -186,7 +207,8 @@
+ typedef struct {
+     uint32_t entry, eid, stamp;  /* guest entry, its EID, LRU stamp           */
+     int      nodes;              /* lists: one per node                        */
+-    int      ok;                 /* 1 = rebuilt and verified, 0 = unusable     */
++    int      ok;                 /* 1 = rebuilt, 0 = unusable                  */
++    int      end_ok;             /* 1 = its last list is the entry's end list  */
+     uint32_t *off;               /* per node: offset of its list in ids[]      */
+     uint16_t *len;
+     uint16_t *ids;
+@@ -219,6 +241,7 @@
+     uint32_t join[2];
+     int valid, widen, added;
+     int model;            /* camera model on the game's list: -1 untried, 0, 1 */
++    int side_on;          /* kind 3 / 8: the pool and the near rule apply      */
+ } c2sl_built;
+ /* The node window's list (frames the camera test cannot judge), and the camera
+  * test's candidates: id, the game-list position it follows, by that position. */
+@@ -227,6 +250,15 @@
+ static uint16_t c2sl_cid[C2SL_MAX_CAND], c2sl_cat[C2SL_MAX_CAND], c2sl_corder[C2SL_MAX_CAND];
+ static uint8_t  c2sl_ckeep[C2SL_MAX_CAND];
+ static int      c2sl_ncand;
++static int      c2sl_pool_first;            /* candidates from here: the pool's */
++/* The side-on pool of one path: every polygon the other camera paths of its
++ * zone and of the neighbour zones list, in this zone's world slots, each
++ * once; sig names the SLST entries it was read from. */
++static struct { uint32_t cam, zone, sig; int n, paths; } c2sl_pool;
++static uint16_t c2sl_pool_ids[C2SL_POOL_MAX];
++static uint8_t  c2sl_pool_have[65536 / 8];
++static C2slEntry c2sl_pool_tmp;
++static int      c2sl_pool_drawn;            /* pool polygons the last frame drew */
+ static int      c2sl_model_seen, c2sl_model_total;
+ /* The side-on window of one path. */
+ static struct { uint32_t cam, zone; int nodes, base, margin, kw; } c2sl_side;
+@@ -410,15 +442,20 @@
+         memcpy(e->ids + used, cur, sizeof(uint16_t) * (size_t)curn);
+         used += (size_t)curn;
+     }
+-    /* The rebuilt last list must be the entry's own end list. */
++    /* The rebuilt last list should be the entry's own end list. Across the
++     * game four entries' differ by one to six polygons - three side-on paths
++     * of S000000F and one forward path of S000001F - a data quirk: walking
++     * such a path forward, the game builds exactly these lists. end_ok = 0
++     * there, and only side-on paths use them (each node still has to match
++     * the game's own list). */
++    e->nodes = nodes;
++    e->ok = 1;
+     {
+         const int hw = c2sl_load_item(C2SL_R32(entry + 16 + 4u * (uint32_t)nodes));
+-        if (hw < 2 || (int16_t)c2sl_item[1] != 0 || hw - 2 != curn) return;
+-        for (int i = 0; i < curn; ++i)
+-            if (c2sl_key(c2sl_item[2 + i]) != c2sl_key(cur[i])) return;
+-    }
+-    e->nodes = nodes;
+-    e->ok = 1;
++        e->end_ok = hw >= 2 && (int16_t)c2sl_item[1] == 0 && hw - 2 == curn;
++        for (int i = 0; e->end_ok && i < curn; ++i)
++            if (c2sl_key(c2sl_item[2 + i]) != c2sl_key(cur[i])) e->end_ok = 0;
++    }
+ }
+ 
+ static C2slEntry *c2sl_entry(uint32_t entry)
+@@ -433,7 +470,7 @@
+     for (int i = 1; i < C2SL_CACHE; ++i)
+         if (c2sl_cache[i].stamp < e->stamp) e = &c2sl_cache[i];
+     c2sl_build_entry(e, entry);
+-    if (!e->ok) c2sl_n_bad++;
++    if (!e->ok || !e->end_ok) c2sl_n_bad++;
+     return e;
+ }
+ 
+@@ -520,8 +557,9 @@
+ }
+ 
+ /* The path joined at one end of `cam` (end 0 its start, 1 its end), mapped to
+- * the renderer's zone. Leaves jn->e NULL when there is none to use. */
+-static void c2sl_join(uint32_t cam, int nodes, int end, uint32_t zone, C2slJoin *jn)
++ * the renderer's zone. Leaves jn->e NULL when there is none to use. lax: an
++ * entry whose end list differs will do (side-on paths). */
++static void c2sl_join(uint32_t cam, int nodes, int end, uint32_t zone, C2slJoin *jn, int lax)
+ {
+     memset(jn, 0, sizeof *jn);
+     int at_start = 0;
+@@ -536,7 +574,7 @@
+             if (c2wg_world(zone, i) == eid) { jn->map[w] = (uint8_t)i; break; }
+     }
+     const C2slEntry *je = c2sl_entry(entry);
+-    if (!je->ok || je->nodes < 2) return;
++    if (!je->ok || (!je->end_ok && !lax) || je->nodes < 2) return;
+     jn->e = je;
+     jn->entry = entry;
+     jn->at_start = at_start;
+@@ -587,13 +625,117 @@
+     return kw < k ? k : kw;
+ }
+ 
++/* The camera paths whose lists feed `cam`'s pool: every other path of its
++ * zone and of each resident neighbour zone (each zone once), with its zone;
++ * how many. */
++static int c2sl_pool_paths(uint32_t cam, uint32_t zone, uint32_t *paths, uint32_t *zones, int max)
++{
++    uint32_t zs[1 + C2WG_MAX_NEIGH];
++    int nz = 0, n = 0;
++    zs[nz++] = zone;
++    for (unsigned s = 0; s < C2WG_MAX_NEIGH; ++s) {
++        const uint32_t z = c2wg_neighbour(zone, s);
++        int seen = !z;
++        for (int i = 0; i < nz && !seen; ++i) seen = zs[i] == z;
++        if (!seen) zs[nz++] = z;
++    }
++    for (int i = 0; i < nz; ++i) {
++        const uint32_t h = c2wg_item(zs[i], 0u);
++        if (!h || !c2wg_ram(h, 0x18Cu)) continue;
++        const uint32_t first = C2WG_R32(h + 0x184u), items = C2WG_R32(h + 0x188u);
++        if (first > 4096u || items > 3u * C2SL_POOL_PATHS) continue;
++        for (uint32_t it = first; it < first + items && n < max; it += 3u) {
++            const uint32_t p = c2wg_item(zs[i], it);
++            if (!p || p == cam) continue;
++            paths[n] = p;
++            zones[n] = zs[i];
++            n++;
++        }
++    }
++    return n;
++}
++
++/* (Re)build the pool of `cam` in `zone` unless it is already the one these
++ * resident entries give. A path whose SLST is not resident, or does not
++ * rebuild, adds nothing. */
++static void c2sl_pool_build(uint32_t cam, uint32_t zone)
++{
++    static uint32_t paths[C2SL_POOL_PATHS], zones[C2SL_POOL_PATHS];
++    const int np = c2sl_pool_paths(cam, zone, paths, zones, C2SL_POOL_PATHS);
++    uint32_t sig = 2166136261u;
++    for (int i = 0; i < np; ++i) {
++        sig = (sig ^ paths[i]) * 16777619u;
++        sig = (sig ^ c2wg_slst_of(paths[i])) * 16777619u;
++    }
++    if (c2sl_pool.cam == cam && c2sl_pool.zone == zone && c2sl_pool.sig == sig) return;
++    c2sl_pool.cam = cam;
++    c2sl_pool.zone = zone;
++    c2sl_pool.sig = sig;
++    c2sl_pool.n = c2sl_pool.paths = 0;
++    memset(c2sl_pool_have, 0, sizeof c2sl_pool_have);
++    for (int i = 0; i < np; ++i) {
++        const uint32_t entry = c2wg_slst_of(paths[i]);
++        if (!entry) continue;
++        uint8_t map[C2WG_MAX_WORLDS];
++        for (unsigned w = 0; w < C2WG_MAX_WORLDS; ++w) {
++            map[w] = 0xFF;
++            const uint32_t eid = c2wg_world(zones[i], w);
++            for (unsigned j = 0; eid && j < C2WG_MAX_WORLDS; ++j)
++                if (c2wg_world(zone, j) == eid) { map[w] = (uint8_t)j; break; }
++        }
++        c2sl_build_entry(&c2sl_pool_tmp, entry);
++        if (c2sl_pool_tmp.ok) {
++            c2sl_pool.paths++;
++            for (int nd = 0; nd < c2sl_pool_tmp.nodes; ++nd) {
++                const uint16_t *l = c2sl_pool_tmp.ids + c2sl_pool_tmp.off[nd];
++                for (int k = 0; k < c2sl_pool_tmp.len[nd] && c2sl_pool.n < C2SL_POOL_MAX; ++k) {
++                    const unsigned w = map[l[k] >> 13];
++                    if (w >= C2WG_MAX_WORLDS) continue;
++                    const uint16_t id = (uint16_t)((w << 13) | (l[k] & 0x1FFFu));
++                    const uint16_t key = c2sl_key(id);
++                    if (c2sl_pool_have[key >> 3] & (1u << (key & 7))) continue;
++                    c2sl_pool_have[key >> 3] |= (uint8_t)(1u << (key & 7));
++                    c2sl_pool_ids[c2sl_pool.n++] = id;
++                }
++            }
++        }
++        c2sl_free(&c2sl_pool_tmp);
++    }
++}
++
++/* The camera test's verdict on a side-on path: what c2wg_classify calls
++ * C2WG_WIDE, but never a polygon with a corner the GTE cannot place, and a
++ * pool polygon only while it lies wholly in the extra columns of one side. */
++static int c2sl_side_keep(const C2wgCam *c, int32_t (*v)[3], int n, int pool)
++{
++    const int lo = -c->margin - C2WG_GUARD, hi = 512 + c->margin + C2WG_GUARD;
++    int all_l = 1, all_r = 1, all_t = 1, all_b = 1, left = 0, right = 0;
++    for (int i = 0; i < n; i++) {
++        int sx, sy;
++        if (!c2wg_placeable(c, v[i][0], v[i][1], v[i][2]) ||
++            !c2wg_project(c, v[i][0], v[i][1], v[i][2], &sx, &sy))
++            return 0;
++        if (sx >= lo) all_l = 0;
++        if (sx < hi) all_r = 0;
++        if (sy >= -C2WG_GUARD) all_t = 0;
++        if (sy < C2WG_FRAME_H + C2WG_GUARD) all_b = 0;
++        if (sx < 0) left++;
++        else if (sx >= 512) right++;
++    }
++    if (all_l || all_r || all_t || all_b) return 0;
++    if (!left && !right) return 0;                       /* inside the 4:3 columns */
++    return !pool || left == n || right == n;
++}
++
+ /* The camera test's candidates: every polygon the lists within k nodes of
+  * `node` hold (past the path's ends, the joined paths', mapped to our worlds)
+  * that the game's list (c2sl_game, m long) does not - nearest node first, each
+  * with the game-list position it would follow: that of the last polygon before
+- * it in its own list that the game's list holds (0: after the first). Then
++ * it in its own list that the game's list holds (0: after the first). Then the
++ * pool's (npool: side-on paths), after the game's last polygon. Then
+  * c2sl_corder holds them by that position, stably. */
+-static int c2sl_candidates(const C2slEntry *e, int node, int k, int m, const C2slJoin *joins)
++static int c2sl_candidates(const C2slEntry *e, int node, int k, int m, const C2slJoin *joins,
++                           const uint16_t *pool, int npool)
+ {
+     static uint16_t start[C2SL_MAX_LIST + 1];
+     memset(c2sl_have, 0, sizeof c2sl_have);
+@@ -623,6 +765,15 @@
+             }
+         }
+     }
++    c2sl_pool_first = n;
++    for (int i = 0; i < npool && n < C2SL_MAX_CAND; ++i) {
++        const uint16_t key = c2sl_key(pool[i]);
++        if (c2sl_have[key >> 3] & (1u << (key & 7))) continue;
++        c2sl_have[key >> 3] |= (uint8_t)(1u << (key & 7));
++        c2sl_cid[n] = pool[i];
++        c2sl_cat[n] = (uint16_t)(m - 1);
++        n++;
++    }
+     memset(start, 0, sizeof(uint16_t) * (size_t)(m + 1));
+     for (int c = 0; c < n; ++c) start[c2sl_cat[c] + 1]++;
+     for (int p = 1; p <= m; ++p) start[p] = (uint16_t)(start[p] + start[p - 1]);
+@@ -634,9 +785,10 @@
+  * (the GTE's rotation and projection; the worlds' offsets from the camera, as
+  * the renderer reads them). Once per node the model must put most of the
+  * game's own list on screen, or this does nothing for that node. Then the
+- * candidates that reach into the extra columns are kept, nearest node first,
+- * at most as many again as the game's list (+32), and each goes after its
+- * anchor. 0 = cannot judge this frame. */
++ * candidates that reach into the extra columns are kept (on side-on paths by
++ * c2sl_side_keep), nearest node first and the pool last, at most as many
++ * again as the game's list (+32), and each goes after its anchor. 0 = cannot
++ * judge this frame. */
+ static int c2sl_frustum(CPUState *cpu, int count, int *out_m)
+ {
+     static C2wgWorld ws[C2WG_MAX_WORLDS];
+@@ -666,13 +818,18 @@
+     if (!cam.ok) return 0;
+     int budget = count + 32;
+     if (budget > C2SL_MAX_LIST - count) budget = C2SL_MAX_LIST - count;
++    const int side = c2sl_built.side_on;
++    c2sl_pool_drawn = 0;
+     for (int c = 0; c < c2sl_ncand; ++c) {
+         c2sl_ckeep[c] = 0;
+         if (budget <= 0) continue;
+         const int n = c2wg_poly(ram, ws, nw, c2sl_cid[c], v);
+-        if (n && c2wg_classify(&cam, v, n, cam.margin) == C2WG_WIDE) {
++        if (!n) continue;
++        if (side ? c2sl_side_keep(&cam, v, n, c >= c2sl_pool_first)
++                 : c2wg_classify(&cam, v, n, cam.margin) == C2WG_WIDE) {
+             c2sl_ckeep[c] = 1;
+             budget--;
++            c2sl_pool_drawn += c >= c2sl_pool_first;
+         }
+     }
+     int w = 0, a = 0;
+@@ -718,6 +875,7 @@
+     c2sl_cap_entry = c2sl_cap_cam = 0;
+     c2sl_built.valid = 0;
+     memset(&c2sl_side, 0, sizeof c2sl_side);
++    memset(&c2sl_pool, 0, sizeof c2sl_pool);
+     c2wg_cam.ok = 0;
+ }
+ 
+@@ -728,10 +886,12 @@
+         c2sl_built.valid = 0;
+         memset(&c2sl_side, 0, sizeof c2sl_side);
+     }
+-    if (reset)
++    if (reset) {
+         c2sl_n_built = c2sl_n_used = c2sl_n_mismatch = c2sl_n_bad =
+             c2sl_n_prim_skips = c2sl_added_max = c2sl_n_side = c2sl_n_joined =
+             c2sl_n_frustum = c2sl_n_model_bad = 0;
++        c2sl_pool_drawn = 0;
++    }
+ }
+ 
+ /* out[6] side = lists built with a side-on window, out[7] joined = lists that
+@@ -739,8 +899,10 @@
+  * out[9] camera = frames drawn with the camera test, out[10] model_bad = nodes
+  * where the camera model did not put the game's own list on screen (the node
+  * window drew those), out[11] model_pct = the share of the game's list the
+- * model put on screen at the last node checked. */
+-void crash2_wide_slst_stats(unsigned long long out[12], int *base_k, int *k,
++ * model put on screen at the last node checked, out[12] pool = polygons in the
++ * current side-on path's pool, out[13] pool_drawn = how many of them the last
++ * frame drew. */
++void crash2_wide_slst_stats(unsigned long long out[14], int *base_k, int *k,
+                             int *code_ok, int *added)
+ {
+     out[0] = c2sl_n_built;   out[1] = c2sl_n_used;  out[2] = c2sl_n_mismatch;
+@@ -750,6 +912,8 @@
+     out[9] = c2sl_n_frustum; out[10] = c2sl_n_model_bad;
+     out[11] = c2sl_model_total > 0
+         ? (unsigned long long)(100 * c2sl_model_seen / c2sl_model_total) : 0u;
++    out[12] = c2sl_built.valid && c2sl_built.side_on ? (unsigned long long)c2sl_pool.n : 0u;
++    out[13] = (unsigned long long)c2sl_pool_drawn;
+     if (base_k)  *base_k = c2sl_base_k < 0 ? 0 : c2sl_base_k;
+     if (k)       *k = c2sl_last_k < 0 ? 0 : c2sl_last_k;
+     if (code_ok) *code_ok = c2sl_code;
+@@ -810,7 +974,8 @@
+         for (int i = 0; i < count; ++i)                 /* for the per-call check */
+             c2sl_game[i] = C2SL_R16(list + 4u + 2u * (uint32_t)i);
+         const C2slEntry *e = c2sl_entry(c2sl_cap_entry);
+-        if (!e->ok || node < 0 || node >= e->nodes) return;
++        const int side_on = c2sl_geo == 1 && c2wg_side_on(c2sl_cap_cam);
++        if (!e->ok || (!e->end_ok && !side_on) || node < 0 || node >= e->nodes) return;
+         /* The game's list must be this node's list, or nothing here applies. */
+         if (e->len[node] != count) { c2sl_n_mismatch++; return; }
+         const uint16_t *mine = e->ids + e->off[node];
+@@ -821,16 +986,16 @@
+         /* The window: k, or a side-on path's own; past the path's ends into
+          * the joined paths, when the camera's zone is this path's (whose world
+          * slots the renderer has). */
+-        int kw = k, side_on = 0, joined = 0;
++        int kw = k, joined = 0;
+         C2slJoin joins[2];
+         memset(joins, 0, sizeof joins);
+         if (c2sl_geo == 1) {
+-            side_on = c2wg_side_on(c2sl_cap_cam);
+             if (side_on) kw = c2sl_side_window(c2sl_cap_cam, e->nodes, k, c2sl_margin);
+             const uint32_t zone = c2wg_zone_of(c2sl_cap_cam);
+             if (zone && zone == C2SL_R32(C2WG_ZONE)) {
+-                if (node - kw < 0) c2sl_join(c2sl_cap_cam, e->nodes, 0, zone, &joins[0]);
+-                if (node + kw > e->nodes - 1) c2sl_join(c2sl_cap_cam, e->nodes, 1, zone, &joins[1]);
++                if (node - kw < 0) c2sl_join(c2sl_cap_cam, e->nodes, 0, zone, &joins[0], side_on);
++                if (node + kw > e->nodes - 1)
++                    c2sl_join(c2sl_cap_cam, e->nodes, 1, zone, &joins[1], side_on);
+             }
+         }
+         c2sl_last_kw = kw;
+@@ -841,15 +1006,22 @@
+         C2slJoin fj[2];
+         memcpy(fj, joins, sizeof fj);
+         c2sl_ncand = 0;
++        c2sl_pool_first = 0;
+         c2sl_built.model = -1;
++        c2sl_built.side_on = side_on;
+         if (c2sl_geo == 1) {
+             const uint32_t zone = c2wg_zone_of(c2sl_cap_cam);
+             if (zone && zone == C2SL_R32(C2WG_ZONE)) {
+                 if (node - C2SL_FRUSTUM_K < 0 && !fj[0].e)
+-                    c2sl_join(c2sl_cap_cam, e->nodes, 0, zone, &fj[0]);
++                    c2sl_join(c2sl_cap_cam, e->nodes, 0, zone, &fj[0], side_on);
+                 if (node + C2SL_FRUSTUM_K > e->nodes - 1 && !fj[1].e)
+-                    c2sl_join(c2sl_cap_cam, e->nodes, 1, zone, &fj[1]);
+-                c2sl_ncand = c2sl_candidates(e, node, C2SL_FRUSTUM_K, count, fj);
++                    c2sl_join(c2sl_cap_cam, e->nodes, 1, zone, &fj[1], side_on);
++                int npool = 0;
++                if (side_on) {
++                    c2sl_pool_build(c2sl_cap_cam, zone);
++                    npool = c2sl_pool.n;
++                }
++                c2sl_ncand = c2sl_candidates(e, node, C2SL_FRUSTUM_K, count, fj, c2sl_pool_ids, npool);
+             }
+         }
+         c2sl_built.join[0] = fj[0].entry;
+@@ -877,6 +1049,7 @@
+      * window's. */
+     const uint16_t *out = c2sl_fb;
+     int m = c2sl_fb_n;
++    c2sl_pool_drawn = 0;
+     if (c2sl_ncand > 0 && c2sl_frustum(cpu, count, &m)) {
+         out = c2sl_out;
+         c2sl_n_frustum++;
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8369,30 +8369,34 @@
+  * built = merged lists made (one per node); used = render calls that drew one;
+  * added = polygons the current one adds; added_max = the most so far;
+  * mismatch = the game's list was not the rebuilt list of its node (left
+- * alone); bad = SLST entries this could not rebuild; prim_skips = frames whose
++ * alone); bad = SLST entries this could not rebuild, or whose last list is not
++ * the entry's end list (side-on paths use those); prim_skips = frames whose
+  * primitive buffer had too little room left (drawn as the game built them);
+  * side = lists built with a side-on path's own window; joined = lists that
+  * took polygons from the path joined at an end; kw = the window last used;
+  * camera = frames drawn with the camera test; model_bad = nodes where the
+  * camera model did not put the game's own list on screen; model_pct = the
+- * share it put on screen at the last node checked. */
++ * share it put on screen at the last node checked; pool = polygons in the
++ * side-on path's pool (other paths' lists); pool_drawn = of those, drawn by
++ * the last frame. */
+ extern void crash2_wide_slst_control(int k, int reset);
+-extern void crash2_wide_slst_stats(unsigned long long out[12], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[14], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ static void handle_c2_slst(int id, const char *json)
+ {
+     crash2_wide_slst_control(json_get_int(json, "k", -1),
+                              json_get_int(json, "reset", 0));
+-    unsigned long long s[12];
++    unsigned long long s[14];
+     int base_k = 0, k = 0, code_ok = 0, added = 0;
+     crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+     send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
+              "\"added\":%d,\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,"
+              "\"bad\":%llu,\"prim_skips\":%llu,\"added_max\":%llu,"
+              "\"side\":%llu,\"joined\":%llu,\"kw\":%llu,\"camera\":%llu,"
+-             "\"model_bad\":%llu,\"model_pct\":%llu}",
++             "\"model_bad\":%llu,\"model_pct\":%llu,\"pool\":%llu,"
++             "\"pool_drawn\":%llu}",
+              id, base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
+-             s[6], s[7], s[8], s[9], s[10], s[11]);
++             s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13]);
+ }
+ 
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -85,7 +85,7 @@
+                                      int *code_ok, int *off);
+ /* Widescreen scenery range (crash2_wide_slst.h): whether it is drawing the
+  * neighbouring nodes' polygons, and why not when it is not. */
+-extern void crash2_wide_slst_stats(unsigned long long out[12], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[14], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+@@ -953,9 +953,9 @@
+                  "\"kept\":%llu,\"mismatch\":%llu}",
+                  on, code_ok, off, s[0], s[1], s[2]);
+     }
+-    char sl_json[384];
++    char sl_json[448];
+     {
+-        unsigned long long s[12];
++        unsigned long long s[14];
+         int base_k = 0, k = 0, code_ok = 0, added = 0;
+         crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+         snprintf(sl_json, sizeof(sl_json),
+@@ -963,9 +963,10 @@
+                  "\"built\":%llu,\"used\":%llu,\"mismatch\":%llu,\"bad\":%llu,"
+                  "\"prim_skips\":%llu,\"added_max\":%llu,\"side\":%llu,"
+                  "\"joined\":%llu,\"kw\":%llu,\"camera\":%llu,"
+-                 "\"model_bad\":%llu,\"model_pct\":%llu}",
++                 "\"model_bad\":%llu,\"model_pct\":%llu,\"pool\":%llu,"
++                 "\"pool_drawn\":%llu}",
+                  base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
+-                 s[6], s[7], s[8], s[9], s[10], s[11]);
++                 s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13]);
+     }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),

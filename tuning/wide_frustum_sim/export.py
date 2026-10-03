@@ -2,19 +2,23 @@
 
     python tuning/wide_frustum_sim/export.py OUT.bin [--nsf-dir DIR] [--per-level N]
 
-Each case: a camera path at one node, near an end or in the middle, on
-side-on (kind 3) and other paths; a camera at the node's path point whose
-rotation is fitted to put most of the node's own list in the 4:3 frame (the
-game's real camera is not modelled here - the hook reads it at run time);
-the entries the hook reads (the zone, its worlds, the path's SLST, and the
-zones and SLSTs of the paths linked at its ends); and what frustum_ref.py
-says the hook draws. OUT.bin is game data: keep it out of the repository.
+Each case: a camera path at one node, near an end or in the middle, up to N
+per level on side-on paths (kind 3, 8) and N on the others, and one more
+side-on case per level whose extra columns hold void to cover; the game's own
+camera at rest there (crash2_wide_geom.h: the path point, turned by the
+node's angles from the item after the path, H from the path's 0x130); the
+entries the hook reads (the zone, its worlds, the path's SLST, the zones and
+SLSTs of the paths linked at its ends, and on a side-on path the zones and
+SLSTs its pool reads: every other path of the zone and of its neighbour
+zones); and what frustum_ref.py says the hook draws. OUT.bin is game data:
+keep it out of the repository.
 
 Format, little-endian: u32 'C2FS', u32 cases; per case: u32 entries, per
 entry u32 eid, type, items, per item u32 length + bytes padded to 4; then
 u32 zone eid, path item, node; i32 camera x, y, z; i32 r[9], h, ofx, ofy,
 margin; u32 model seen, total, merged length, kept, joins; u64 FNV-1a of the
-merged list (0 when the model fails); u32 objects, per object u32 draw-list
+merged list (0 when the model fails); i32 the void cover's width left, right
+(px; 0 off side-on paths); u32 objects, per object u32 draw-list
 value, i32 the object hook's verdict (1 in the extra columns, 0 not, -1
 cannot tell). Ends with u32 0xFFFFFFFF.
 """
@@ -26,8 +30,6 @@ import os
 import struct
 import sys
 
-import numpy as np
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
@@ -38,6 +40,7 @@ import frustum_ref as F  # noqa: E402
 import slst_ref as S  # noqa: E402
 
 MARGIN = 85
+POOL_PATHS = 256                 # crash2_wide_slst.h's C2SL_POOL_PATHS
 
 
 def table(it):
@@ -116,41 +119,103 @@ def fnv(ids):
     return h
 
 
-def rotation(yaw, pitch):
-    cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
-    fwd = np.array([sy * cp, sp, cy * cp])
-    right = np.array([cy, 0.0, -sy])
-    down = np.cross(fwd, right)
-    return np.stack([right, down, fwd])
+def _sin(a):
+    return int(round(4096 * math.sin(2 * math.pi * (a & 0xFFF) / 4096)))
 
 
-def fit_camera(corner_sets):
-    """Rows of a rotation putting most corner sets in the 4:3 frame (H 256)."""
-    pts = np.array([c + [c[-1]] * (4 - len(c)) for c in corner_sets], dtype=float)
+def _mul(a, b):
+    """MulMatrix (0x8004ECB8): a x b, each element >> 12 as MVMVA leaves it."""
+    return [[max(-0x8000, min(0x7FFF, sum(a[i][k] * b[k][j] for k in range(3)) >> 12))
+             for j in range(3)] for i in range(3)]
 
-    def score(R):
-        v = pts @ R.T
-        z = v[..., 2]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            sx = 256 + 256 * v[..., 0] / z
-            sy = 108 + 256 * v[..., 1] / z
-        inside = (z > 1) & (sx >= 0) & (sx < 512) & (sy >= 0) & (sy < 216)
-        return inside.any(axis=1).mean()
 
-    best = (-1.0, 0.0, 0.0)
-    for yd in range(0, 360, 6):
-        for pd in range(-60, 61, 6):
-            s = score(rotation(math.radians(yd), math.radians(pd)))
-            if s > best[0]:
-                best = (s, yd, pd)
-    s0, yd0, pd0 = best
-    for yd in np.arange(yd0 - 6, yd0 + 6.01, 1.0):
-        for pd in np.arange(pd0 - 6, pd0 + 6.01, 1.0):
-            s = score(rotation(math.radians(yd), math.radians(pd)))
-            if s > best[0]:
-                best = (s, float(yd), float(pd))
-    R = rotation(math.radians(best[1]), math.radians(best[2]))
-    return best[0], [int(round(max(-32768, min(32767, x * 4096)))) for x in R.flatten()]
+def camera_rotation(ax, ay, az):
+    """The GTE rotation for a node's angles (x, y, z; 4096 a turn), as
+    0x80017BC4 builds it - Rz(-z) Rx(-x) Ry(-y) - and 0x80017AF8 hands it to
+    the world draw: row 1 times -5/8, row 2 negated. Sines from 4096 sin(),
+    the game's table to within one."""
+    s, c = _sin(-az), _sin(1024 - az)
+    m = [[c, -s, 0], [s, c, 0], [0, 0, 4096]]
+    s, c = _sin(-ax), _sin(1024 - ax)
+    m = _mul(m, [[4096, 0, 0], [0, c, -s], [0, s, c]])
+    s, c = _sin(-ay), _sin(1024 - ay)
+    m = _mul(m, [[c, 0, s], [0, 4096, 0], [-s, 0, c]])
+    return m[0] + [(-(5 * v)) >> 3 for v in m[1]] + [-v for v in m[2]]
+
+
+def path_h(it, tb, node):
+    """H at a node: the path's 0x130, rows by node, linear between them; 288
+    without it (0x80023D7C)."""
+    if 0x130 not in tb:
+        return 288
+    rs = sorted((m, v[0]) for m, v in rows(it, tb[0x130]) if v)
+    if not rs:
+        return 288
+    if node <= rs[0][0]:
+        return rs[0][1]
+    for (m0, v0), (m1, v1) in zip(rs, rs[1:]):
+        if m0 <= node <= m1:
+            return int(round(v0 + (v1 - v0) * (node - m0) / max(1, m1 - m0)))
+    return rs[-1][1]
+
+
+def node_lists(items, lax):
+    """The node lists as crash2_wide_slst.h rebuilds them, None where it
+    refuses. A rebuild whose last list is not the entry's own end list (four
+    entries in the game) serves side-on paths only (lax)."""
+    try:
+        ll = S.node_lists(items)
+        if not lax and [F.key(v) for v in S.source(items[-1])] != [F.key(v) for v in ll[-1]]:
+            return None
+    except Exception:
+        return None
+    return ll
+
+
+def zone_worlds(zone_items):
+    """A zone's world EIDs, as c2wg_world reads them (none past 8)."""
+    hdr = zone_items[0]
+    nw = struct.unpack_from("<I", hdr, 0)[0]
+    if nw > 8:
+        return []
+    return [struct.unpack_from("<I", hdr, 4 + 48 * i)[0] for i in range(nw)]
+
+
+def pool_sources(ents, zeid, item):
+    """The paths a side-on path's pool reads, in the hook's order: the zone's
+    other paths, then each neighbour zone's (by slot, each zone once), items
+    in order. [(world EIDs, node lists, SLST eid)] for those whose SLST
+    rebuilds; and every zone read."""
+    hdr = ents[zeid][1][0]
+    nn = struct.unpack_from("<I", hdr, 0x190)[0]
+    neigh = list(struct.unpack_from("<%dI" % nn, hdr, 0x194)) if nn <= 16 else []
+    zones = [zeid]
+    for z in neigh:
+        if ents.get(z, (0,))[0] == 7 and z not in zones:
+            zones.append(z)
+    out, counted = [], 0
+    for z in zones:
+        zi = ents[z][1]
+        c0, cn = struct.unpack_from("<2I", zi[0], 0x184)
+        if c0 > 4096 or cn > 3 * POOL_PATHS:
+            continue
+        for k in range(c0, c0 + cn, 3):
+            if k >= len(zi) or counted >= POOL_PATHS:
+                break
+            if z == zeid and k == item:
+                continue
+            counted += 1
+            tb = table(zi[k])
+            if not tb or 0x103 not in tb:
+                continue
+            se = rows(zi[k], tb[0x103])[0][1][0]
+            if ents.get(se, (0,))[0] != 4:
+                continue
+            ll = node_lists(ents[se][1], True)
+            if ll is None:
+                continue
+            out.append((zone_worlds(zi), ll, se))
+    return out, zones
 
 
 def main() -> int:
@@ -173,9 +238,10 @@ def main() -> int:
         if want_levels and name not in want_levels:
             continue
         ents = {eid: (t, items) for eid, t, items in N.entries(data)}
-        got = 0
+        got = {True: 0, False: 0}                  # side-on, other
+        void_case = False                          # one side-on case with a cover
         for zeid, (t, items) in ents.items():
-            if t != 7 or got >= args.per_level:
+            if t != 7 or (min(got.values()) >= args.per_level and void_case):
                 continue
             hdr = items[0]
             nw = struct.unpack_from("<I", hdr, 0)[0]
@@ -190,22 +256,25 @@ def main() -> int:
             neigh = list(struct.unpack_from("<%dI" % min(nn, 16), hdr, 0x194))
             ox, oy, oz = struct.unpack_from("<3i", items[1], 0)
             for k in range(cam0, cam0 + ncam_items, 3):
-                if got >= args.per_level or k >= len(items):
+                if k + 1 >= len(items):
                     break
                 it = items[k]
-                tb = table(it)
-                if not tb or 0x103 not in tb or 0x04B not in tb:
+                tb, ta = table(it), table(items[k + 1])
+                if not tb or 0x103 not in tb or 0x04B not in tb or not ta or 0x04B not in ta:
                     continue
                 kind = rows(it, tb[0x029])[0][1][0] if 0x029 in tb else -1
+                side = kind in (3, 8)
+                if got[side] >= args.per_level and (not side or void_case):
+                    continue
                 se = rows(it, tb[0x103])[0][1][0]
                 if ents.get(se, (0,))[0] != 4:
                     continue
-                try:
-                    lists = S.node_lists(ents[se][1])
-                except Exception:
+                lists = node_lists(ents[se][1], side)
+                if lists is None:
                     continue
                 pos = [(ox + x, oy + y, oz + z) for x, y, z in rows(it, tb[0x04B])[0][1]]
-                if len(pos) != len(lists) or len(pos) < 6:
+                angles = rows(items[k + 1], ta[0x04B])[0][1]
+                if len(pos) != len(lists) or len(pos) < 6 or len(angles) < 2 * len(pos):
                     continue
                 # the paths linked at each end
                 joins, extra = [None, None], []
@@ -226,34 +295,39 @@ def main() -> int:
                     jse = rows(jit, jtb[0x103])[0][1][0]
                     if ents.get(jse, (0,))[0] != 4:
                         continue
-                    try:
-                        jl = S.node_lists(ents[jse][1])
-                    except Exception:
+                    jl = node_lists(ents[jse][1], side)
+                    if jl is None:
                         continue
                     jnw = struct.unpack_from("<I", jz[0], 0)[0]
                     jw = [struct.unpack_from("<I", jz[0], 4 + 48 * i)[0] for i in range(min(jnw, 8))]
                     wmap = [wl_eids.index(e) if e in wl_eids else 0xFF for e in jw] + [0xFF] * (8 - len(jw))
                     joins[end] = (jl, at_start, wmap)
                     extra += [neigh[slot], jse]
-                for n in (len(pos) - 3, len(pos) // 2):
-                    if got >= args.per_level:
-                        break
+                pool_ids = []
+                if side:
+                    srcs, pool_zones = pool_sources(ents, zeid, k)
+                    pool_ids = F.pool(wl_eids, [(w, ll) for w, ll, _ in srcs])
+                    extra += pool_zones + [s for _, _, s in srcs]
+                for n in (len(pos) - 3, len(pos) // 2, 1):
+                    regular = got[side] < args.per_level and n != 1
+                    if not regular and (not side or void_case):
+                        continue
                     cx, cy, cz = pos[n]
                     offsets = [((w.origin[0] - cx) & 0xFFFFFFFF, ((w.origin[1] - cy) & 0xFFFFFFFF) & 0xFFFE,
                                 (w.origin[2] - cz) & 0xFFFFFFFF) for w in worlds]
-                    cs = []
-                    for v in lists[n]:
-                        w = v >> 13
-                        c = worlds[w].corners(v, offsets[w]) if w < len(worlds) else None
-                        if c:
-                            cs.append(c)
-                    if len(cs) < 20:
+                    if sum(1 for v in lists[n] if (v >> 13) < len(worlds)) < 20:
                         continue
-                    frac, r = fit_camera(cs)
-                    if frac < 0.6:
-                        continue
-                    cam = {"r": r, "h": 256, "ofx": 256 << 16, "ofy": 108 << 16}
-                    seen, total, merged, kept = F.draw(cam, worlds, offsets, lists, n, joins, MARGIN)
+                    r = camera_rotation(*angles[2 * n])
+                    h = path_h(it, tb, n)
+                    cam = {"r": r, "h": h, "ofx": 256 << 16, "ofy": 108 << 16}
+                    seen, total, merged, kept = F.draw(cam, worlds, offsets, lists, n, joins, MARGIN,
+                                                       side, pool_ids)
+                    cover = F.void_cover(cam, worlds, offsets, merged, MARGIN) \
+                        if side and merged is not None else [0, 0]
+                    if not regular:
+                        if not any(cover):
+                            continue
+                        void_case = True
                     entry_eids = [zeid] + wl_eids + [se] + extra
                     placed = set(entry_eids)
                     objs = []
@@ -267,15 +341,16 @@ def main() -> int:
                                     objs.append((v, verdict))
                     cases.append({
                         "entries": [(e, ents[e][0], ents[e][1]) for e in dict.fromkeys(entry_eids)],
-                        "zone": zeid, "item": k, "node": n, "cam": (cx, cy, cz), "r": r,
+                        "zone": zeid, "item": k, "node": n, "cam": (cx, cy, cz), "r": r, "h": h,
                         "seen": seen, "total": total, "merged": merged, "kept": kept,
                         "joins": sum(j is not None for j in joins),
-                        "kind": kind, "level": name, "objs": objs,
+                        "kind": kind, "level": name, "objs": objs, "cover": cover,
                     })
-                    got += 1
-                    print("%s %s item %d kind %d node %d/%d: fit %.0f%%, model %d/%d, kept %d, joins %d"
-                          % (name, N.eid_name(zeid), k, kind, n, len(pos), 100 * frac, seen, total,
-                             kept, cases[-1]["joins"]))
+                    if regular:
+                        got[side] += 1
+                    print("%s %s item %d kind %d node %d/%d: H %d, model %d/%d, kept %d, joins %d, pool %d, "
+                          "cover %d/%d" % (name, N.eid_name(zeid), k, kind, n, len(pos), h, seen, total, kept,
+                                           cases[-1]["joins"], len(pool_ids), cover[0], cover[1]))
     with open(args.out, "wb") as f:
         f.write(b"C2FS")
         f.write(struct.pack("<I", len(cases)))
@@ -289,10 +364,11 @@ def main() -> int:
             f.write(struct.pack("<III", c["zone"], c["item"], c["node"]))
             f.write(struct.pack("<3i", *c["cam"]))
             f.write(struct.pack("<9i", *c["r"]))
-            f.write(struct.pack("<4i", 256, 256 << 16, 108 << 16, MARGIN))
+            f.write(struct.pack("<4i", c["h"], 256 << 16, 108 << 16, MARGIN))
             merged = c["merged"] or []
             f.write(struct.pack("<5I", c["seen"], c["total"], len(merged), c["kept"], c["joins"]))
             f.write(struct.pack("<Q", fnv(merged) if c["merged"] else 0))
+            f.write(struct.pack("<2i", *c["cover"]))
             f.write(struct.pack("<I", len(c["objs"])))
             for v, verdict in c["objs"]:
                 f.write(struct.pack("<Ii", v, verdict))

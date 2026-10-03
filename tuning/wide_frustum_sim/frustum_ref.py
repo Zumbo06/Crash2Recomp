@@ -5,21 +5,40 @@ What the hook draws at node n when it can judge the camera:
     (past the path's ends, the linked path's, world slots mapped by world
     EID) that the game's list L(n) does not, nearest node first, each with the
     position in L(n) of the last polygon before it in its own list that L(n)
-    holds;
+    holds; on a side-on path (kind 3, 8) then the pool's - every polygon the
+    other paths of the zone and of its neighbour zones list - after L(n)'s
+    last polygon;
   - the model check: most of L(n) must land in the 4:3 frame;
   - kept: candidates reaching into the extra columns (outside 512 wide, inside
-    it plus the margin), at most len(L(n)) + 32, nearest first;
+    it plus the margin), at most len(L(n)) + 32, in candidate order; on a
+    side-on path never one with a corner the GTE cannot place, and a pool
+    polygon only wholly in the extra columns of one side;
   - the list: L(n), each kept candidate right after its anchor.
+On a side-on path, the void cover: per side, how far in from the wide
+frame's edge the void enclosed in the extra columns reaches (void_cover).
 The projection is the GTE's RTPS in integers, no translation, no squash.
 """
 from __future__ import annotations
 
+import math
 import struct
+
+import numpy as np
 
 FRUSTUM_K = 20
 MAX_LIST = 1520
+MAX_CAND = 12288
+POOL_MAX = 8192
 GUARD = 24
 FRAME_H = 216
+VC_CELL = 2
+VC_STRIP = 16
+VC_BAND = 48
+VC_OPEN = 50
+VC_COLS = 80
+VC_ROWS = FRAME_H // VC_CELL
+VC_GROW = 1.5
+VC_MIN = 4
 
 
 def key(v):
@@ -79,6 +98,14 @@ def project(cam, x, y, z):
     return px, py
 
 
+def placeable(cam, x, y, z):
+    """In front of the eye and far enough that the GTE's division does not
+    saturate (H < 2 SZ)."""
+    r = cam["r"]
+    m3 = (r[6] * x + r[7] * y + r[8] * z) >> 12
+    return m3 > 0 and cam["h"] < 2 * min(m3, 0xFFFF)
+
+
 OUT, IN43, WIDE = 0, 1, 2
 
 
@@ -107,6 +134,31 @@ def classify(cam, corners, margin):
     return WIDE if aside else IN43
 
 
+def side_keep(cam, corners, margin, from_pool):
+    """A side-on path's verdict: WIDE with every corner placeable; a pool
+    polygon only wholly left or wholly right of the 4:3 columns."""
+    lo, hi = -margin - GUARD, 512 + margin + GUARD
+    all_l = all_r = all_t = all_b = True
+    left = right = 0
+    for x, y, z in corners:
+        if not placeable(cam, x, y, z):
+            return False
+        sx, sy = project(cam, x, y, z)
+        all_l &= sx < lo
+        all_r &= sx >= hi
+        all_t &= sy < -GUARD
+        all_b &= sy >= FRAME_H + GUARD
+        if sx < 0:
+            left += 1
+        elif sx >= 512:
+            right += 1
+    if all_l or all_r or all_t or all_b:
+        return False
+    if not left and not right:
+        return False
+    return not from_pool or left == len(corners) or right == len(corners)
+
+
 BODY = 384
 
 
@@ -126,9 +178,151 @@ def object_verdict(cam, margin, cam_pos, obj_pos):
     return int(lo <= sx < hi and -GUARD - body <= sy < FRAME_H + GUARD + body and (sx < 0 or sx >= 512))
 
 
-def candidates(lists, n, joins, k=FRUSTUM_K):
+def pool(zone_worlds, paths):
+    """A side-on path's pool. paths: [(world EIDs of that path's zone, its node
+    lists)] in the order the hook reads them - the zone's other paths, then
+    each neighbour zone's (by slot, each zone once), paths in item order.
+    Every polygon whose world this zone has, mapped to this zone's slot by
+    world EID, first one seen of each, at most POOL_MAX."""
+    out, seen = [], set()
+    for wl, lists in paths:
+        wmap = [zone_worlds.index(e) if e in zone_worlds else 0xFF for e in wl[:8]]
+        wmap += [0xFF] * (8 - len(wmap))
+        for lst in lists:
+            for v in lst:
+                if len(out) >= POOL_MAX:
+                    return out
+                w = wmap[v >> 13]
+                if w == 0xFF:
+                    continue
+                m = (w << 13) | (v & 0x1FFF)
+                if key(m) in seen:
+                    continue
+                seen.add(key(m))
+                out.append(m)
+    return out
+
+
+def _vc_tri(cells, s, marg, cols, x, y):
+    """Mark side s's cells whose centres the triangle grown by VC_GROW
+    covers - every step in float32, in the C's order."""
+    f = np.float32
+    x = [f(v) for v in x]
+    y = [f(v) for v in y]
+    area = f(f(x[1] - x[0]) * f(y[2] - y[0])) - f(f(y[1] - y[0]) * f(x[2] - x[0]))
+    if f(-0.5) < area < f(0.5):
+        return
+    nx, ny, nd = [], [], []
+    for e in range(3):
+        a, b = e, (e + 1) % 3
+        ex, ey = f(x[b] - x[a]), f(y[b] - y[a])
+        ln = f(math.sqrt(float(f(f(ex * ex) + f(ey * ey)))))
+        if not ln > 0:
+            return
+        k = f(f(1.0 if area > 0 else -1.0) / ln)
+        nxe, nye = f(f(-ey) * k), f(ex * k)
+        nx.append(nxe)
+        ny.append(nye)
+        nd.append(f(-f(f(nxe * x[a]) + f(nye * y[a]))))
+    x0, x1, y0, y1 = min(x), max(x), min(y), max(y)
+    g, cell = f(VC_GROW), f(VC_CELL)
+    edge = f(-marg) if s == 0 else f(512 + marg)
+    if s == 0:
+        c0 = math.floor(f(f(f(x0 - g) - edge) / cell))
+        c1 = math.floor(f(f(f(x1 + g) - edge) / cell))
+    else:
+        c0 = math.floor(f(f(f(edge - x1) - g) / cell))
+        c1 = math.floor(f(f(f(edge - x0) + g) / cell))
+    r0, r1 = math.floor(f(f(y0 - g) / cell)), math.floor(f(f(y1 + g) / cell))
+    c0, c1 = max(c0, 0), min(c1, cols - 1)
+    r0, r1 = max(r0, 0), min(r1, VC_ROWS - 1)
+    half = f(cell * f(0.5))
+    for r in range(r0, r1 + 1):
+        py = f(f(f(r) * cell) + half)
+        for c in range(c0, c1 + 1):
+            if cells[r][c]:
+                continue
+            if s == 0:
+                px = f(f(edge + f(f(c) * cell)) + half)
+            else:
+                px = f(f(edge - f(f(c) * cell)) - half)
+            if all(f(f(f(nx[e] * px) + f(ny[e] * py)) + nd[e]) >= -g for e in range(3)):
+                cells[r][c] = 1
+
+
+def void_cover(cam, worlds, offsets, polys, marg):
+    """[left, right]: how many px in from the wide frame's edge the cover
+    reaches (crash2_wide_slst.h's c2sl_vc_scan)."""
+    cols = min((marg + VC_BAND + VC_CELL - 1) // VC_CELL, VC_COLS)
+    mcols = (marg + VC_CELL - 1) // VC_CELL
+    scols = min(mcols + VC_STRIP // VC_CELL, cols)
+    cells = [[[0] * cols for _ in range(VC_ROWS)] for _ in range(2)]
+    lo, hi = -marg, 512 + marg
+    for pid in polys:
+        w = pid >> 13
+        if w >= len(worlds) or worlds[w] is None:
+            continue
+        cs = worlds[w].corners(pid, offsets[w])
+        if not cs:
+            continue
+        pts = [project(cam, *c) for c in cs]
+        if any(p is None for p in pts):
+            continue
+        sx = [p[0] for p in pts]
+        sy = [p[1] for p in pts]
+        if all(v < lo for v in sx) or all(v >= hi for v in sx) or all(v < 0 for v in sy) or \
+                all(v >= 217 for v in sy):
+            continue
+        near_l = any(v < VC_BAND + 2 for v in sx)
+        near_r = any(v >= 512 - VC_BAND - 2 for v in sx)
+        tris = [(0, 1, 2), (1, 2, 3)] if len(cs) == 4 else [(0, 1, 2)]
+        for t in tris:
+            tx = [sx[i] for i in t]
+            ty = [sy[i] for i in t]
+            if max(tx) - min(tx) > 1023 or max(ty) - min(ty) > 511:
+                continue
+            if near_l and min(tx) < VC_BAND + 2:
+                _vc_tri(cells[0], 0, marg, cols, tx, ty)
+            if near_r and max(tx) >= 512 - VC_BAND - 2:
+                _vc_tri(cells[1], 1, marg, cols, tx, ty)
+    out = []
+    for s in range(2):
+        g = cells[s]
+        band_void = sum(1 for r in range(VC_ROWS) for c in range(mcols, cols) if not g[r][c])
+        if band_void * VC_OPEN > VC_ROWS * (cols - mcols):
+            out.append(0)                       # a dark, open scene: no cover
+            continue
+        queue = [(r, c) for r in range(VC_ROWS) for c in range(mcols, scols) if not g[r][c]]
+        for r, c in queue:
+            g[r][c] = 2
+        head = 0
+        while head < len(queue):
+            r, c = queue[head]
+            head += 1
+            for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if 0 <= rr < VC_ROWS and 0 <= cc < scols and not g[rr][cc]:
+                    g[rr][cc] = 2
+                    queue.append((rr, cc))
+        edge = [(r, 0) for r in range(VC_ROWS) if not g[r][0]]
+        for r, c in edge:
+            g[r][c] = 3
+        head = 0
+        while head < len(edge):
+            r, c = edge[head]
+            head += 1
+            for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if 0 <= rr < VC_ROWS and 0 <= cc < mcols and not g[rr][cc]:
+                    g[rr][cc] = 3
+                    edge.append((rr, cc))
+        inner = max((c for _, c in edge), default=-1)
+        want = (inner + 1) * VC_CELL + 1 if len(edge) >= VC_MIN else 0
+        out.append(min(want, marg))
+    return out
+
+
+def candidates(lists, n, joins, k=FRUSTUM_K, pool_ids=()):
     """joins[0] / joins[1]: (lists, at_start, map) of the path linked at the
-    start / end, or None."""
+    start / end, or None. (polygon, anchor, from the pool) each."""
     game = lists[n]
     pos = {}
     for i, v in enumerate(game):
@@ -157,13 +351,23 @@ def candidates(lists, n, joins, k=FRUSTUM_K):
                     if kk in pos:
                         anchor = pos[kk]
                     continue
+                if len(out) >= MAX_CAND:
+                    break
                 seen.add(kk)
-                out.append((v, anchor))
+                out.append((v, anchor, False))
+    for v in pool_ids:
+        if len(out) >= MAX_CAND:
+            break
+        if key(v) in seen:
+            continue
+        seen.add(key(v))
+        out.append((v, len(game) - 1, True))
     return out
 
 
-def draw(cam, worlds, offsets, lists, n, joins, margin):
-    """(model_seen, model_total, merged list, kept count)."""
+def draw(cam, worlds, offsets, lists, n, joins, margin, side=False, pool_ids=()):
+    """(model_seen, model_total, merged list, kept count). side: a side-on
+    path (kind 3 or 8) with its pool."""
     game = lists[n]
 
     def corners(pid):
@@ -182,19 +386,20 @@ def draw(cam, worlds, offsets, lists, n, joins, margin):
     model = total >= 8 and seen * 2 >= total
     if not model:
         return seen, total, None, 0
-    cands = candidates(lists, n, joins)
+    cands = candidates(lists, n, joins, pool_ids=pool_ids if side else ())
     budget = min(len(game) + 32, MAX_LIST - len(game))
     keep = []
-    for v, anchor in cands:
+    for v, anchor, from_pool in cands:
         ok = False
         if budget > 0:
             c = corners(v)
-            if c is not None and classify(cam, c, margin) == WIDE:
+            if c is not None and (side_keep(cam, c, margin, from_pool) if side
+                                  else classify(cam, c, margin) == WIDE):
                 ok = True
                 budget -= 1
         keep.append(ok)
     by_anchor = {}
-    for (v, anchor), ok in zip(cands, keep):
+    for (v, anchor, _), ok in zip(cands, keep):
         if ok:
             by_anchor.setdefault(anchor, []).append(v)
     merged = []

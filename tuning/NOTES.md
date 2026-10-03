@@ -3797,3 +3797,259 @@ paths, mid-path and near an end, 70 of them reaching into a linked path.
 - **The view.** Side margins in forward sections, side-scrollers and across
   path ends should no longer fill in late. Nothing should show through walls
   inside the 4:3 area.
+
+## Widescreen, part 13: black triangles in side-on scenes
+
+Patch 0053.
+
+**The report.** After 0052, black triangles still showed at the outer edges of
+2D (side-on) scenes: Snow Go's ice cave and the bonus rounds.
+
+**Two attempts after 0052 were withdrawn.**
+
+- One dropped near-plane wedges from the additions.
+- The other drew polygons no list held, which put the sky over the walls of
+  a forward room.
+
+The request was then to fix only the triangles, and only in 2D scenes, so this
+part starts again from 0052.
+
+### The game's camera, read exactly
+
+Part 12 judged offline views with a camera fitted to each node's list. The
+game's own camera is now decoded:
+
+- **Where.** At rest it sits on its path's point for the node: zone origin +
+  0x04B[node] (`0x80026A08`, called by the camera update at `0x80022C14`).
+- **Which way.** The item after the path in the zone (three items per path;
+  property 0x173 of every one of the 1,990 paths is its index) holds 0x04B
+  rows of two int16 triples per node.
+  - The first triple is the camera's x, y, z angle, 4096 to a turn.
+  - `0x80026A08` writes it beside the position (`0x800607F4` + 12).
+- **The matrix** (`0x80017BC4`):
+  - Rz(-z), times Rx(-x), times Ry(-y), using the game's sine table
+    (`0x8005BCB0`) and MVMVA's >> 12;
+  - `0x80017AF8` then copies it to `0x80060774` for the world draw, with row 1
+    times -5/8 (the frame's aspect) and row 2 negated.
+- **H** is the path's 0x130 at the node, 288 without it. OFX/OFY are 256/108
+  (`0x8004EFE8`, called from `0x80017F70`).
+- **In play**, a look toward Crash turns it from there, within per-node limits
+  (0x119; `0x800231B0`).
+
+On side-on paths, 71 to 95% of the game's own list lands inside the 4:3 frame
+with this camera (median 86%). The fitted cameras reached 55 to 76%.
+
+### What the triangles are
+
+Snow Go's side-on paths were rendered offline with that camera:
+
+- **What was drawn:** the game's list, 0047's widened test and 0052's
+  additions, far to near, with the GPU's size limit applied.
+- **The reference:** every polygon of the zone's worlds.
+
+What the comparison showed:
+
+- **No wedges.** In Snow Go's views neither 0052's additions nor the game's own
+  polygons had a corner the GTE cannot place. Across the game, 0052 drew 8 such
+  wedges, all in S0000026. The withdrawn near-plane fix had answered the fitted
+  cameras, not the game.
+- **Gaps.** 1.1% of the extra columns stayed black although the zone's worlds
+  have geometry there.
+  - They are mostly at the bottom corners, where a path starts or ends.
+  - Each such polygon is held by the list of another camera path: 35% by
+    another path of the same zone, 65% by a path of another zone.
+  - From this path's nodes the 4:3 frame never sees it, so no list within
+    reach holds it.
+- **Void.** 1.3% has no geometry in any world of the zone or its neighbours.
+  Nothing can be drawn there.
+
+### Patch 0053
+
+Everything is in `crash2_wide_slst.h`, for kind 3 and 8 paths only. Forward
+paths behave exactly as in 0052.
+
+- **The pool.** These lists become candidates, after the nodes' own and last
+  in the budget:
+  - every other camera path of the zone;
+  - every path of its neighbour zones, mapped to this zone's world slots by
+    world EID.
+
+  The pool is built when the path changes, and rebuilt when the zone or the set
+  of resident SLST entries changes. The largest seen held 7,529 polygons.
+- **The 4:3 frame stays the game's.** A pool polygon is drawn only while every
+  corner lies outside the 4:3 columns, all on one side. Another path's list
+  says nothing about what this view should show inside the frame.
+- **No wedges, by rule.** On these paths a candidate with a corner the GTE
+  cannot place (behind the eye, or H >= 2 SZ) is never added. The look toward
+  Crash could otherwise turn one into view.
+- **Four SLST entries** rebuild cleanly but do not end on their own end list.
+  - They differ by 1 to 6 polygons: three side-on paths of S000000F, and one
+    forward path of S000001F.
+  - Walking forward, the game builds exactly these lists.
+  - 0052 refused the whole path. Side-on paths now use them, and each node
+    still has to match the game's own list.
+
+**Counters.** `wide_slst` gains `pool` (the current side-on path's pool) and
+`pool_drawn` (pool polygons the last frame drew). `bad` still counts those four
+entries.
+
+### Checked without the game
+
+**Every side-on view of the game, with the real camera** (one node in four,
+3,069 views):
+
+| | 0052 | 0053 |
+|---|---|---|
+| extra columns with geometry but nothing drawn | 1.52% | 0.45% |
+| additions with a corner the GTE cannot place | 8 | 0 |
+| 4:3 pixels not as the game's own list draws them | 0.241% | 0.241% |
+
+- **Snow Go:** 1.11% to 0.02%.
+- **The bonus rounds:** for example, 1.91% to 0.04% in S000000A.
+- **The budget** (count + 32 additions) fills in 97 views (3.2%), in
+  S0000026, S0000010, S000000F and S0000016, leaving pool polygons out. It
+  stays as it is: it protects the frame's primitive buffer.
+- **What stays missing** is mostly in those four levels, and in S0000018 to
+  S0000021, where the resting camera fits the game least: offline, the game's
+  own list leaves 2 to 7% of the 4:3 frame empty there.
+- **Void,** where there is nothing to draw: 4.5% overall, 1.3% in Snow Go.
+
+**`wide_frustum_sim`** now runs on the game's own camera, and on the extra
+data the pool reads.
+
+- **Cases.** 122: two per level on side-on paths and two on others.
+  - 50 were judged on side-on paths, every one with a pool (the largest 3,655).
+- **The checks.**
+  - Every list equals `frustum_ref.py`'s.
+  - All 11,326 additions on side-on paths have every corner placeable.
+  - Every pool polygon lies wholly in the extra columns.
+  - Other paths have no pool.
+- **The cost,** at -O2:
+  - the first frame on a node, pool build included: at most 0.74 ms;
+  - later frames: 0.04 ms on average, 0.14 ms at most.
+
+**`wide_slst_sim`.**
+
+- 1,990 entries and 63,950 node lists, all equal to the reference.
+- 4 entries do not end on their end list.
+- Its stats buffer held 6 of the 12 values `crash2_wide_slst_stats` wrote (14
+  now). Fixed.
+
+### To check in play
+
+- **Snow Go's ice cave and the bonus rounds.** The black triangles at the
+  bottom corners and at path ends should be gone.
+  - What can stay black is void, where the level has no geometry at all.
+  - Inside the 4:3 frame nothing should change.
+- **Forward rooms** should look exactly as with 0052.
+- **The counters.** On a side-on path, `wide_slst` `pool` should be in the
+  hundreds to thousands, and `pool_drawn` above 0 near path ends.
+
+## Widescreen, part 14: a straight edge where the level ends
+
+Patch 0054.
+
+**The report.** After 0053 the black triangles at the edges of 2D scenes were
+still there. The reporter's guess was right: the engine has nothing to render
+there.
+
+### What is left after 0053
+
+The offline renders of part 13 (the game's camera, everything the runtime
+draws) leave two kinds of black in the extra columns:
+
+- **Void.** The zone's worlds and its neighbours' have no geometry there at
+  all: 1.3% of Snow Go's side-on extra columns, and up to a fifth in a few
+  views.
+  - The cleared frame shows through, bounded by the polygon edges where the
+    modelled scene stops: wedges, mostly in the bottom corners.
+  - The 4:3 frame never looks there, so nothing was ever built for it.
+- **Darkness the scene shows anyway.** Some levels have open black space in
+  the 4:3 view itself (S000000F's caves between ceiling and platforms) and
+  dark gaps between structures. More of the same at the edges is how the
+  scene looks.
+
+Nothing can be drawn into void. So the void wedges are covered, and the scene's
+own darkness is left alone.
+
+### Patch 0054: the void cover
+
+In `crash2_wide_slst.h`, on kind 3 and 8 paths only, once the camera test has
+judged the frame:
+
+- **Coverage.** Every polygon the world draw gets is rasterised as the renderer
+  will project it: its screen test applies, and so does the GPU's 1023 x 511
+  limit.
+  - Resolution: 2-px cells, over the extra columns and the 48 px of the 4:3
+    frame beside them.
+  - Each triangle is grown by 1.5 px, so the cracks between polygons do not
+    count as void.
+- **Left alone:**
+  - void connected to the first 16 px of the 4:3 frame: open space the 4:3
+    view shows too;
+  - gaps inside the extra columns that do not reach the frame's edge;
+  - a whole side whose 48 px of the 4:3 frame show more than 2% void of their
+    own: a dark, open scene.
+- **Covered:** the rest of the void that reaches the frame's outer edge, from
+  that edge to its innermost cell.
+  - It is one black, opaque POLY_F4 per side, written to the frame's primitive
+    buffer.
+  - It is linked into ordering-table slot 2046. The table is drawn from slot 0
+    up (`0x8003BC5C` links it forward), and world polygons use slots 0-1904,
+    so the cover is drawn after all the scenery.
+  - No draw mode is set or left behind.
+- **Over time.** The cover grows at once to hide a new wedge. When less is
+  needed it holds for 15 frames, then shrinks 2 px a frame. It never enters
+  the 4:3 frame.
+
+**Counters.** `wide_slst` gains `cover_l` / `cover_r` (px, as drawn) and
+`covered` (frames drawn with a cover).
+
+### A bug the checks caught
+
+The first version split quads into one triangle too many, which read a fifth
+corner past the end of the array. Results then depended on what was in
+memory: the simulator passed at -O1 and -O3 and failed at -O0 and -O2. It now
+passes at every level, and under UBSan and ASan.
+
+### Checked without the game
+
+**Every side-on view of the game, with the real camera** (one node in four):
+
+- **All levels.** 3,069 views; a cover in 588 (19%), covering 5.6% of the
+  extra columns. Black there goes from 4.98% to 3.80%. Most of what stays is
+  the dark caves' own darkness (S000000F 18.5%, S0000016 15.5%), left alone on
+  purpose.
+
+- **Snow Go:** a cover in 35 of 304 views. Black in the extra columns goes from
+  1.34% to 0.05%, and 5.5% of the extra columns are covered.
+- **S000000F's dark caves:** a cover in 22 of 192 views, against 145 before the
+  dark-scene rule. 2.8% is covered.
+- **The bonus areas of S0000018 to S0000021** are where the cover is most often
+  drawn: black goes from 4.5-9.3% to 0.5-0.9%, and 22-34% is covered. The
+  resting camera fits the game least there, so play may differ.
+
+**`wide_frustum_sim`.**
+
+- **Cases.** 144, of which 72 are side-on.
+  - The export adds one side-on case per level that needs a cover; 33 cases
+    have one.
+- **The checks.**
+  - `frustum_ref.py` scans the same way, in float32 in the C's order, and the
+    C matches it exactly on every case.
+  - Every cover is a black opaque POLY_F4, linked in slot 2046, and stays in
+    the extra columns.
+  - Other paths have no cover.
+- **The cost,** at -O2: 0.18 ms per frame on average, 0.65 ms at most. The
+  first frame on a node, with the pool build, takes at most 1.35 ms.
+
+### To check in play
+
+- **Snow Go's ice cave and the bonus rounds.** Where the black triangles were,
+  each side should now show a straight black edge that slides in and out as
+  the level runs out of geometry.
+- **Elsewhere on side-on paths,** nothing should change: no cover in front of
+  scenery that exists.
+- **Dark caves** (black space between structures in the 4:3 view too) should
+  look as before.
+- **The counters.** `wide_slst` `cover_l` / `cover_r` show the cover's width.

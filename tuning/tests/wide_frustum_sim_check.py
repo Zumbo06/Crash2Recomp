@@ -2,7 +2,8 @@
 against real level data, in wide_frustum_sim.
 
 Exports cases - a camera path's zone, worlds and SLST, the paths linked at its
-ends, a fitted camera, and what frustum_ref.py says the hooks do - to a
+ends and, on side-on paths, the zones and SLSTs its pool reads; the game's own
+camera at the node; and what frustum_ref.py says the hooks do - to a
 temporary folder (game data, never written into the repository), builds
 tuning/wide_frustum_sim/sim.c against the live framework tree and runs it with
 the real executable as guest RAM. Skipped when the toolchain, the tree, the
@@ -67,6 +68,7 @@ class WideFrustumModelTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout[-4000:] + run.stderr)
         self.assertIn("ALL CHECKS PASSED", run.stdout)
         self.assertIn("0 against the camera's verdict", run.stdout)
+        self.assertIn("with a pool", run.stdout)
 
 
 if __name__ == "__main__":

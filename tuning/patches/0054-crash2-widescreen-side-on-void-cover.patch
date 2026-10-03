@@ -1,0 +1,454 @@
+Widescreen, side-on paths: a straight edge where the level has no geometry.
+
+Reported after 0053: the black triangles at the edges of 2D scenes are still
+there. Offline with the game's camera, what remains is void: in the extra
+columns there is no geometry in any world of the zone or its neighbours
+(1.3% of Snow Go's side-on extra columns, up to a fifth in a few views), so
+the cleared frame shows between the polygon edges where the modelled scene
+ends - wedges. Nothing can be drawn there.
+
+crash2_wide_slst.h, side-on paths only (forward paths unchanged):
+- each frame, the polygons the world draw gets are rasterised as the renderer
+  will project them (its screen test, the GPU's size limit) at 2-px cells
+  over the extra columns and a 16-px strip of the 4:3 frame, each triangle
+  grown 1.5 px so cracks between polygons do not count;
+- void reaching the strip is open space the 4:3 view shows too, and gaps
+  inside the extra columns are as dark as the 4:3 view's own: both stay;
+- a side whose 48 px of the 4:3 frame show void of their own (over 2%) is a
+  dark, open scene (S000000F's caves), where more darkness at the edge is no
+  wedge: no cover there;
+- the rest of the void reaching the frame's outer edge is covered, from that
+  edge to its innermost cell, by one black opaque POLY_F4 per side linked
+  into the world's ordering-table slot 2046, after all the scenery; no draw
+  mode is touched;
+- the cover grows at once, holds 15 frames once less is needed, then shrinks
+  2 px a frame; it never enters the 4:3 frame.
+
+Counters: wide_slst cover_l / cover_r (px) and covered (frames);
+crash2_wide_slst_stats fills 17 values.
+
+tuning/wide_frustum_sim: frustum_ref.py scans the same way in float32 and the
+C matches it exactly on all 72 side-on cases (33 with a cover), at -O0
+to -O3. Later frames 0.18 ms on average, 0.65 ms at most.
+
+No file here is in codegen_hash_sources.cmake.
+
+--- a/runtime/src/crash2_wide_slst.h
++++ b/runtime/src/crash2_wide_slst.h
+@@ -74,6 +74,25 @@
+  *   - A candidate with a corner the GTE cannot place (behind the eye, or so
+  *     near that its division saturates) is never added: it would be drawn as
+  *     a wedge from wherever that corner lands.
++ *   - The void cover. Where the level has no geometry at all - nothing in any
++ *     world of the zone or its neighbours - the extra columns show the cleared
++ *     frame: black wedges between the polygon edges where the modelled scene
++ *     ends (1.3% of Snow Go's side-on extra columns, up to a fifth in a few
++ *     views). Nothing can be drawn there. So each frame the polygons the world
++ *     draw gets are rasterised, as the renderer will project them, at 2-px
++ *     cells over the extra columns and a 16-px strip of the 4:3 frame beside
++ *     them, each triangle grown 1.5 px so the cracks between polygons do not
++ *     count. Void that reaches the strip is open space the 4:3 view shows as
++ *     well and stays; so do gaps inside the extra columns, as dark as the
++ *     ones the 4:3 view shows between its own polygons. And a side whose 48
++ *     px of the 4:3 frame show void of their own (over 2% of them) is a dark,
++ *     open scene - S000000F's caves - where more of that darkness at the edge
++ *     is no wedge: no cover there. What is covered is the rest of the void
++ *     that reaches the frame's outer edge - the wedges - from that edge inward
++ *     to its innermost cell, by one black flat quad per side in the world's
++ *     last ordering-table slot (after all the scenery): a straight edge
++ *     instead of wedges. The cover grows at once, holds 15 frames once less
++ *     is needed, then shrinks 2 px a frame.
+  *
+  * How far, when it cannot (the node window):
+  *
+@@ -130,6 +149,18 @@
+ #define C2SL_MAX_CAND    12288        /* candidates for the camera test        */
+ #define C2SL_POOL_MAX    8192         /* side-on pool: other paths' polygons   */
+ #define C2SL_POOL_PATHS  256          /* paths the pool reads, all zones       */
++#define C2SL_VC_CELL     2            /* void cover: px a coverage cell spans  */
++#define C2SL_VC_STRIP    16           /* px of the 4:3 frame: void here is open */
++#define C2SL_VC_BAND     48           /* px of the 4:3 frame scanned beside it */
++#define C2SL_VC_OPEN     50           /* band void over 1/50: a dark open scene */
++#define C2SL_VC_COLS     80           /* cells across: margin + band <= 160 px  */
++#define C2SL_VC_ROWS     (C2WG_FRAME_H / C2SL_VC_CELL)
++#define C2SL_VC_GROW     1.5f         /* px each triangle grows: cracks are not void */
++#define C2SL_VC_MIN      4            /* void cells a side needs before covering */
++#define C2SL_VC_HOLD     15           /* frames held once less is needed        */
++#define C2SL_VC_SHRINK   2            /* px a frame it then shrinks by          */
++#define C2SL_VC_OT       2046u        /* ordering-table slot: after the scenery */
++#define C2SL_VC_PRIM     24u          /* bytes of one cover quad (POLY_F4)      */
+ #define C2SL_SENT        0xFFFF00
+ 
+ #ifndef C2SL_R32
+@@ -141,6 +172,10 @@
+ #define C2SL_R16(a)     psx_read_half(a)
+ #define C2SL_W16(a, v)  psx_write_half((a), (v))
+ #define C2SL_ALLOC(n)   psx_mod_memory_alloc((n), 4u)
++#endif
++#ifndef C2SL_W32
++extern void     psx_write_word(uint32_t a, uint32_t v);
++#define C2SL_W32(a, v)  psx_write_word((a), (v))
+ #endif
+ 
+ static const uint32_t c2sl_words[][2] = {
+@@ -259,6 +294,11 @@
+ static uint8_t  c2sl_pool_have[65536 / 8];
+ static C2slEntry c2sl_pool_tmp;
+ static int      c2sl_pool_drawn;            /* pool polygons the last frame drew */
++/* The void cover: per side (0 left, 1 right), the coverage of the last scan
++ * (0 void, 1 covered, 2 open void), the columns wanted this frame and shown
++ * (px from the wide frame's edge), frames since more than wanted was shown. */
++static uint8_t  c2sl_vc_cell[2][C2SL_VC_ROWS][C2SL_VC_COLS];
++static struct { int want[2], shown[2], idle[2], cols, marg; unsigned long long frames; } c2sl_vc;
+ static int      c2sl_model_seen, c2sl_model_total;
+ /* The side-on window of one path. */
+ static struct { uint32_t cam, zone; int nodes, base, margin, kw; } c2sl_side;
+@@ -781,6 +821,148 @@
+     return n;
+ }
+ 
++/* Mark the cells of side `s` whose centres one screen triangle (grown by
++ * C2SL_VC_GROW) covers. Side 0's column c spans x from -margin + 2c, side 1's
++ * from 512 + margin - 2(c + 1): column 0 is at the wide frame's edge. */
++static void c2sl_vc_tri(int s, const float *x, const float *y)
++{
++    const float area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
++    if (area > -0.5f && area < 0.5f) return;
++    float nx[3], ny[3], nd[3];
++    for (int e = 0; e < 3; ++e) {
++        const int a = e, b = (e + 1) % 3;
++        const float ex = x[b] - x[a], ey = y[b] - y[a];
++        const float len = sqrtf(ex * ex + ey * ey);
++        if (!(len > 0.0f)) return;
++        const float k = (area > 0.0f ? 1.0f : -1.0f) / len;
++        nx[e] = -ey * k; ny[e] = ex * k;                 /* inside: >= -grow */
++        nd[e] = -(nx[e] * x[a] + ny[e] * y[a]);
++    }
++    float x0 = x[0], x1 = x[0], y0 = y[0], y1 = y[0];
++    for (int i = 1; i < 3; ++i) {
++        if (x[i] < x0) x0 = x[i];
++        if (x[i] > x1) x1 = x[i];
++        if (y[i] < y0) y0 = y[i];
++        if (y[i] > y1) y1 = y[i];
++    }
++    const float g = C2SL_VC_GROW, cell = (float)C2SL_VC_CELL;
++    const float edge = s == 0 ? (float)-c2sl_vc.marg : (float)(512 + c2sl_vc.marg);
++    int c0, c1;
++    if (s == 0) { c0 = (int)floorf((x0 - g - edge) / cell); c1 = (int)floorf((x1 + g - edge) / cell); }
++    else        { c0 = (int)floorf((edge - x1 - g) / cell); c1 = (int)floorf((edge - x0 + g) / cell); }
++    int r0 = (int)floorf((y0 - g) / cell), r1 = (int)floorf((y1 + g) / cell);
++    if (c0 < 0) c0 = 0;
++    if (c1 > c2sl_vc.cols - 1) c1 = c2sl_vc.cols - 1;
++    if (r0 < 0) r0 = 0;
++    if (r1 > C2SL_VC_ROWS - 1) r1 = C2SL_VC_ROWS - 1;
++    for (int r = r0; r <= r1; ++r) {
++        const float py = (float)r * cell + cell * 0.5f;
++        for (int c = c0; c <= c1; ++c) {
++            if (c2sl_vc_cell[s][r][c]) continue;
++            const float px = s == 0 ? edge + (float)c * cell + cell * 0.5f
++                                    : edge - (float)c * cell - cell * 0.5f;
++            if (nx[0] * px + ny[0] * py + nd[0] >= -g && nx[1] * px + ny[1] * py + nd[1] >= -g &&
++                nx[2] * px + ny[2] * py + nd[2] >= -g)
++                c2sl_vc_cell[s][r][c] = 1;
++        }
++    }
++}
++
++/* This frame's void on each side: rasterise every polygon of `list` the
++ * renderer will draw (its screen test, the GPU's size limit) over the extra
++ * columns and the 4:3 band beside them; no cover where the band shows void
++ * of its own; else flood the void reaching the 4:3 strip as open (2), then
++ * the rest of the void reaching the frame's outer edge (3), and want the side
++ * covered up to the innermost cell of that. */
++static void c2sl_vc_scan(const C2wgCam *cam, const C2wgWorld *ws, int nw, const uint8_t *ram,
++                         const uint16_t *list, int n)
++{
++    const int marg = cam->margin;
++    c2sl_vc.marg = marg;
++    c2sl_vc.cols = (marg + C2SL_VC_BAND + C2SL_VC_CELL - 1) / C2SL_VC_CELL;
++    if (c2sl_vc.cols > C2SL_VC_COLS) c2sl_vc.cols = C2SL_VC_COLS;
++    const int cols = c2sl_vc.cols, mcols = (marg + C2SL_VC_CELL - 1) / C2SL_VC_CELL;
++    const int scols = mcols + C2SL_VC_STRIP / C2SL_VC_CELL < cols ? mcols + C2SL_VC_STRIP / C2SL_VC_CELL : cols;
++    memset(c2sl_vc_cell, 0, sizeof c2sl_vc_cell);
++    const int lo = -marg, hi = 512 + marg;
++    for (int i = 0; i < n; ++i) {
++        int32_t v[4][3];
++        const int k = c2wg_poly(ram, ws, nw, list[i], v);
++        if (!k) continue;
++        int sx[4], sy[4], ok = 1, all_l = 1, all_r = 1, all_t = 1, all_b = 1, near_l = 0, near_r = 0;
++        for (int q = 0; q < k && ok; ++q) {
++            ok = c2wg_project(cam, v[q][0], v[q][1], v[q][2], &sx[q], &sy[q]);
++            if (sx[q] >= lo) all_l = 0;
++            if (sx[q] < hi) all_r = 0;
++            if (sy[q] >= 0) all_t = 0;
++            if (sy[q] < 217) all_b = 0;
++            if (sx[q] < C2SL_VC_BAND + 2) near_l = 1;
++            if (sx[q] >= 512 - C2SL_VC_BAND - 2) near_r = 1;
++        }
++        if (!ok || all_l || all_r || all_t || all_b) continue;     /* not drawn */
++        for (int t = 0; t < k - 2; ++t) {                         /* (0,1,2), (1,2,3) */
++            const int a = t, b = t + 1, c = t + 2;
++            int mnx = sx[a], mxx = sx[a], mny = sy[a], mxy = sy[a];
++            const int idx[3] = { a, b, c };
++            for (int j = 1; j < 3; ++j) {
++                if (sx[idx[j]] < mnx) mnx = sx[idx[j]];
++                if (sx[idx[j]] > mxx) mxx = sx[idx[j]];
++                if (sy[idx[j]] < mny) mny = sy[idx[j]];
++                if (sy[idx[j]] > mxy) mxy = sy[idx[j]];
++            }
++            if (mxx - mnx > 1023 || mxy - mny > 511) continue;    /* the GPU drops it */
++            const float tx[3] = { (float)sx[a], (float)sx[b], (float)sx[c] };
++            const float ty[3] = { (float)sy[a], (float)sy[b], (float)sy[c] };
++            if (near_l && mnx < C2SL_VC_BAND + 2) c2sl_vc_tri(0, tx, ty);
++            if (near_r && mxx >= 512 - C2SL_VC_BAND - 2) c2sl_vc_tri(1, tx, ty);
++        }
++    }
++    static uint16_t queue[C2SL_VC_ROWS * C2SL_VC_COLS];
++    for (int s = 0; s < 2; ++s) {
++        uint8_t (*g)[C2SL_VC_COLS] = c2sl_vc_cell[s];
++        c2sl_vc.want[s] = 0;
++        int band_void = 0;
++        for (int r = 0; r < C2SL_VC_ROWS; ++r)
++            for (int c = mcols; c < cols; ++c) band_void += !g[r][c];
++        if (band_void * C2SL_VC_OPEN > C2SL_VC_ROWS * (cols - mcols)) continue;
++        int head = 0, tail = 0;
++        for (int r = 0; r < C2SL_VC_ROWS; ++r)
++            for (int c = mcols; c < scols; ++c)
++                if (!g[r][c]) { g[r][c] = 2; queue[tail++] = (uint16_t)(r * C2SL_VC_COLS + c); }
++        while (head < tail) {
++            const int r = queue[head] / C2SL_VC_COLS, c = queue[head] % C2SL_VC_COLS;
++            head++;
++            const int nr[4] = { r - 1, r + 1, r, r }, nc[4] = { c, c, c - 1, c + 1 };
++            for (int j = 0; j < 4; ++j)
++                if (nr[j] >= 0 && nr[j] < C2SL_VC_ROWS && nc[j] >= 0 && nc[j] < scols &&
++                    !g[nr[j]][nc[j]]) {
++                    g[nr[j]][nc[j]] = 2;
++                    queue[tail++] = (uint16_t)(nr[j] * C2SL_VC_COLS + nc[j]);
++                }
++        }
++        head = tail = 0;
++        for (int r = 0; r < C2SL_VC_ROWS; ++r)
++            if (!g[r][0]) { g[r][0] = 3; queue[tail++] = (uint16_t)(r * C2SL_VC_COLS); }
++        while (head < tail) {
++            const int r = queue[head] / C2SL_VC_COLS, c = queue[head] % C2SL_VC_COLS;
++            head++;
++            const int nr[4] = { r - 1, r + 1, r, r }, nc[4] = { c, c, c - 1, c + 1 };
++            for (int j = 0; j < 4; ++j)
++                if (nr[j] >= 0 && nr[j] < C2SL_VC_ROWS && nc[j] >= 0 && nc[j] < mcols &&
++                    !g[nr[j]][nc[j]]) {
++                    g[nr[j]][nc[j]] = 3;
++                    queue[tail++] = (uint16_t)(nr[j] * C2SL_VC_COLS + nc[j]);
++                }
++        }
++        int inner = -1;
++        for (int i = 0; i < tail; ++i)
++            if (queue[i] % C2SL_VC_COLS > inner) inner = queue[i] % C2SL_VC_COLS;
++        int want = tail >= C2SL_VC_MIN ? (inner + 1) * C2SL_VC_CELL + 1 : 0;
++        if (want > marg) want = marg;
++        c2sl_vc.want[s] = want;
++    }
++}
++
+ /* The camera test, for this frame: the camera the world draw is about to use
+  * (the GTE's rotation and projection; the worlds' offsets from the camera, as
+  * the renderer reads them). Once per node the model must put most of the
+@@ -840,8 +1022,53 @@
+             a++;
+         }
+     }
++    if (side) c2sl_vc_scan(&cam, ws, nw, ram, c2sl_out, w);
+     *out_m = w;
+     return 1;
++}
++
++/* This frame's cover, from what the scan wanted (nothing unless `judged`). */
++static void c2sl_vc_step(int judged)
++{
++    for (int s = 0; s < 2; ++s) {
++        const int want = judged ? c2sl_vc.want[s] : 0;
++        if (want >= c2sl_vc.shown[s]) {
++            c2sl_vc.shown[s] = want;
++            c2sl_vc.idle[s] = 0;
++        } else if (++c2sl_vc.idle[s] > C2SL_VC_HOLD) {
++            c2sl_vc.shown[s] -= C2SL_VC_SHRINK;
++            if (c2sl_vc.shown[s] < want) c2sl_vc.shown[s] = want;
++        }
++    }
++}
++
++/* The cover quads for this frame: black, opaque (no draw mode touched), from
++ * past the wide frame's edge to the shown width, the drawing area's rows,
++ * linked into ordering-table slot C2SL_VC_OT of `frame` at `prim`. Returns
++ * the bytes used. */
++static uint32_t c2sl_vc_draw(uint32_t frame, uint32_t prim)
++{
++    uint32_t used = 0;
++    const int marg = c2sl_vc.marg > 0 ? c2sl_vc.marg : c2sl_margin;
++    for (int s = 0; s < 2; ++s) {
++        if (c2sl_vc.shown[s] <= 0) continue;
++        const int x0 = s == 0 ? -marg - 32 : 512 + marg - c2sl_vc.shown[s];
++        const int x1 = s == 0 ? -marg + c2sl_vc.shown[s] : 512 + marg + 32;
++        const int y0 = -16, y1 = C2WG_FRAME_H + 16;
++        const uint32_t p = prim + used;
++        C2SL_W32(p + 4u, 0x28000000u);                       /* POLY_F4, black */
++        C2SL_W32(p + 8u, ((uint32_t)(uint16_t)y0 << 16) | (uint16_t)x0);
++        C2SL_W32(p + 12u, ((uint32_t)(uint16_t)y0 << 16) | (uint16_t)x1);
++        C2SL_W32(p + 16u, ((uint32_t)(uint16_t)y1 << 16) | (uint16_t)x0);
++        C2SL_W32(p + 20u, ((uint32_t)(uint16_t)y1 << 16) | (uint16_t)x1);
++        const uint32_t ot = frame + 24u + 4u * C2SL_VC_OT;
++        const uint32_t head = C2SL_R32(ot);
++        C2SL_W32(p, (5u << 24) | (head & 0x00FFFFFFu));
++        C2SL_W32(ot, (head & 0xFF000000u) | (p & 0x00FFFFFFu));
++        used += C2SL_VC_PRIM;
++    }
++    if (used) c2sl_vc.frames++;
++    return used;
+ }
+ 
+ static int c2sl_code_ok(CPUState *cpu)
+@@ -876,6 +1103,7 @@
+     c2sl_built.valid = 0;
+     memset(&c2sl_side, 0, sizeof c2sl_side);
+     memset(&c2sl_pool, 0, sizeof c2sl_pool);
++    memset(&c2sl_vc, 0, sizeof c2sl_vc);
+     c2wg_cam.ok = 0;
+ }
+ 
+@@ -891,6 +1119,7 @@
+             c2sl_n_prim_skips = c2sl_added_max = c2sl_n_side = c2sl_n_joined =
+             c2sl_n_frustum = c2sl_n_model_bad = 0;
+         c2sl_pool_drawn = 0;
++        c2sl_vc.frames = 0;
+     }
+ }
+ 
+@@ -901,8 +1130,9 @@
+  * window drew those), out[11] model_pct = the share of the game's list the
+  * model put on screen at the last node checked, out[12] pool = polygons in the
+  * current side-on path's pool, out[13] pool_drawn = how many of them the last
+- * frame drew. */
+-void crash2_wide_slst_stats(unsigned long long out[14], int *base_k, int *k,
++ * frame drew, out[14] / out[15] cover_l / cover_r = the void cover's width on
++ * each side (px), out[16] covered = frames drawn with a cover. */
++void crash2_wide_slst_stats(unsigned long long out[17], int *base_k, int *k,
+                             int *code_ok, int *added)
+ {
+     out[0] = c2sl_n_built;   out[1] = c2sl_n_used;  out[2] = c2sl_n_mismatch;
+@@ -914,6 +1144,9 @@
+         ? (unsigned long long)(100 * c2sl_model_seen / c2sl_model_total) : 0u;
+     out[12] = c2sl_built.valid && c2sl_built.side_on ? (unsigned long long)c2sl_pool.n : 0u;
+     out[13] = (unsigned long long)c2sl_pool_drawn;
++    out[14] = (unsigned long long)(c2sl_vc.shown[0] > 0 ? c2sl_vc.shown[0] : 0);
++    out[15] = (unsigned long long)(c2sl_vc.shown[1] > 0 ? c2sl_vc.shown[1] : 0);
++    out[16] = c2sl_vc.frames;
+     if (base_k)  *base_k = c2sl_base_k < 0 ? 0 : c2sl_base_k;
+     if (k)       *k = c2sl_last_k < 0 ? 0 : c2sl_last_k;
+     if (code_ok) *code_ok = c2sl_code;
+@@ -1050,23 +1283,30 @@
+     const uint16_t *out = c2sl_fb;
+     int m = c2sl_fb_n;
+     c2sl_pool_drawn = 0;
++    int judged = 0;
+     if (c2sl_ncand > 0 && c2sl_frustum(cpu, count, &m)) {
+         out = c2sl_out;
+         c2sl_n_frustum++;
+-    }
+-    if (m <= count) return;
+-    const int added = m - count;
+-    c2sl_built.added = added;
++        judged = 1;
++    }
++    c2sl_vc_step(judged && c2sl_built.side_on);
++    const int cover = c2sl_vc.shown[0] > 0 || c2sl_vc.shown[1] > 0;
++    if (m <= count && !cover) return;
++    const int added = m > count ? m - count : 0;
++    if (added) c2sl_built.added = added;
+     if ((unsigned long long)added > c2sl_added_max) c2sl_added_max = (unsigned long long)added;
+ 
+-    /* Room in this frame's primitive buffer for every added polygon. */
++    /* Room in this frame's primitive buffer for every added polygon and the
++     * cover. */
+     const uint32_t frame = cpu->gpr[5];
+     if (frame != C2SL_FRAME0 && frame != C2SL_FRAME0 + C2SL_FRAME_SIZE) return;
+     const uint32_t base = C2SL_R32(frame + 4), cur = C2SL_R32(frame + 8);
+     if (!c2sl_is_ram(base, C2SL_PRIM_SIZE) || cur < base) return;
+     const uint32_t used = cur - base;
+-    const uint32_t need = C2SL_PRIM_POLY * (uint32_t)added + C2SL_PRIM_RESERVE;
++    const uint32_t need = C2SL_PRIM_POLY * (uint32_t)added + C2SL_PRIM_RESERVE + 2u * C2SL_VC_PRIM;
+     if (used >= C2SL_PRIM_SIZE || C2SL_PRIM_SIZE - used < need) { c2sl_n_prim_skips++; return; }
++    if (cover) C2SL_W32(frame + 8, cur + c2sl_vc_draw(frame, cur));
++    if (!added) return;
+ 
+     if (!c2sl_buf) c2sl_buf = C2SL_ALLOC(4u + 2u * C2SL_MAX_LIST);
+     if (!c2sl_buf) return;
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8378,15 +8378,16 @@
+  * camera model did not put the game's own list on screen; model_pct = the
+  * share it put on screen at the last node checked; pool = polygons in the
+  * side-on path's pool (other paths' lists); pool_drawn = of those, drawn by
+- * the last frame. */
++ * the last frame; cover_l / cover_r = px of void covered at each side edge;
++ * covered = frames drawn with such a cover. */
+ extern void crash2_wide_slst_control(int k, int reset);
+-extern void crash2_wide_slst_stats(unsigned long long out[14], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[17], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ static void handle_c2_slst(int id, const char *json)
+ {
+     crash2_wide_slst_control(json_get_int(json, "k", -1),
+                              json_get_int(json, "reset", 0));
+-    unsigned long long s[14];
++    unsigned long long s[17];
+     int base_k = 0, k = 0, code_ok = 0, added = 0;
+     crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+     send_fmt("{\"id\":%d,\"ok\":true,\"base_k\":%d,\"k\":%d,\"code_ok\":%d,"
+@@ -8394,9 +8395,10 @@
+              "\"bad\":%llu,\"prim_skips\":%llu,\"added_max\":%llu,"
+              "\"side\":%llu,\"joined\":%llu,\"kw\":%llu,\"camera\":%llu,"
+              "\"model_bad\":%llu,\"model_pct\":%llu,\"pool\":%llu,"
+-             "\"pool_drawn\":%llu}",
++             "\"pool_drawn\":%llu,\"cover_l\":%llu,\"cover_r\":%llu,"
++             "\"covered\":%llu}",
+              id, base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
+-             s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13]);
++             s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16]);
+ }
+ 
+ /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -85,7 +85,7 @@
+                                      int *code_ok, int *off);
+ /* Widescreen scenery range (crash2_wide_slst.h): whether it is drawing the
+  * neighbouring nodes' polygons, and why not when it is not. */
+-extern void crash2_wide_slst_stats(unsigned long long out[14], int *base_k, int *k,
++extern void crash2_wide_slst_stats(unsigned long long out[17], int *base_k, int *k,
+                                    int *code_ok, int *added);
+ extern uint32_t g_debug_current_func_addr;     /* debug_server.c */
+ extern uint32_t g_debug_last_store_pc;         /* debug_server.c */
+@@ -953,9 +953,9 @@
+                  "\"kept\":%llu,\"mismatch\":%llu}",
+                  on, code_ok, off, s[0], s[1], s[2]);
+     }
+-    char sl_json[448];
++    char sl_json[512];
+     {
+-        unsigned long long s[14];
++        unsigned long long s[17];
+         int base_k = 0, k = 0, code_ok = 0, added = 0;
+         crash2_wide_slst_stats(s, &base_k, &k, &code_ok, &added);
+         snprintf(sl_json, sizeof(sl_json),
+@@ -964,9 +964,10 @@
+                  "\"prim_skips\":%llu,\"added_max\":%llu,\"side\":%llu,"
+                  "\"joined\":%llu,\"kw\":%llu,\"camera\":%llu,"
+                  "\"model_bad\":%llu,\"model_pct\":%llu,\"pool\":%llu,"
+-                 "\"pool_drawn\":%llu}",
++                 "\"pool_drawn\":%llu,\"cover_l\":%llu,\"cover_r\":%llu,"
++                 "\"covered\":%llu}",
+                  base_k, k, code_ok, added, s[0], s[1], s[2], s[3], s[4], s[5],
+-                 s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13]);
++                 s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16]);
+     }
+     static char buf[64 * 1024];
+     int n = snprintf(buf, sizeof(buf),

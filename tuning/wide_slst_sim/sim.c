@@ -50,6 +50,7 @@ static uint32_t mod_alloc(uint32_t n)
 #define C2WG_RAMPTR()  g_ram
 #define C2SL_W16(a, v) w16((a), (v))
 #define C2SL_ALLOC(n)  mod_alloc(n)
+#define C2SL_W32(a, v) w32((a), (v))
 
 /* ---- the runtime pieces the header touches ------------------------------ */
 typedef struct { uint32_t gpr[32]; uint32_t gte_data[32]; uint32_t gte_ctrl[32]; } CPUState;
@@ -199,7 +200,7 @@ int main(int argc, char **argv)
     }
 
     printf("1. the C port rebuilds every node list of every SLST entry\n");
-    int entries_ok = 0, entries_ref_bad = 0, node_total = 0, node_bad = 0, c_refused = 0;
+    int entries_ok = 0, entries_ref_bad = 0, node_total = 0, node_bad = 0, c_refused = 0, c_open = 0;
     static C2slEntry ce;
     for (int i = 0; i < g_nentries; ++i) {
         const RefEntry *re = &g_entries[i];
@@ -207,6 +208,7 @@ int main(int argc, char **argv)
         c2sl_build_entry(&ce, ENTRY_AT);
         if (re->status == 2) { entries_ref_bad++; continue; }
         if (!ce.ok) { c_refused++; continue; }
+        if (!ce.end_ok) c_open++;
         entries_ok++;
         if ((uint32_t)ce.nodes != re->nodes) { node_bad++; continue; }
         for (int n = 0; n < ce.nodes; ++n) {
@@ -216,11 +218,13 @@ int main(int argc, char **argv)
         }
     }
     printf("   %d entries rebuilt, %d node lists, %d differ from the reference; "
-           "%d refused by C, %d the reference cannot decode\n",
-           entries_ok, node_total, node_bad, c_refused, entries_ref_bad);
+           "%d refused by C, %d not ending on their end list, %d the reference cannot decode\n",
+           entries_ok, node_total, node_bad, c_refused, c_open, entries_ref_bad);
     CHECK(entries_ok > 1000, "most entries rebuild (%d)", entries_ok);
     CHECK(node_bad == 0, "%d node lists differ from the reference", node_bad);
-    CHECK(c_refused <= 4, "C refused %d entries (the reference does not close 4)", c_refused);
+    CHECK(c_refused == 0 && c_open <= 4,
+          "C refused %d entries, %d do not end on their end list (the reference does not close 4)",
+          c_refused, c_open);
 
     printf("2. merging the neighbours' lists\n");
     long merges = 0, merge_bad = 0, added_total = 0, list_total = 0, capped = 0;
@@ -309,7 +313,7 @@ int main(int argc, char **argv)
 
             /* the game's list is not this node's: left alone */
             w16(LIST + 4 + 2 * (count / 2), (uint16_t)(mine[count / 2] ^ 0x0400u));
-            unsigned long long st[6]; int bk, kk, ok, ad;
+            unsigned long long st[17]; int bk, kk, ok, ad;   /* all crash2_wide_slst_stats writes */
             crash2_wide_slst_stats(st, &bk, &kk, &ok, &ad);
             const unsigned long long mism = st[2];
             RENDER(C2SL_RA_SITE1);

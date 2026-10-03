@@ -1,14 +1,17 @@
 /* Model check for the camera test in crash2_wide_slst.h.
  *
- * Real level data (export.py: a camera path's zone, its worlds, its SLST and
- * the paths linked at its ends) is laid out in guest RAM the way the game
- * holds it - entry headers with item pointers, entities pointing at their
- * zone, the zone's world records filled for the frame (offsets from the
- * camera, the world's items), an EID record table where 0x80014B90 looks -
- * and the hook is driven at the render call with a camera in the GTE. What it
- * draws must equal what frustum_ref.py says, case by case. Then the ways it
- * must refuse: worlds it cannot read, a camera that does not put the game's
- * list on screen, a linked path that is not resident.
+ * Real level data (export.py: a camera path's zone, its worlds, its SLST, the
+ * paths linked at its ends and, on a side-on path, every zone and SLST its
+ * pool reads) is laid out in guest RAM the way the game holds it - entry
+ * headers with item pointers, entities pointing at their zone, the zone's
+ * world records filled for the frame (offsets from the camera, the world's
+ * items), an EID record table where 0x80014B90 looks - and the hook is driven
+ * at the render call with the game's camera for that node in the GTE. What it
+ * draws must equal what frustum_ref.py says, case by case; on side-on paths
+ * nothing it adds may have a corner the GTE cannot place, and nothing from
+ * the pool may reach into the 4:3 columns. Then the ways it must refuse:
+ * worlds it cannot read, a camera that does not put the game's list on
+ * screen, a linked path that is not resident.
  *
  *   sh tuning/wide_frustum_sim/build.sh
  *   python tuning/wide_frustum_sim/export.py cases.bin   (game data: keep it out of git)
@@ -45,6 +48,7 @@ static uint32_t mod_alloc(uint32_t n)
 #define C2SL_R16(a)    r16(a)
 #define C2SL_W16(a, v) w16((a), (v))
 #define C2SL_ALLOC(n)  mod_alloc(n)
+#define C2SL_W32(a, v) w32((a), (v))
 #define C2WG_R32(a)    r32(a)
 #define C2WG_R16(a)    r16(a)
 #define C2WG_R8(a)     ((uint8_t)(r16((a) & ~1u) >> (((a) & 1u) * 8u)))
@@ -88,6 +92,7 @@ typedef struct {
     int32_t cam[3], r[9], h, ofx, ofy, margin;
     uint32_t seen, total, merged, kept, joins;
     uint64_t hash;
+    int32_t cover[2];
     uint32_t nobj, *obj_value;
     int32_t *obj_verdict;
 } Case;
@@ -126,7 +131,8 @@ static int load(const char *path)
             !rd(f, k->cam, 12) || !rd(f, k->r, 36) || !rd(f, &k->h, 4) || !rd(f, &k->ofx, 4) ||
             !rd(f, &k->ofy, 4) || !rd(f, &k->margin, 4) || !rd(f, &k->seen, 4) ||
             !rd(f, &k->total, 4) || !rd(f, &k->merged, 4) || !rd(f, &k->kept, 4) ||
-            !rd(f, &k->joins, 4) || !rd(f, &k->hash, 8) || !rd(f, &k->nobj, 4))
+            !rd(f, &k->joins, 4) || !rd(f, &k->hash, 8) || !rd(f, k->cover, 8) ||
+            !rd(f, &k->nobj, 4))
             return 0;
         k->obj_value = calloc(k->nobj + 1, 4);
         k->obj_verdict = calloc(k->nobj + 1, 4);
@@ -138,7 +144,7 @@ static int load(const char *path)
 }
 
 /* ---- laying a case out in guest RAM --------------------------------------- */
-#define PLACE_LO   0x80100000u
+#define PLACE_LO   0x800B0000u   /* above the frame structs and PRIM_AT     */
 #define PLACE_HI   0x801E0000u
 #define HASH_AT    0x801E0000u   /* bucket heads, 256 words              */
 #define RECS_AT    0x801E0400u   /* records, 8 bytes                       */
@@ -288,6 +294,8 @@ int main(int argc, char **argv)
 
     printf("1. what the camera test draws, against the reference (%d cases)\n", g_ncases);
     int ran = 0, model_ok = 0, joined = 0, placed_out = 0, obj_total = 0, obj_in = 0;
+    int side_cases = 0, pooled = 0, pool_max = 0, pool_drawn = 0, side_checked = 0;
+    int covered = 0, cover_px = 0;
     long added = 0, listed = 0;
     double worst_ms = 0.0;
     for (int c = 0; c < g_ncases; ++c) {
@@ -332,10 +340,74 @@ int main(int argc, char **argv)
         CHECK(c2wg_cam.ok == want_model, "case %d: the camera handed on is marked as judged", c);
         if (!want_model) continue;
         model_ok++;
-        unsigned long long st[12];
+        unsigned long long st[17];
         int bk, kk, ok, ad;
         crash2_wide_slst_stats(st, &bk, &kk, &ok, &ad);
         CHECK(st[9] == 1, "case %d: drawn with the camera test (%llu)", c, st[9]);
+        /* Side-on: every kept candidate placeable, the pool's wholly in the
+         * extra columns of one side; elsewhere no pool at all. */
+        if (c2sl_built.side_on) {
+            static C2wgWorld ws[C2WG_MAX_WORLDS];
+            const int nw = c2wg_worlds(zone->addr, ws, C2WG_MAX_WORLDS);
+            C2wgCam cam;
+            memset(&cam, 0, sizeof cam);
+            for (int i = 0; i < 9; ++i) cam.r[i] = k->r[i];
+            cam.h = k->h; cam.ofx = k->ofx; cam.ofy = k->ofy; cam.margin = k->margin;
+            side_cases++;
+            if (c2sl_pool.n > 0) pooled++;
+            if (c2sl_pool.n > pool_max) pool_max = c2sl_pool.n;
+            pool_drawn += (int)st[13];
+            CHECK(st[12] == (unsigned long long)c2sl_pool.n, "case %d: pool count reported", c);
+            for (int cc = 0; cc < c2sl_ncand; ++cc) {
+                if (!c2sl_ckeep[cc]) continue;
+                int32_t v[4][3];
+                const int n = c2wg_poly(g_ram, ws, nw, c2sl_cid[cc], v);
+                int place_ok = n > 0, left = 0, right = 0;
+                for (int q = 0; q < n; ++q) {
+                    int sx = 0, sy = 0;
+                    place_ok &= c2wg_placeable(&cam, v[q][0], v[q][1], v[q][2]) &&
+                                c2wg_project(&cam, v[q][0], v[q][1], v[q][2], &sx, &sy);
+                    left += sx < 0;
+                    right += sx >= 512;
+                }
+                side_checked++;
+                CHECK(place_ok, "case %d: added polygon %04X has a corner the GTE cannot place", c,
+                      c2sl_cid[cc]);
+                if (cc >= c2sl_pool_first)
+                    CHECK(left == n || right == n,
+                          "case %d: pool polygon %04X reaches into the 4:3 columns", c, c2sl_cid[cc]);
+            }
+            /* The void cover: as the reference scans it, in the last slot of the
+             * ordering table, inside the extra columns, black and opaque. */
+            CHECK(c2sl_vc.want[0] == k->cover[0] && c2sl_vc.want[1] == k->cover[1],
+                  "case %d: void cover %d/%d, reference %d/%d", c, c2sl_vc.want[0], c2sl_vc.want[1],
+                  k->cover[0], k->cover[1]);
+            CHECK(st[14] == (unsigned long long)k->cover[0] && st[15] == (unsigned long long)k->cover[1],
+                  "case %d: the cover shown at once", c);
+            if (k->cover[0] > 0 || k->cover[1] > 0) {
+                covered++;
+                cover_px += k->cover[0] + k->cover[1];
+                uint32_t p = r32(C2SL_FRAME0 + 24u + 4u * C2SL_VC_OT) & 0x00FFFFFFu;
+                int quads = 0;
+                for (int s = 1; s >= 0; --s) {
+                    if (k->cover[s] <= 0) continue;
+                    const uint32_t a = 0x80000000u | p;
+                    const int16_t x0 = (int16_t)r16(a + 8u), x1 = (int16_t)r16(a + 12u);
+                    CHECK((r32(a) >> 24) == 5u && r32(a + 4u) == 0x28000000u,
+                          "case %d: cover %d is a black opaque POLY_F4", c, s);
+                    CHECK(s == 0 ? (x1 == -k->margin + k->cover[0] && x1 <= 0)
+                                 : (x0 == 512 + k->margin - k->cover[1] && x0 >= 512),
+                          "case %d: cover %d stays in the extra columns (%d..%d)", c, s, x0, x1);
+                    p = r32(a) & 0x00FFFFFFu;
+                    quads++;
+                }
+                CHECK(quads == (k->cover[0] > 0) + (k->cover[1] > 0), "case %d: cover quads linked", c);
+            }
+        } else {
+            CHECK(c2sl_pool_first == c2sl_ncand && st[12] == 0 && st[13] == 0,
+                  "case %d: not side-on, yet candidates from a pool", c);
+            CHECK(st[14] == 0 && st[15] == 0, "case %d: not side-on, yet a void cover", c);
+        }
         const int m = drawn == c2sl_buf && c2sl_buf ? r16(c2sl_buf) : count;
         CHECK((uint32_t)m == k->merged, "case %d (%u joins): %d polygons, reference %u", c, k->joins,
               m, k->merged);
@@ -346,10 +418,16 @@ int main(int argc, char **argv)
         listed += count;
     }
     printf("   %d cases ran (%d did not fit in RAM), %d judged by the camera, %d with a linked path;\n"
-           "   %.1f%% more polygons, the slowest frame %.2f ms; %d objects judged, %d in the extra columns\n",
+           "   %.1f%% more polygons, the slowest frame %.2f ms; %d objects judged, %d in the extra columns\n"
+           "   side-on: %d judged, %d with a pool (largest %d), %d pool polygons drawn, %d kept checked;\n"
+           "   void cover on %d of them, %d px on average\n",
            ran, placed_out, model_ok, joined, listed ? 100.0 * added / listed : 0.0, worst_ms,
-           obj_total, obj_in);
+           obj_total, obj_in, side_cases, pooled, pool_max, pool_drawn, side_checked, covered,
+           covered ? cover_px / covered : 0);
     CHECK(ran >= 20 && model_ok >= 20, "enough cases judged (%d)", model_ok);
+    CHECK(side_cases >= 20 && pooled >= 20 && pool_drawn > 0,
+          "side-on cases with a pool (%d, %d, %d drawn)", side_cases, pooled, pool_drawn);
+    CHECK(covered >= 5, "side-on cases with void to cover (%d)", covered);
     CHECK(obj_total >= 200 && obj_in > 0, "objects judged (%d, %d in the margins)", obj_total, obj_in);
 
     printf("2. the object hook spawning by the camera\n");
@@ -412,7 +490,7 @@ int main(int argc, char **argv)
             Ent *slst = NULL;
             for (int i = 0; i < k->nent; ++i) if (k->ent[i].addr == c2wg_slst_of(path)) slst = &k->ent[i];
             int count = 0;
-            unsigned long long st[12];
+            unsigned long long st[17];
             int bk, kk, ok, ad;
 
             /* a camera looking the other way: the model fails, the node window draws */
