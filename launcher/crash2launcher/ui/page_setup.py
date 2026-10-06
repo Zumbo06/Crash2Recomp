@@ -422,9 +422,10 @@ class SetupPage(QWidget):
 
         # `psxrecomp.exe build` wrote a fresh game.toml and translated from it,
         # so nothing the generated C needs beyond the CLI's defaults is in it
-        # yet - the native 60 FPS script pacing among them, without which the
-        # 60 FPS mode runs animations and platforms at double speed. Put the
-        # profile back and translate again before compiling.
+        # yet - the native 60 FPS script and camera pacing among them, without
+        # which the 60 FPS mode runs animations, platforms and the camera's
+        # path motion at double speed. Put the profile back and translate
+        # again before compiling.
         try:
             changed = recompprofile.apply(self.layout_.game_toml)
         except (OSError, ValueError) as exc:
@@ -448,7 +449,7 @@ class SetupPage(QWidget):
             return
         self.build_log.append_line(
             "Adding this port's recompile settings (native 60 FPS script "
-            "pacing) and translating again...")
+            "and camera pacing) and translating again...")
         self._job = Job(str(recompiler), ["--config", "game.toml"],
                         cwd=self.layout_.project)
         self._job.line.connect(self.build_log.append_line)

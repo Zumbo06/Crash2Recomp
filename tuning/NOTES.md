@@ -4053,3 +4053,159 @@ passes at every level, and under UBSan and ASan.
 - **Dark caves** (black space between structures in the 4:3 view too) should
   look as before.
 - **The counters.** `wide_slst` `cover_l` / `cover_r` show the cover's width.
+
+## 60 FPS, part 24: the camera kept the field rate
+
+Patch 0055 and the recompile-profile word `c2-60-cam-flag`.
+
+**The report.** In Air Crash, getting on the skull platform at 60 FPS sends the
+camera back to the start of the level, where it stays. It does not happen at
+30.
+
+### The skull platform's warp
+
+Air Crash is `S0000020`. Its NSD lists two entrances: zone 01 (the level start)
+and zone S3, the start of a secret jet-board section (S3 to S9, then S0) with
+its own Crash spawn, board launch (S4) and drop-off (S9). There are two
+`obj_warp_secret` platforms (WarpC, subtype 9): one in zone 09 of the main
+route, and `#2` at the end of the secret section.
+
+The end platform's warp is a handshake between Crash's script and the camera:
+
+1. **The platform** (WarpC state 8) sends Crash event `0x1600`.
+2. **Crash, state 65:**
+   - spins, with the camera pointed at the spin (global 4 bit `0x20000`,
+     target `0x8006CD70`);
+   - fades to black, by waiting for global 106 to reach -1;
+   - queues camera event `0x10`.
+3. **The camera matches `0x10`** against the `0x1A8` records of the path it is
+   on, at both of its ends (`0x80026334`). In Air Crash only S0 has one for
+   it: at S0's end, "prepare a cut to link 1", which is zone 04's path at its
+   start.
+4. **Preparing the cut** (`0x8002655C`):
+   - sets mode 7;
+   - sends Crash the `0x198` event of that path: `0x3200`, with x, y, z in
+     zone 04;
+   - leaving state 65 runs its exit callback (sub 4819), which clears
+     `0x20000`, so the camera targets Crash again.
+5. **Crash, state 39:** moves to x, y, z and queues "cut now" (`0x400`).
+6. **The camera cuts** to zone 04 and sets Crash's zone to it.
+
+Coming back near the level start is the design. The camera and Crash arrive
+together.
+
+The zone-09 platform takes the same branch of state 65 (current level 32), but
+no main-route path has a `0x10` record, so it cannot move the camera.
+
+### Why 60 FPS breaks it
+
+During steps 2 to 4 the camera keeps following its path toward the spin. That
+motion (`0x80023E60`, called from the kind-0 handler `0x8002271C`) is one step
+per call, with no frame-time term. The only tick reads in the camera code are
+the angle-blend timer and a timestamp in the seat routine. With the camera
+update running once per field, the camera moved twice as far per second.
+
+S0's end links into zones 03 and 04, the level's start. A camera that reaches
+it before the fade is over takes the link and leaves S0. Event `0x10` then
+finds no record on the path it is on:
+
+- no prepared cut;
+- no event `0x3200`, so Crash stays at the platform;
+- a camera at the start of the level with nothing there to follow.
+
+This was derived from the code (GOOL disassembly of WarpC and WillC, the camera
+update, the event and state-change routines), not observed in a trace. It is
+the only route from a skull platform to the level's start that leaves Crash
+behind.
+
+### Patch 0055: the camera update keeps the script step
+
+`crash2_60fps.h`, `C2_60_CAM_UPDATE`:
+
+- **The flag.** The camera update (`0x80026CA0`) runs on script steps only,
+  like the scripts it trades messages and events with.
+  - Its entry hook stores a flag at sp+44 of the 48-byte frame, the unused
+    padding: the crash pointer on a script step, 0 on a physics-only field.
+  - The profile word makes `0x80026D04` load the crash pointer from that flag
+    instead of `0x8005F38C`.
+  - 0 takes the update's own "no crash" exit.
+  - With the mode off the flag is always the pointer, so the function is the
+    original.
+- **The same rates as 30 Hz.** Every per-call rate inside the update is now
+  the stock one: path motion, the mode-6 blend countdown, the look-at
+  smoothing.
+  - Objects update after the camera in each loop. A message queued on a script
+    step drains at the next step's camera update, before that step's scripts,
+    exactly as at 30 Hz.
+- **Drawn ahead.** At 30 Hz under 60 Hz objects, the camera would visibly lag.
+  - On a physics-only field the frame is drawn from a pose extrapolated from
+    the last two updates' poses (position and angles, angles the short way
+    round), by the share of a step since the last one.
+  - The real pose goes back at the next loop's top, before anything runs. The
+    game's own logic only ever sees poses its camera update made.
+- **Held instead of drawn ahead** in these cases:
+  - after a cut: the update set "cut now", `0x8005B99B`;
+  - after a jump of more than 2048 units or 512/4096 of a turn in one step;
+  - without poses from two consecutive steps;
+  - after a RAM restore, when RAM is the camera and nothing is put back.
+- **A/B:** `PSX_CRASH2_60FPS_CAMERA_RATE=0` brings back the per-field camera.
+- **Heartbeat:** `native_60fps_camera_hz`, `native_60fps_camera_hooked`,
+  `native_60fps_camera_extrapolated`, `native_60fps_camera_held`.
+
+### Shipping it
+
+- **The profile.** `launcher/crash2launcher/recompprofile.py` adds `0x80026CA0`
+  to `mod_function_entry_funcs` and the `c2-60-cam-flag` word (`0x8C84F38C` to
+  `0x8FA4002C`).
+  - The workspace `game.toml` was re-applied.
+  - `psxrecomp-game` regenerated one shard (`full_07`): the entry-hook call and
+    the load.
+  - The Play page's "Rebuild recommended" now also shows for a build that has
+    the script words but not this one.
+- **Overlay caches.** The profile moves the overlay config hash (d6362e32 to
+  9ced4f89).
+  - Both trees' caches were rebuilt from every stored capture: each tree's
+    manifest and `.json.d` history, 1,063 files, merged to 523 distinct
+    (address, bytes) captures with their execution evidence combined.
+  - Result: 6 shards per tree, none failed.
+  - The previous cache's seventh shard (region 0, `AF3DB9EB`) is covered by
+    the new `8D44BB00`: same entry, same code CRC.
+
+### Checked without the game
+
+**`tuning/native120_sim`, scenario 9.** It models the patched camera update:
+it reads the flag the load would, and moves the camera from the pose in RAM.
+
+- **At 30 Hz:** an update every loop, nothing drawn ahead.
+- **At 60:** 30.00 updates a second, and `camera_hz` reads 30.
+  - Drawn x and the y angle advance by exactly half a step every field,
+    through the angle's wrap.
+  - Every update reads only poses it wrote.
+- **Holds:**
+  - a cut is held for one field, then drawn ahead again;
+  - so is a 5,000-unit jump;
+  - after a restore, the restored pose is kept and the fields are held until
+    two updates have run.
+- **The A/B switch:** 60 updates a second, nothing drawn ahead.
+- **At 120:** three fields between updates, each 8 or 9 ticks' worth.
+- **Suites:** all tuning checks (62) and launcher tests pass.
+
+### To check in play
+
+- **Air Crash's secret section, at 60 FPS.** Ride the end skull platform.
+  After the fade, Crash and the camera should both be in zone 04 near the
+  start, with the camera following.
+- **Heartbeat.**
+  - `native_60fps_camera_hz` should read about 30 with the gate open, and
+    `native_60fps_camera_hooked` 1.
+  - `camera_extrapolated` should grow with play.
+  - `camera_held` should stay small: cuts and loads.
+- **Elsewhere.**
+  - The camera should look as smooth as before.
+  - Its catch-up is the 30 FPS one again, a little lazier than the per-field
+    camera was.
+  - A sharp stop or turn can overshoot by up to half a step for one field.
+
+**Found and not changed.** The screen fade (global 106, stepped once per loop
+at `0x800164C4`) runs per field, so fades last half as long at 60. Scripts wait
+for its end value, so only the look changes.

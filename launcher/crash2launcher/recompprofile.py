@@ -8,11 +8,17 @@ This module is the one place those keys live: the Setup page applies it after
 the CLI's generate step and runs the recompiler again before compiling, and the
 workspace ``game.toml`` carries exactly what :func:`apply` writes.
 
-Currently one feature - native 60 FPS script pacing (``crash2_60fps.h``,
-``C2_60_GOOL_UPDATE``): an entry hook on GoolObjectUpdate (0x8001C718) and nine
-opcode-verified instruction words that make its once-per-call GOOL work depend
-on a flag the hook stores. Without them the 60 FPS mode runs every animation,
-moving platform and scripted timer at double speed.
+Currently one feature, native 60 FPS pacing (``crash2_60fps.h``), in two parts:
+
+* scripts (``C2_60_GOOL_UPDATE``): an entry hook on GoolObjectUpdate
+  (0x8001C718) and nine opcode-verified instruction words that make its
+  once-per-call GOOL work depend on a flag the hook stores. Without them the
+  60 FPS mode runs every animation, moving platform and scripted timer at
+  double speed.
+* the camera (``C2_60_CAM_UPDATE``): an entry hook on the camera update
+  (0x80026CA0) and one word that makes it skip physics-only fields. Without it
+  the camera's path motion runs at double speed, and Air Crash's skull
+  platform leaves the camera at the start of the level.
 
 The recompiler verifies each ``expected`` word against the executable and
 refuses to build on a mismatch, so a different revision fails loudly here
@@ -25,7 +31,7 @@ import re
 import tomllib
 from pathlib import Path
 
-ENTRY_FUNCS = ("0x8001C718",)
+ENTRY_FUNCS = ("0x8001C718", "0x80026CA0")
 
 # (id, address, expected, replacement, note)
 PATCHES: tuple[tuple[str, int, int, int, str], ...] = (
@@ -55,6 +61,10 @@ PATCHES: tuple[tuple[str, int, int, int, str], ...] = (
     ("c2-60-gool-trans-test", 0x8001C938, 0x1040000E, 0x1140000E,
      "beq v0,zero -> beq t2,zero: same test, on the pointer loaded at "
      "0x8001C8A8"),
+    ("c2-60-cam-flag", 0x80026D04, 0x8C84F38C, 0x8FA4002C,
+     "lw a0,-3188(a0) -> lw a0,44(sp): the camera update's crash pointer is "
+     "the frame flag (crash on a script step, 0 on a physics-only field, "
+     "which takes the update's own no-crash exit)"),
 )
 
 BEGIN = "# >>> crash2 recompile profile (launcher/crash2launcher/recompprofile.py)"
@@ -80,6 +90,16 @@ _HEADER = (
     "# With the mode off the flag is never 0 and the function is the original.",
     "# Recompile-time only: guest RAM keeps the disc's words, so the text-image",
     "# guard still validates this function and it stays native.",
+    "#",
+    "# Native 60 FPS - the camera at script rate (C2_60_CAM_UPDATE). The camera",
+    "# update (0x80026CA0) moves the camera along its path a step per call, so",
+    "# per field it moved twice as fast - and in Air Crash's secret section left",
+    "# the path the skull platform's cut is recorded on before the warp sent it,",
+    "# stranding the camera at the level's start. c2-60-cam-flag loads the crash",
+    "# pointer from a flag the entry hook stores at sp+44 (unused padding): the",
+    "# pointer on a script step, 0 on a physics-only field, which takes the",
+    "# update's own no-crash exit. The runtime draws those fields from an",
+    "# extrapolated camera. With the mode off the flag is the pointer.",
 )
 
 

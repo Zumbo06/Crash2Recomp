@@ -1,0 +1,355 @@
+Native 60 FPS: the camera update keeps the 30 Hz script step.
+
+Reported: at 60 FPS the skull platform in Air Crash sends the camera back to
+the start of the level, where it stays. The platform ends the secret
+jet-board section (zones S3-S9, S0). Its warp is a handshake with the camera:
+Crash's state 65 spins, fades to black and queues camera event 0x10; S0's end
+record turns that into a prepared cut to zone 04, which sends Crash the
+teleport (event 0x3200, state 39) that queues "cut now". The camera follows
+its path meanwhile, a step per call (0x80023E60) with no frame-time term, so
+once per field it moved twice as far - and S0's end links into zones 03/04,
+the level's start. A camera that leaves S0 before the fade ends finds no 0x10
+record: no cut, no teleport.
+
+crash2_60fps.h:
+- the camera update (0x80026CA0) runs on script steps only: its entry hook
+  stores the crash pointer (step) or 0 (physics-only field) at sp+44 of the
+  48-byte frame, the unused padding, and a recompile-time word
+  (game.toml c2-60-cam-flag, launcher/crash2launcher/recompprofile.py) makes
+  0x80026D04 load the crash pointer from there - 0 takes the update's own
+  no-crash exit. With the mode off the flag is the pointer: the original;
+- a physics-only field is drawn from a pose extrapolated from the last two
+  updates by the share of a step since the last one; the real pose goes back
+  at the next loop's top, so game logic only sees poses its update made. Held
+  instead across a cut ("cut now" set), a jump over 2048 units or 512/4096 of
+  a turn, without two consecutive steps, and after a RAM restore;
+- PSX_CRASH2_60FPS_CAMERA_RATE=0 restores the per-field camera (A/B).
+
+Heartbeat: native_60fps_camera_hz, _camera_hooked, _camera_extrapolated,
+_camera_held.
+
+tuning/native120_sim models the patched camera update: 30 updates/s at 60 and
+120, drawn x and angle advancing evenly every field (through the angle wrap),
+every update reading only poses it wrote, cuts and jumps held, a restore
+kept, the A/B switch.
+
+No file here is in codegen_hash_sources.cmake. The game.toml change moves the
+overlay config hash (d6362e32 -> 9ced4f89); both trees' caches were rebuilt.
+
+--- a/runtime/src/crash2_60fps.h
++++ b/runtime/src/crash2_60fps.h
+@@ -22,7 +22,8 @@
+  * dropped frames; we are reusing it, not inventing one.
+  *
+  * The GOOL SCRIPTS are not scaled that way, and ran at double speed until they
+- * were paced separately - see C2_60_GOOL_UPDATE.
++ * were paced separately - see C2_60_GOOL_UPDATE. Nor is the camera's path
++ * motion, which now keeps the same step - see C2_60_CAM_UPDATE.
+  *
+  * The FIRST wait stays, so a frame whose guest work does not fit in one field
+  * lands on the next VBlank and the game falls back to 30 (or 20) Hz exactly as
+@@ -238,6 +239,56 @@
+ #define C2_60_FIRST_FRAME    0x20u
+ #define C2_60_STEP_TICKS     34u          /* one stock frame: two NTSC fields */
+ #define C2_60_TICK_CLAMP     102u         /* the engine's own clamp (sltiu 103) */
++
++/* Camera rate: the camera update keeps the 30 Hz step too.
++ *
++ * Reported: at 60 FPS the skull platform in Air Crash sent the camera back to
++ * the start of the level, where it stayed. The platform is the end of the
++ * secret jet-board section (zones S3-S9, then S0), and its warp is a handshake
++ * the camera takes part in:
++ *
++ *   - the platform (WarpC, subtype 9) sends Crash event 0x1600. His state 65
++ *     spins him, points the camera at the spin (global 4 bit 0x20000, target
++ *     0x8006CD70), fades to black, then queues camera event 0x10;
++ *   - the camera matches 0x10 against the 0x1A8 records of the path it is on
++ *     (0x80026334). Only S0's has one: at its end, "prepare a cut to link 1",
++ *     zone 04's path at its start. Preparing it (0x8002655C) sends Crash the
++ *     0x198 event of that path - 0x3200 with x, y, z - and his state 39 puts
++ *     him there and queues "cut now" (0x400). Cut and teleport land together.
++ *
++ * Until then the camera follows its path toward the spin, and that motion
++ * (0x80023E60, from the kind-0 handler 0x8002271C) is a step per CALL with no
++ * frame-time term. Run once per field, the camera moved twice as far in the
++ * same time. S0's end links into zones 03 and 04 - the level's start - so a
++ * camera that reaches it before the fade is over leaves S0, and event 0x10
++ * then finds no record on the path it is on: no cut, no teleport, and nothing
++ * to follow where it went.
++ *
++ * So the camera update now runs on script steps only, like the scripts it
++ * exchanges messages and events with, and every per-call rate inside it - path
++ * motion, the mode-6 blend countdown, the look-at smoothing - is the stock
++ * one. A recompile-time word (game.toml c2-60-cam-flag) turns the load of the
++ * crash pointer at 0x80026D04 into a load of a flag this hook stores at sp+44
++ * of the 48-byte frame, its unused padding: the crash pointer on a script step
++ * - the very word the original loads - and 0 on a physics-only field, which
++ * takes the update's own "no crash" exit. With the mode off the flag is always
++ * the crash pointer and the function is the original.
++ *
++ * Drawn once per field, that camera would move at 30 Hz under 60 Hz objects.
++ * On a physics-only field the frame is drawn from a pose extrapolated from the
++ * last two updates by the share of a step since the last one, and the real
++ * pose goes back before the next loop runs anything, so the game's own logic
++ * only ever sees poses its camera update made. Nothing is extrapolated across
++ * a cut (0x8005B99B set by the update), a jump larger than camera motion, or
++ * without the poses of two consecutive steps.
++ * PSX_CRASH2_60FPS_CAMERA_RATE=0 brings back the per-field camera for A/B. */
++#define C2_60_CAM_UPDATE     0x80026CA0u  /* the camera update, once per loop */
++#define C2_60_CAM_FLAG_SLOT  4u           /* below the caller's sp: its sp+44 */
++#define C2_60_CAM_POSE       0x800607F4u  /* x, y, z (world << 8), angles x, y, z */
++#define C2_60_CAM_WORDS      6u
++#define C2_60_CAM_CUT        0x8005B99Bu  /* byte: "cut now", reset by each update */
++#define C2_60_CAM_MAX_MOVE   (2048 << 8)  /* per step and axis; more is a cut */
++#define C2_60_CAM_MAX_TURN   512          /* per step and axis, of 4096 */
+ 
+ /* One second is long enough to average out a single slow frame and short
+  * enough that a bad scene is not endured. 57 of the 59.94 VBlanks a second is
+@@ -423,6 +474,19 @@
+ static uint32_t c2_60_ff_obj, c2_60_ff_bit;
+ static unsigned long long c2_60_gool_steps, c2_60_gool_fields;
+ static unsigned c2_60_win_steps, c2_60_script_hz;
++/* Camera rate - see C2_60_CAM_UPDATE. */
++static int c2_60_cam_enabled = -1;     /* -1 unread; PSX_CRASH2_60FPS_CAMERA_RATE */
++/* Set by the camera update's entry hook - like c2_60_gool_hooked, the proof
++ * the generated code carries the matching word. */
++static int c2_60_cam_hooked;
++static int c2_60_cam_ran;              /* this loop's update had the crash pointer */
++static int c2_60_cam_hist;             /* real poses held: 0, 1 (cur) or 2 */
++static int32_t c2_60_cam_prev[C2_60_CAM_WORDS], c2_60_cam_cur[C2_60_CAM_WORDS];
++static int c2_60_cam_cut;              /* the update that made cur cut */
++static int c2_60_cam_drawn;            /* RAM holds a drawn pose, to be put back */
++static uint32_t c2_60_cam_drawn_words[C2_60_CAM_WORDS];
++static unsigned long long c2_60_cam_updates, c2_60_cam_extrapolated, c2_60_cam_held;
++static unsigned c2_60_win_cam, c2_60_cam_hz;
+ static int c2_60_suspended;            /* held closed by the timing mode */
+ static unsigned c2_60_timing_mode;
+ static int c2_60_fails;                /* consecutive back-offs */
+@@ -889,6 +953,16 @@
+  * objects running means the project was generated without the recompile
+  * profile, and 60 FPS will run scripts at double speed until it is rebuilt. */
+ int crash2_60fps_script_hooked(void) { return c2_60_gool_hooked; }
++/* Camera updates per second over the last window (C2_60_CAM_UPDATE): ~30 with
++ * the camera on the script step, at 30 Hz or at 60. ~60 with the gate open is
++ * the per-field camera - the A/B switch, or a project without the profile,
++ * which camera_hooked 0 confirms. */
++unsigned crash2_60fps_camera_hz(void) { return c2_60_cam_hz; }
++int crash2_60fps_camera_hooked(void) { return c2_60_cam_hooked; }
++/* Physics-only fields drawn from an extrapolated camera, and those drawn from
++ * the last real pose instead (a cut, a jump, no history yet). Cumulative. */
++unsigned long long crash2_60fps_camera_extrapolated(void) { return c2_60_cam_extrapolated; }
++unsigned long long crash2_60fps_camera_held(void) { return c2_60_cam_held; }
+ unsigned crash2_60fps_loop_hz(void) { return c2_60_loop_hz; }
+ /* Percentage of the last window's frames the engine simulated as one field.
+  * This is the number the hold decision is made on, so report it: a scene that
+@@ -1013,7 +1087,7 @@
+         c2_60_win_ms = now;
+         c2_60_win_vbl = vbl;
+         c2_60_win_loops = c2_60_win_one_field = 0;
+-        c2_60_win_steps = 0;
++        c2_60_win_steps = c2_60_win_cam = 0;
+         return C2_60_PENDING;
+     }
+     unsigned long long span = now - c2_60_win_ms;
+@@ -1024,10 +1098,11 @@
+     c2_60_vbl_hz = (unsigned)(vblanks * 1000u / span);
+     c2_60_hold_seen = loops ? (unsigned)((unsigned long long)one_field * 100u / loops) : 0u;
+     c2_60_script_hz = (unsigned)((unsigned long long)c2_60_win_steps * 1000u / span);
++    c2_60_cam_hz = (unsigned)((unsigned long long)c2_60_win_cam * 1000u / span);
+     c2_60_win_ms = now;
+     c2_60_win_vbl = vbl;
+     c2_60_win_loops = c2_60_win_one_field = 0;
+-    c2_60_win_steps = 0;
++    c2_60_win_steps = c2_60_win_cam = 0;
+ 
+     /* A window never spans a rate change: engaging or dropping 120 starts a
+      * new one. */
+@@ -1281,6 +1356,137 @@
+                        c2_60_peek(obj + C2_60_STATUS_A) | C2_60_FIRST_FRAME);
+         c2_60_ff_obj = 0;
+     }
++}
++
++static void c2_60_cam_read(int32_t pose[C2_60_CAM_WORDS])
++{
++    for (uint32_t i = 0; i < C2_60_CAM_WORDS; i++)
++        pose[i] = (int32_t)c2_60_peek(C2_60_CAM_POSE + 4u * i);
++}
++
++/* Once per outer loop, before anything in it reads the camera: put the real
++ * pose back if the last field was drawn from another one, then take the pose
++ * the last camera update made into the history. */
++static void c2_60_cam_loop(void)
++{
++    if (c2_60_cam_enabled < 0) {
++        const char *e = getenv("PSX_CRASH2_60FPS_CAMERA_RATE");
++        c2_60_cam_enabled = (e && e[0] == '0') ? 0 : 1;
++    }
++    if (c2_60_restored) {
++        /* RAM was replaced: what it holds is the camera now, and nothing held
++         * here describes it. */
++        c2_60_cam_drawn = 0;
++        c2_60_cam_ran = 0;
++        c2_60_cam_hist = 0;
++        return;
++    }
++    int32_t pose[C2_60_CAM_WORDS];
++    if (c2_60_cam_drawn) {
++        c2_60_cam_drawn = 0;
++        c2_60_cam_read(pose);
++        int ours = 1;
++        for (uint32_t i = 0; i < C2_60_CAM_WORDS; i++)
++            if ((uint32_t)pose[i] != c2_60_cam_drawn_words[i]) ours = 0;
++        if (ours) {
++            for (uint32_t i = 0; i < C2_60_CAM_WORDS; i++)
++                c2_60_poke(C2_60_CAM_POSE + 4u * i, (uint32_t)c2_60_cam_cur[i]);
++        } else {
++            c2_60_cam_hist = 0;    /* moved by something else: that stands */
++        }
++    }
++    if (c2_60_cam_ran) {
++        c2_60_cam_ran = 0;
++        c2_60_cam_read(pose);
++        memcpy(c2_60_cam_prev, c2_60_cam_cur, sizeof c2_60_cam_prev);
++        memcpy(c2_60_cam_cur, pose, sizeof c2_60_cam_cur);
++        c2_60_cam_cut = (int)((c2_60_peek(C2_60_CAM_CUT & ~3u)
++                               >> (8u * (C2_60_CAM_CUT & 3u))) & 0xFFu);
++        if (c2_60_cam_hist < 2) c2_60_cam_hist++;
++    } else if (c2_60_gool_step) {
++        /* The loop just gone was a step and its update did not run (no crash
++         * yet, a load): the next pose is not one step after the last. */
++        c2_60_cam_hist = 0;
++    }
++}
++
++/* A physics-only field, its camera update skipped: draw it from the last
++ * update's pose moved on by the share of a step since then, at the last step's
++ * speed. The real pose goes back at the next loop's top (c2_60_cam_loop). */
++static void c2_60_cam_between(void)
++{
++    if (c2_60_cam_hist < 2 || c2_60_cam_drawn || c2_60_cam_cut) {
++        c2_60_cam_held++;
++        return;
++    }
++    int32_t pose[C2_60_CAM_WORDS];
++    c2_60_cam_read(pose);
++    if (memcmp(pose, c2_60_cam_cur, sizeof pose) != 0) {
++        c2_60_cam_hist = 0;        /* moved since its update: draw what is there */
++        c2_60_cam_held++;
++        return;
++    }
++    const int64_t since = (int64_t)c2_60_gool_since;
++    const int64_t span = (int64_t)c2_60_gool_ticks;
++    if (since <= 0 || span <= 0 || since >= span) {
++        c2_60_cam_held++;
++        return;
++    }
++    int32_t delta[C2_60_CAM_WORDS];
++    for (uint32_t i = 0; i < C2_60_CAM_WORDS; i++) {
++        uint32_t d = (uint32_t)c2_60_cam_cur[i] - (uint32_t)c2_60_cam_prev[i];
++        int32_t limit = C2_60_CAM_MAX_MOVE;
++        if (i >= 3) {              /* angles: 4096 a turn, the shortest way */
++            d &= 0xFFFu;
++            delta[i] = d >= 2048u ? (int32_t)d - 4096 : (int32_t)d;
++            limit = C2_60_CAM_MAX_TURN;
++        } else {
++            delta[i] = (int32_t)d;
++        }
++        if (delta[i] > limit || delta[i] < -limit) {
++            c2_60_cam_held++;      /* a cut or a jump, not camera motion */
++            return;
++        }
++    }
++    for (uint32_t i = 0; i < C2_60_CAM_WORDS; i++) {
++        const int64_t num = (int64_t)delta[i] * since;
++        const int64_t add = (num >= 0 ? num + span / 2 : num - span / 2) / span;
++        c2_60_cam_drawn_words[i] = (uint32_t)c2_60_cam_cur[i] + (uint32_t)(int32_t)add;
++        c2_60_poke(C2_60_CAM_POSE + 4u * i, c2_60_cam_drawn_words[i]);
++    }
++    c2_60_cam_drawn = 1;
++    c2_60_cam_extrapolated++;
++}
++
++/* Entry to the camera update, before its first instruction: publish the flag
++ * the patched load at 0x80026D04 reads (see C2_60_CAM_UPDATE), and on a
++ * physics-only field draw the frame from where the camera is heading - the
++ * matrix (0x80017BC4) is built from the pose right after this call returns.
++ * Nothing before that load touches sp+44: the function saves its registers at
++ * sp+32..40 and the debug-camera block's two calls keep to their own frames. */
++static void c2_60_cam_entry(CPUState *cpu, uint32_t address)
++{
++    (void)address;
++    const uint32_t crash = c2_60_peek(C2_60_CRASH);
++    c2_60_cam_hooked = 1;
++    const int step = (c2_60_gool_active && c2_60_cam_enabled == 1)
++                         ? c2_60_gool_step : 1;
++    c2_60_poke(cpu->gpr[29] - C2_60_CAM_FLAG_SLOT, step ? crash : 0u);
++    if (step) {
++        if (crash) {
++            c2_60_cam_ran = 1;
++            c2_60_cam_updates++;
++            c2_60_win_cam++;
++        }
++        return;
++    }
++    c2_60_cam_between();
++}
++
++PSX_MOD_CONSTRUCTOR(c2_60_register_cam_entry)
++{
++    psx_mod_register_function_entry_plugin("crash2.native60.camera_rate",
++                                           C2_60_CAM_UPDATE, c2_60_cam_entry);
+ }
+ 
+ /* Called at the outer game loop, so at most once per simulated frame: the six
+@@ -1361,7 +1567,9 @@
+         }
+     }
+     /* Before anything below consumes c2_60_restored, and in every mode: with
+-     * the mode off it keeps every loop a script step. */
++     * the mode off it keeps every loop a script step. The camera first - it
++     * reads the step the loop just gone made, which c2_60_gool_loop replaces. */
++    c2_60_cam_loop();
+     c2_60_gool_loop();
+     /* Outside the engaged state nothing of 120 may remain: a savestate made
+      * at 120 carries the stand-in in RAM, and a stall may have left the
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -49,6 +49,15 @@
+ extern unsigned long long crash2_60fps_physics_fields(void);
+ /* 0 with the mode on means the project lacks the recompile profile. */
+ extern int      crash2_60fps_script_hooked(void);
++/* Camera updates per second (crash2_60fps.h, C2_60_CAM_UPDATE): ~30 when the
++ * camera keeps the script step; ~60 with the gate open is the per-field
++ * camera. camera_hooked 0 with the mode on: no recompile profile. The two
++ * counts are physics-only fields drawn from an extrapolated camera and from
++ * the held one (a cut, a jump, no history). */
++extern unsigned crash2_60fps_camera_hz(void);
++extern int      crash2_60fps_camera_hooked(void);
++extern unsigned long long crash2_60fps_camera_extrapolated(void);
++extern unsigned long long crash2_60fps_camera_held(void);
+ /* Rewind captures by path (psx_rewind.c). A sync capture waited for the GPU
+  * to drain; with rewind on, async should be all but the first few. */
+ extern unsigned long long psx_rewind_async_captures(void);
+@@ -991,6 +1000,10 @@
+         "  \"native_60fps_script_hz\":%u,\n"
+         "  \"native_60fps_physics_fields\":%llu,\n"
+         "  \"native_60fps_script_hooked\":%d,\n"
++        "  \"native_60fps_camera_hz\":%u,\n"
++        "  \"native_60fps_camera_hooked\":%d,\n"
++        "  \"native_60fps_camera_extrapolated\":%llu,\n"
++        "  \"native_60fps_camera_held\":%llu,\n"
+         "  \"native_fps_target\":%d,\n"
+         "  \"native_fps_field_hz\":%d,\n"
+         "  \"native_120fps_engaged\":%llu,\n"
+@@ -1085,6 +1098,10 @@
+         crash2_60fps_script_hz(),
+         crash2_60fps_physics_fields(),
+         crash2_60fps_script_hooked(),
++        crash2_60fps_camera_hz(),
++        crash2_60fps_camera_hooked(),
++        crash2_60fps_camera_extrapolated(),
++        crash2_60fps_camera_held(),
+         crash2_60fps_target_fps(),
+         crash2_60fps_field_hz(),
+         crash2_60fps_fast_engaged(),

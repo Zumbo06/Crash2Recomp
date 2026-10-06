@@ -96,12 +96,13 @@ int host_profiler_start(const char *tag, unsigned seconds)
 void host_profiler_pause(void) { s_prof_pauses++; }
 void host_profiler_finish(void) {}
 
-static PSXModFunctionEntryCallback s_gool_entry;
+static PSXModFunctionEntryCallback s_gool_entry, s_cam_entry;
 int psx_mod_register_function_entry_plugin(const char *id, uint32_t address,
                                            PSXModFunctionEntryCallback cb)
 {
-    (void)id; (void)address;
-    s_gool_entry = cb;
+    (void)id;
+    if (address == 0x8001C718u) s_gool_entry = cb;
+    if (address == 0x80026CA0u) s_cam_entry = cb;
     return 1;
 }
 
@@ -174,6 +175,64 @@ static uint32_t quantize(int32_t raw)
     return (uint32_t)raw;
 }
 
+/* The camera update (0x80026CA0) as the patched build runs it. The entry hook
+ * stores the flag at sp-4 - sp+44 once the function has its 48-byte frame -
+ * and the load at 0x80026D04 reads it: 0 takes the no-crash exit. Otherwise
+ * the model moves the camera by cam_vel from the pose it finds in RAM, so a
+ * drawn pose left there would show up as the update reading something it did
+ * not write, and sets the update's "cut now" byte as asked. The pose
+ * 0x80017BC4 then builds the matrix from is what this loop's frame is drawn
+ * from. */
+#define CAM_SP     0x801FFE00u
+#define GOOL_SP    0x801FFF00u
+#define CRASH_OBJ  0x800A0000u
+#define CAM_POSE   0x800607F4u
+static int32_t cam_vel[6], cam_true[6], cam_drawn[6];
+static int32_t cam_jump_next;
+static int cam_cut_next, cam_restore_after_draw;
+static int cam_flag_ok = 1, cam_read_ok = 1, cam_stepped;
+static unsigned long long cam_model_updates;
+
+static void cam_set_cut(int v)
+{
+    const uint32_t w = psx_read_word(0x8005B998u);
+    psx_write_word(0x8005B998u, (w & 0x00FFFFFFu) | ((uint32_t)(v & 0xFF) << 24));
+}
+
+static void cam_sync_true(void)
+{
+    for (int i = 0; i < 6; i++) cam_true[i] = (int32_t)psx_read_word(CAM_POSE + 4u * i);
+}
+
+static void camera_update(void)
+{
+    cpu.gpr[29] = CAM_SP;
+    if (s_cam_entry) s_cam_entry(&cpu, 0x80026CA0u);
+    const uint32_t flag = psx_read_word(CAM_SP - 4u);
+    cam_stepped = flag != 0u;
+    if (flag != 0u && flag != psx_read_word(0x8005F38Cu)) cam_flag_ok = 0;
+    if (flag != 0u) {
+        for (int i = 0; i < 6; i++) {
+            const int32_t now = (int32_t)psx_read_word(CAM_POSE + 4u * i);
+            if (now != cam_true[i]) cam_read_ok = 0;
+            cam_true[i] = now + cam_vel[i] + (i == 0 ? cam_jump_next : 0);
+            psx_write_word(CAM_POSE + 4u * i, (uint32_t)cam_true[i]);
+        }
+        cam_set_cut(cam_cut_next);
+        cam_cut_next = 0;
+        cam_jump_next = 0;
+        cam_model_updates++;
+    }
+    for (int i = 0; i < 6; i++) cam_drawn[i] = (int32_t)psx_read_word(CAM_POSE + 4u * i);
+    if (cam_restore_after_draw) {
+        /* A savestate loaded right after this frame was drawn: RAM, drawn
+         * pose and all, is the game's state now. */
+        cam_restore_after_draw = 0;
+        crash2_60fps_note_restore();
+        cam_sync_true();
+    }
+}
+
 /* One trip round the game loop: body, frame end, LOOP_PC. */
 static void game_loop(uint64_t work_at_100)
 {
@@ -181,6 +240,8 @@ static void game_loop(uint64_t work_at_100)
     const uint32_t cur = psx_read_word(0x80063450u);
     last_db20 = psx_read_word(cur + 20u);
     phys_ticks += last_db20;
+    camera_update();
+    cpu.gpr[29] = GOOL_SP;
     if (s_gool_entry) s_gool_entry(&cpu, 0x8001C718u);
     run_to(t + work_at_100 * 100u / s_cpu_pct);
 
@@ -262,6 +323,7 @@ static void boot(void)
     psx_write_word(0x80063454u, DB_B);
     psx_write_word(0x80063458u, DB_A);
     psx_write_word(0x8006CD14u, 0u);   /* live play */
+    psx_write_word(0x8005F38Cu, CRASH_OBJ);
     t = last_vb = 0;
     sync_clock();
 }
@@ -490,6 +552,144 @@ int main(int argc, char **argv)
     w = measure(3.0, busy);
     check(near(w.loop_hz, 29.97, 0.3) && w.ticks_min == 34, "stock 30 Hz, 34 ticks");
     check(near(w.music_hz, 59.94, 0.2), "music at 59.94 Hz at stock");
+
+    printf("9. the camera keeps the script step, and is drawn ahead between steps\n");
+    {
+        /* A camera on the move: 300 units a step along x, turning 40/4096 a
+         * step about y, from just below a full turn so the angle wraps. */
+        static const int32_t start[6] = {34200 << 8, 11655 << 8, 224549 << 8, 100, 4090, 2000};
+        static const int32_t vel[6] = {300 * 256, -40 * 256, 520 * 256, 6, 40, -12};
+        for (int i = 0; i < 6; i++) psx_write_word(CAM_POSE + 4u * i, (uint32_t)start[i]);
+        cam_sync_true();
+        memcpy(cam_vel, vel, sizeof vel);
+        enum { N = 600 };
+        static int32_t xs[N], ays[N];
+        static int st[N];
+
+        /* 9a: the mode is off after 8. */
+        unsigned long long u0 = cam_model_updates, l0 = loops;
+        unsigned long long e0 = crash2_60fps_camera_extrapolated();
+        for (int i = 0; i < 60; i++) game_loop(busy);
+        check(cam_model_updates - u0 == loops - l0, "30 Hz: an update every loop");
+        check(crash2_60fps_camera_extrapolated() == e0, "30 Hz: nothing drawn ahead");
+        check(cam_flag_ok && cam_read_ok,
+              "the flag is the crash pointer; the update reads only its own poses");
+
+        /* 9b: 60. */
+        crash2_60fps_set_mode(1);
+        crash2_60fps_set_target_fps(60);
+        for (int i = 0; i < 2000 && !(crash2_60fps_gate_open() && last_db20 == 17); i++)
+            game_loop(busy);
+        measure(2.0, busy);
+        u0 = cam_model_updates;
+        const uint64_t g0 = t;
+        int steps = 0, between = 0, smooth = 1, turn = 1;
+        for (int i = 0; i < N; i++) {
+            game_loop(busy);
+            xs[i] = cam_drawn[0];
+            ays[i] = cam_drawn[4];
+            st[i] = cam_stepped;
+            if (cam_stepped) steps++; else between++;
+            if (i > 0 && xs[i] - xs[i - 1] != vel[0] / 2) smooth = 0;
+            if (i > 0 && ays[i] - ays[i - 1] != vel[4] / 2) turn = 0;
+        }
+        const double secs = (double)(t - g0) / CPU_HZ;
+        printf("  [60: %d updates, %d fields between, %.2f updates/s, camera_hz %u]\n",
+               steps, between, (double)(cam_model_updates - u0) / secs,
+               crash2_60fps_camera_hz());
+        check(near((double)(cam_model_updates - u0) / secs, 29.97, 0.3),
+              "60: the camera updates at 30 Hz");
+        check(near(crash2_60fps_camera_hz(), 30, 1), "and camera_hz says so");
+        check(steps == between, "every other field is drawn between updates");
+        check(smooth, "x drawn: half a step a field, every field");
+        check(turn, "y angle drawn: half a step a field, through the wrap");
+        check(cam_flag_ok && cam_read_ok,
+              "every update reads the pose the last one wrote, not a drawn one");
+        check(crash2_60fps_camera_hooked() == 1, "camera_hooked");
+
+        /* 9c: a cut ("cut now" set by the update that jumps) is held once. */
+        unsigned long long h0 = crash2_60fps_camera_held();
+        do { game_loop(busy); } while (cam_stepped);   /* end on a field between */
+        cam_cut_next = 1;
+        cam_jump_next = 100000 << 8;
+        game_loop(busy);                               /* the cut update */
+        check(cam_stepped && cam_drawn[0] == cam_true[0], "the cut is drawn where it lands");
+        game_loop(busy);
+        check(!cam_stepped && memcmp(cam_drawn, cam_true, sizeof cam_true) == 0,
+              "the field after a cut is held, not thrown on");
+        game_loop(busy);
+        game_loop(busy);
+        check(!cam_stepped && cam_drawn[0] == cam_true[0] + vel[0] / 2,
+              "one step later it is drawn ahead again");
+        check(crash2_60fps_camera_held() == h0 + 1, "one held field counted");
+
+        /* 9d: a jump larger than camera motion, without the cut byte. */
+        h0 = crash2_60fps_camera_held();
+        cam_jump_next = 5000 << 8;
+        game_loop(busy);
+        game_loop(busy);
+        check(!cam_stepped && memcmp(cam_drawn, cam_true, sizeof cam_true) == 0,
+              "a 5000-unit jump is held too");
+        check(crash2_60fps_camera_held() == h0 + 1, "counted");
+
+        /* 9e: a state loaded while a drawn pose is in RAM keeps it. */
+        do { game_loop(busy); } while (!cam_stepped);  /* next is a field between */
+        cam_restore_after_draw = 1;
+        game_loop(busy);
+        check(!cam_stepped && cam_drawn[0] == cam_true[0],
+              "restored on a field between, drawn ahead (now the camera)");
+        h0 = crash2_60fps_camera_held();
+        const int32_t drawn_x = cam_drawn[0];
+        /* A restore starts a fresh script step (c2_60_gool_loop), so a field
+         * between comes first - with no history it is held. */
+        game_loop(busy);
+        check(!cam_stepped && cam_drawn[0] == drawn_x && crash2_60fps_camera_held() == h0 + 1,
+              "after a restore: the next field is held where RAM has it");
+        game_loop(busy);                               /* an update */
+        check(cam_stepped && cam_true[0] == drawn_x + vel[0],
+              "the update starts from the restored pose - nothing put back");
+        game_loop(busy);
+        check(!cam_stepped && crash2_60fps_camera_held() == h0 + 2,
+              "the next field between is held: one pose is no history");
+        game_loop(busy);
+        game_loop(busy);
+        check(!cam_stepped && cam_drawn[0] == cam_true[0] + vel[0] / 2,
+              "two updates later it is drawn ahead again");
+        check(cam_flag_ok && cam_read_ok, "updates still read their own poses");
+
+        /* 9f: PSX_CRASH2_60FPS_CAMERA_RATE=0 - the per-field camera. */
+        c2_60_cam_enabled = 0;
+        e0 = crash2_60fps_camera_extrapolated();
+        u0 = cam_model_updates;
+        const uint64_t g1 = t;
+        for (int i = 0; i < 120; i++) game_loop(busy);
+        check(near((double)(cam_model_updates - u0) / ((double)(t - g1) / CPU_HZ), 59.94, 0.6),
+              "A/B off: the camera updates every field");
+        check(crash2_60fps_camera_extrapolated() == e0, "A/B off: nothing drawn ahead");
+        c2_60_cam_enabled = 1;
+
+        /* 9g: 120 - three fields drawn between updates, 8 or 9 ticks apart. */
+        crash2_60fps_set_target_fps(120);
+        for (int i = 0; i < 4000 && s_div != 2; i++) game_loop(busy);
+        check(s_div == 2, "120 engaged");
+        measure(2.0, busy);
+        steps = between = 0;
+        int ok120 = 1;
+        for (int i = 0; i < N; i++) {
+            game_loop(busy);
+            xs[i] = cam_drawn[0];
+            if (cam_stepped) steps++; else between++;
+            if (i > 0) {
+                const double d = (double)(xs[i] - xs[i - 1]) / vel[0] * 34.0;
+                if (d < 7.5 || d > 9.5) ok120 = 0;
+            }
+        }
+        printf("  [120: %d updates, %d fields between]\n", steps, between);
+        check(abs(between - 3 * steps) <= 3, "three fields between each update");
+        check(ok120, "x drawn: 8 or 9 ticks' worth a field");
+        check(cam_flag_ok && cam_read_ok, "updates still read their own poses at 120");
+        crash2_60fps_set_target_fps(60);
+    }
 
     printf("\n%s\n", fails ? "FAILED" : "ALL CHECKS PASSED");
     return fails ? 1 : 0;
