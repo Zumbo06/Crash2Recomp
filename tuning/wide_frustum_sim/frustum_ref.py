@@ -10,9 +10,10 @@ What the hook draws at node n when it can judge the camera:
     last polygon;
   - the model check: most of L(n) must land in the 4:3 frame;
   - kept: candidates reaching into the extra columns (outside 512 wide, inside
-    it plus the margin), at most len(L(n)) + 32, in candidate order; on a
-    side-on path never one with a corner the GTE cannot place, and a pool
-    polygon only wholly in the extra columns of one side;
+    it plus the margin), at most len(L(n)) + 32, in candidate order; never
+    one with a corner the GTE cannot place (on forward paths too since
+    widescreen part 15), and a pool polygon only wholly in the extra columns
+    of one side;
   - the list: L(n), each kept candidate right after its anchor.
 On a side-on path, the void cover: per side, how far in from the wide
 frame's edge the void enclosed in the extra columns reaches (void_cover).
@@ -159,6 +160,17 @@ def side_keep(cam, corners, margin, from_pool):
     return not from_pool or left == len(corners) or right == len(corners)
 
 
+def fwd_keep(cam, corners, margin, from_pool):
+    """A forward path's verdict: WIDE, and - as on side-on paths - every
+    corner placeable: behind the eye the GTE's saturated division lands a
+    corner near twice its camera offset from the centre, and such a polygon
+    was drawn as a wedge up to the whole screen. A pool polygon by the
+    side-on pool's rule."""
+    if from_pool:
+        return side_keep(cam, corners, margin, True)
+    return all(placeable(cam, *c) for c in corners) and classify(cam, corners, margin) == WIDE
+
+
 BODY = 384
 
 
@@ -250,12 +262,10 @@ def _vc_tri(cells, s, marg, cols, x, y):
                 cells[r][c] = 1
 
 
-def void_cover(cam, worlds, offsets, polys, marg):
-    """[left, right]: how many px in from the wide frame's edge the cover
-    reaches (crash2_wide_slst.h's c2sl_vc_scan)."""
+def _vc_cells(cam, worlds, offsets, polys, marg):
+    """The cells c2sl_vc_scan marks covered, per side: (cells, cols, mcols)."""
     cols = min((marg + VC_BAND + VC_CELL - 1) // VC_CELL, VC_COLS)
     mcols = (marg + VC_CELL - 1) // VC_CELL
-    scols = min(mcols + VC_STRIP // VC_CELL, cols)
     cells = [[[0] * cols for _ in range(VC_ROWS)] for _ in range(2)]
     lo, hi = -marg, 512 + marg
     for pid in polys:
@@ -285,11 +295,32 @@ def void_cover(cam, worlds, offsets, polys, marg):
                 _vc_tri(cells[0], 0, marg, cols, tx, ty)
             if near_r and max(tx) >= 512 - VC_BAND - 2:
                 _vc_tri(cells[1], 1, marg, cols, tx, ty)
+    return cells, cols, mcols
+
+
+def _vc_open(g, cols, mcols):
+    """A dark, open scene on this side: its band of the 4:3 frame shows more
+    than 1/VC_OPEN void of its own."""
+    band_void = sum(1 for r in range(VC_ROWS) for c in range(mcols, cols) if not g[r][c])
+    return band_void * VC_OPEN > VC_ROWS * (cols - mcols)
+
+
+def band_open(cam, worlds, offsets, polys, marg):
+    """[left, right]: whether that side is a dark, open scene for these
+    polygons - the test the void cover skips a side by (c2sl_vc_open)."""
+    cells, cols, mcols = _vc_cells(cam, worlds, offsets, polys, marg)
+    return [_vc_open(cells[s], cols, mcols) for s in range(2)]
+
+
+def void_cover(cam, worlds, offsets, polys, marg):
+    """[left, right]: how many px in from the wide frame's edge the cover
+    reaches (crash2_wide_slst.h's c2sl_vc_scan)."""
+    cells, cols, mcols = _vc_cells(cam, worlds, offsets, polys, marg)
+    scols = min(mcols + VC_STRIP // VC_CELL, cols)
     out = []
     for s in range(2):
         g = cells[s]
-        band_void = sum(1 for r in range(VC_ROWS) for c in range(mcols, cols) if not g[r][c])
-        if band_void * VC_OPEN > VC_ROWS * (cols - mcols):
+        if _vc_open(g, cols, mcols):
             out.append(0)                       # a dark, open scene: no cover
             continue
         queue = [(r, c) for r in range(VC_ROWS) for c in range(mcols, scols) if not g[r][c]]
@@ -393,8 +424,7 @@ def draw(cam, worlds, offsets, lists, n, joins, margin, side=False, pool_ids=())
         ok = False
         if budget > 0:
             c = corners(v)
-            if c is not None and (side_keep(cam, c, margin, from_pool) if side
-                                  else classify(cam, c, margin) == WIDE):
+            if c is not None and (side_keep if side else fwd_keep)(cam, c, margin, from_pool):
                 ok = True
                 budget -= 1
         keep.append(ok)

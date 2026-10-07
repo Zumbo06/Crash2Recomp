@@ -47,7 +47,9 @@ from ..config import (
     SUPERSAMPLING_60FPS_WARN_ABOVE,
     SUPERSAMPLING_120FPS_WARN_ABOVE,
     Settings,
+    apply_original_43,
     apply_preset,
+    is_original_43,
     matching_preset,
     native_120fps_active,
 )
@@ -445,10 +447,15 @@ class SettingsPage(QWidget):
              if (w, h) == (self.settings.window_width, self.settings.window_height)), 0))
         self.output_resolution.currentIndexChanged.connect(self._on_output_resolution)
 
+        # The PS1's own picture is named here, because 4:3 alone said nothing
+        # about bars: Image fit, Zoom, Stretch and the overscan crop decide
+        # those, and a 4:3 left on Stretch filled a 16:9 screen. Picking
+        # Original sets them too (config.ORIGINAL_43). A 4:3 framed any other
+        # way shows as "custom framing", an entry that exists only while it is
+        # the state - as the presets bar shows Custom.
         self.aspect = QComboBox()
-        self.aspect.addItems(ASPECTS)
-        self.aspect.setCurrentText(self.settings.aspect)
-        self.aspect.currentTextChanged.connect(self._on_aspect)
+        self._fill_aspect()
+        self.aspect.currentIndexChanged.connect(self._on_aspect)
 
         self.ws_mode = self._combo(WIDESCREEN_MODES,
                                    self.settings.widescreen_native_wide,
@@ -492,9 +499,11 @@ class SettingsPage(QWidget):
                 row("Gameplay aspect", self.aspect),
                 self.ws_mode_row,
                 self.object_range_row,
-                dim("Gameplay aspect is what the game draws; Screen shape is "
-                    "the window. 4:3 gameplay with Zoom fills a wide screen "
-                    "without pop-in at the edges."),
+                dim("Original 4:3 is the picture as the PS1 drew it, with "
+                    "black bars at the sides of a wider screen (a window "
+                    "that matches the gameplay aspect is 4:3 itself). "
+                    "Gameplay aspect is what the game draws; Screen shape "
+                    "is the window."),
                 self.ws_mode_note,
                 self.object_range_note,
             ),
@@ -914,6 +923,7 @@ class SettingsPage(QWidget):
         # Widescreen settings do nothing while the game draws 4:3. Native-wide
         # and the object range are developer previews: hidden, and not applied
         # (config.widescreen_*_active), outside developer mode.
+        self._fill_aspect()
         wide = self.settings.aspect != "4:3"
         for box in (self.ws_mode, self.widescreen_object_range):
             box.setEnabled(wide)
@@ -967,7 +977,7 @@ class SettingsPage(QWidget):
         if idx >= 0:
             self.renderer.setCurrentIndex(idx)
         self.scale.setCurrentIndex(max(0, self.settings.supersampling - 1))
-        self.aspect.setCurrentText(self.settings.aspect)
+        self._fill_aspect()
         for box, value in (
             (self.fullscreen, self.settings.fullscreen_mode),
             (self.rewind, self.settings.rewind),
@@ -1085,7 +1095,38 @@ class SettingsPage(QWidget):
             self.output_resolution.itemData(index)
         self._touch()
 
-    def _on_aspect(self, value: str) -> None:
+    ORIGINAL_43_LABEL = "Original 4:3 - black bars at the sides"
+    CUSTOM_43_LABEL = "4:3 - custom framing"
+
+    def _fill_aspect(self) -> None:
+        """Show the Gameplay aspect entry the settings amount to.
+
+        Rebuilt rather than kept, because the custom-framing entry comes and
+        goes with the framing controls. Signals stay blocked: this follows the
+        settings, it never changes them."""
+        original = is_original_43(self.settings)
+        entries = [(self.ORIGINAL_43_LABEL, "original")]
+        if self.settings.aspect == "4:3" and not original:
+            entries.append((self.CUSTOM_43_LABEL, "4:3"))
+        entries += [(a, a) for a in ASPECTS if a != "4:3"]
+        blocked = self.aspect.blockSignals(True)
+        if [(self.aspect.itemText(i), self.aspect.itemData(i))
+                for i in range(self.aspect.count())] != entries:
+            self.aspect.clear()
+            for label, data in entries:
+                self.aspect.addItem(label, data)
+        self.aspect.setCurrentIndex(max(0, self.aspect.findData(
+            "original" if original else self.settings.aspect)))
+        self.aspect.blockSignals(blocked)
+
+    def _on_aspect(self, index: int) -> None:
+        value = self.aspect.itemData(index)
+        if value == "original":
+            apply_original_43(self.settings)
+            self._touch()
+            # Image fit, Zoom, Stretch and Overscan changed with it.
+            self._rebuild_from_settings()
+            return
         self.settings.aspect = value
         self._touch()
 

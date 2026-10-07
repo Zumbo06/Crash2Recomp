@@ -4288,3 +4288,52 @@ The scratchpad harness compiles `psx_pause_menu.c` with stubs.
 - **Armed state.** Arming Quit reddens Quit only.
 - **Mouse.** Hover and click land on the rows, windowed and in exclusive full
   screen. The D3D12 renderer is also worth one look.
+
+## Original 4:3 (patch 0057)
+
+**The report.** There was no original PS1 aspect option: 4:3 with black bars at
+the sides.
+
+The renderer could always pillarbox. It only did so when four settings agreed:
+
+- aspect 4:3;
+- Image fit Letterbox;
+- Zoom "Follow image fit" or "None", and Stretch 0;
+- no overscan crop. Trimming the blank lines makes the kept band wider than
+  4:3 (`overscan_aspect_mul`), which narrows the bars.
+
+Picking 4:3 reset none of these. A 4:3 left on Stretch, or on Enhanced's stretch
+100 and 12/12 crop, filled a 16:9 window.
+
+**Original 4:3 is a named state of those fields, not a new setting.**
+
+- **Launcher** (`config.ORIGINAL_43`, `is_original_43`, `apply_original_43`):
+  - Gameplay aspect offers "Original 4:3 - black bars at the sides". It sets the
+    framing and leaves image quality, the screen shape and the window alone.
+  - A 4:3 framed any other way shows as "4:3 - custom framing". That entry
+    exists only while it is the state.
+  - The Authentic preset shows as Original.
+- **Home menu:**
+  - GAMEPLAY ASPECT index 0 reads ORIGINAL 4:3 under the same test
+    (`pause_menu_framing_is_original`). Picking it applies the framing at once.
+  - `MENU_PREF_OVERSCAN` writes the crop back, so `ingame.py` keeps it as
+    "game aspect original 4:3".
+  - `g_overscan_crop` in main.cpp mirrors the crop, because the renderer has no
+    getter for it and the D3D12 dispatch would need one in four files.
+
+A window sized to match the gameplay aspect is 4:3 itself, so it shows no bars.
+Fullscreen, or a 16:9 output resolution, does.
+
+**Checked:**
+
+- `launcher/test_original_aspect.py`;
+- `test_ingame.py` (the runtime writes exactly the keys the launcher reads);
+- the Home menu harness (both labels, the redraw, the width);
+- both trees build.
+
+**To check in play:**
+
+- Pick Original 4:3 in the launcher, in a 16:9 window: there should be bars at
+  the sides, with sharpness and filtering as before.
+- In the Home menu, cycle GAMEPLAY ASPECT to ORIGINAL 4:3 and resume: the same
+  picture, and the launcher shows it on return.

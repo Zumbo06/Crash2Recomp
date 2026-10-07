@@ -976,6 +976,46 @@ def postfx_string(settings: Settings) -> str:
     return ";".join(parts)
 
 
+# The PS1's own picture: the 4:3 render shown whole at its own shape, with
+# black bars wherever the screen is wider. Not a preset - a named state of the
+# framing fields - so it leaves image quality, the screen shape and the window
+# alone, and Authentic (which includes it) is recognised as it. Overscan is
+# part of it: trimming the game's blank lines makes the kept band wider than
+# 4:3 (gpu_gl_renderer.c overscan_aspect_mul), which narrows the bars.
+ORIGINAL_43: dict[str, Any] = {
+    "aspect": "4:3",
+    "scaling_mode": "letterbox",
+    "present_zoom": -1,
+    "present_pan": 0,
+    "present_stretch": 0,
+    "overscan_top": 0,
+    "overscan_bottom": 0,
+    "overscan_left": 0,
+    "overscan_right": 0,
+}
+
+
+def is_original_43(settings: Settings) -> bool:
+    """Whether the game draws 4:3 and the picture is shown whole, unstretched.
+
+    Zoom "None" (0) frames exactly as "Follow image fit" (-1) does under
+    Letterbox, and the vertical pan only moves a picture that is cropped, so
+    neither changes what is on screen here. The runtime's Home menu applies the
+    same test (main.cpp pause_menu_framing_is_original)."""
+    s = settings
+    return (s.aspect == "4:3" and s.scaling_mode == "letterbox"
+            and s.present_zoom in (-1, 0) and s.present_stretch == 0
+            and not (s.overscan_top or s.overscan_bottom
+                     or s.overscan_left or s.overscan_right))
+
+
+def apply_original_43(settings: Settings) -> Settings:
+    """Switch to the original 4:3 picture; everything else stays."""
+    for key, value in ORIGINAL_43.items():
+        setattr(settings, key, value)
+    return settings
+
+
 def apply_preset(settings: Settings, name: str) -> Settings:
     """Apply a preset over the current settings, leaving diagnostics alone."""
     for key, value in PRESETS.get(name, {}).items():

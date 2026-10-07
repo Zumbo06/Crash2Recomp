@@ -3,8 +3,10 @@
     python tuning/wide_frustum_sim/export.py OUT.bin [--nsf-dir DIR] [--per-level N]
 
 Each case: a camera path at one node, near an end or in the middle, up to N
-per level on side-on paths (kind 3, 8) and N on the others, and one more
-side-on case per level whose extra columns hold void to cover; the game's own
+per level on side-on paths (kind 3, 8) and N on the others, one more
+side-on case per level whose extra columns hold void to cover, and one more
+forward case per level where the camera test refuses a polygon reaching into
+the extra columns for a corner the GTE cannot place; the game's own
 camera at rest there (crash2_wide_geom.h: the path point, turned by the
 node's angles from the item after the path, H from the path's 0x130); the
 entries the hook reads (the zone, its worlds, the path's SLST, the zones and
@@ -218,6 +220,103 @@ def pool_sources(ents, zeid, item):
     return out, zones
 
 
+def wedges_refused(cam, worlds, offsets, lists, n, joins, margin):
+    """How many of the camera test's candidates on a forward path reach into
+    the extra columns but have a corner the GTE cannot place: the polygons
+    widescreen part 15 stopped adding."""
+    count = 0
+    for v, _, _ in F.candidates(lists, n, joins):
+        w = v >> 13
+        c = worlds[w].corners(v, offsets[w]) if w < len(worlds) and worlds[w] else None
+        if c and F.classify(cam, c, margin) == F.WIDE and \
+                not all(F.placeable(cam, *q) for q in c):
+            count += 1
+    return count
+
+
+class Path:
+    """One camera path, decoded as the hooks read it (see level_paths)."""
+
+
+def level_paths(ents, skip_zone=lambda: False, want=lambda side: True):
+    """Every camera path the hooks can work with, in entry and item order:
+    its zone, with every world resident; the path's SLST rebuilt by
+    crash2_wide_slst.h's rules (the lax rebuild on side-on paths); its points
+    and node angles; and the paths the camera links join at its ends, world
+    slots mapped by world EID. skip_zone() is asked before each zone and
+    want(side) before a path's SLST is rebuilt, so a caller with a quota does
+    not pay for paths it will not use. Shared by this export and
+    tuning/wide_view_sweep."""
+    for zeid, (t, items) in ents.items():
+        if t != 7 or skip_zone():
+            continue
+        hdr = items[0]
+        nw = struct.unpack_from("<I", hdr, 0)[0]
+        if not 1 <= nw <= 8:
+            continue
+        wl_eids = [struct.unpack_from("<I", hdr, 4 + 48 * i)[0] for i in range(nw)]
+        if any(ents.get(e, (0,))[0] != 3 for e in wl_eids):
+            continue
+        worlds = [F.World(ents[e][1]) for e in wl_eids]
+        cam0, ncam_items = struct.unpack_from("<2I", hdr, 0x184)
+        nn = struct.unpack_from("<I", hdr, 0x190)[0]
+        neigh = list(struct.unpack_from("<%dI" % min(nn, 16), hdr, 0x194))
+        ox, oy, oz = struct.unpack_from("<3i", items[1], 0)
+        for k in range(cam0, cam0 + ncam_items, 3):
+            if k + 1 >= len(items):
+                break
+            it = items[k]
+            tb, ta = table(it), table(items[k + 1])
+            if not tb or 0x103 not in tb or 0x04B not in tb or not ta or 0x04B not in ta:
+                continue
+            kind = rows(it, tb[0x029])[0][1][0] if 0x029 in tb else -1
+            side = kind in (3, 8)
+            if not want(side):
+                continue
+            se = rows(it, tb[0x103])[0][1][0]
+            if ents.get(se, (0,))[0] != 4:
+                continue
+            lists = node_lists(ents[se][1], side)
+            if lists is None:
+                continue
+            pos = [(ox + x, oy + y, oz + z) for x, y, z in rows(it, tb[0x04B])[0][1]]
+            angles = rows(items[k + 1], ta[0x04B])[0][1]
+            if len(pos) != len(lists) or len(pos) < 6 or len(angles) < 2 * len(pos):
+                continue
+            # the paths linked at each end
+            joins, extra = [None, None], []
+            for node, vals in (rows(it, tb[0x109]) if 0x109 in tb else []):
+                end = 0 if node == 0 else (1 if node == len(pos) - 1 else None)
+                if end is None or len(vals) != 1:
+                    continue
+                rec = vals[0]
+                slot, pidx, at_start = (rec >> 16) & 0xFF, (rec >> 8) & 0xFF, (rec & 0xFF) == 1
+                if slot >= len(neigh) or ents.get(neigh[slot], (0,))[0] != 7:
+                    continue
+                jz = ents[neigh[slot]][1]
+                jc0 = struct.unpack_from("<I", jz[0], 0x184)[0]
+                jit = jz[pidx * 3 + jc0] if pidx * 3 + jc0 < len(jz) else None
+                jtb = table(jit) if jit else None
+                if not jtb or 0x103 not in jtb:
+                    continue
+                jse = rows(jit, jtb[0x103])[0][1][0]
+                if ents.get(jse, (0,))[0] != 4:
+                    continue
+                jl = node_lists(ents[jse][1], side)
+                if jl is None:
+                    continue
+                jnw = struct.unpack_from("<I", jz[0], 0)[0]
+                jw = [struct.unpack_from("<I", jz[0], 4 + 48 * i)[0] for i in range(min(jnw, 8))]
+                wmap = [wl_eids.index(e) if e in wl_eids else 0xFF for e in jw] + [0xFF] * (8 - len(jw))
+                joins[end] = (jl, at_start, wmap)
+                extra += [neigh[slot], jse]
+            p = Path()
+            p.zeid, p.items, p.wl_eids, p.worlds, p.neigh = zeid, items, wl_eids, worlds, neigh
+            p.k, p.it, p.tb, p.kind, p.side, p.se = k, it, tb, kind, side, se
+            p.lists, p.pos, p.angles, p.joins, p.extra = lists, pos, angles, joins, extra
+            yield p
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -239,118 +338,64 @@ def main() -> int:
             continue
         ents = {eid: (t, items) for eid, t, items in N.entries(data)}
         got = {True: 0, False: 0}                  # side-on, other
-        void_case = False                          # one side-on case with a cover
-        for zeid, (t, items) in ents.items():
-            if t != 7 or (min(got.values()) >= args.per_level and void_case):
-                continue
-            hdr = items[0]
-            nw = struct.unpack_from("<I", hdr, 0)[0]
-            if not 1 <= nw <= 8:
-                continue
-            wl_eids = [struct.unpack_from("<I", hdr, 4 + 48 * i)[0] for i in range(nw)]
-            if any(ents.get(e, (0,))[0] != 3 for e in wl_eids):
-                continue
-            worlds = [F.World(ents[e][1]) for e in wl_eids]
-            cam0, ncam_items = struct.unpack_from("<2I", hdr, 0x184)
-            nn = struct.unpack_from("<I", hdr, 0x190)[0]
-            neigh = list(struct.unpack_from("<%dI" % min(nn, 16), hdr, 0x194))
-            ox, oy, oz = struct.unpack_from("<3i", items[1], 0)
-            for k in range(cam0, cam0 + ncam_items, 3):
-                if k + 1 >= len(items):
-                    break
-                it = items[k]
-                tb, ta = table(it), table(items[k + 1])
-                if not tb or 0x103 not in tb or 0x04B not in tb or not ta or 0x04B not in ta:
+        # one more case each: side-on with a cover, forward with a wedge refused
+        special = {True: False, False: False}
+        for p in level_paths(
+                ents,
+                skip_zone=lambda: min(got.values()) >= args.per_level and all(special.values()),
+                want=lambda side: not (got[side] >= args.per_level and special[side])):
+            side, lists, pos, joins, worlds = p.side, p.lists, p.pos, p.joins, p.worlds
+            extra = list(p.extra)
+            pool_ids = []
+            if side:
+                srcs, pool_zones = pool_sources(ents, p.zeid, p.k)
+                pool_ids = F.pool(p.wl_eids, [(w, ll) for w, ll, _ in srcs])
+                extra += pool_zones + [s for _, _, s in srcs]
+            for n in (len(pos) - 3, len(pos) // 2, 1):
+                regular = got[side] < args.per_level and n != 1
+                if not regular and special[side]:
                     continue
-                kind = rows(it, tb[0x029])[0][1][0] if 0x029 in tb else -1
-                side = kind in (3, 8)
-                if got[side] >= args.per_level and (not side or void_case):
+                cx, cy, cz = pos[n]
+                offsets = [((w.origin[0] - cx) & 0xFFFFFFFF, ((w.origin[1] - cy) & 0xFFFFFFFF) & 0xFFFE,
+                            (w.origin[2] - cz) & 0xFFFFFFFF) for w in worlds]
+                if sum(1 for v in lists[n] if (v >> 13) < len(worlds)) < 20:
                     continue
-                se = rows(it, tb[0x103])[0][1][0]
-                if ents.get(se, (0,))[0] != 4:
-                    continue
-                lists = node_lists(ents[se][1], side)
-                if lists is None:
-                    continue
-                pos = [(ox + x, oy + y, oz + z) for x, y, z in rows(it, tb[0x04B])[0][1]]
-                angles = rows(items[k + 1], ta[0x04B])[0][1]
-                if len(pos) != len(lists) or len(pos) < 6 or len(angles) < 2 * len(pos):
-                    continue
-                # the paths linked at each end
-                joins, extra = [None, None], []
-                for node, vals in (rows(it, tb[0x109]) if 0x109 in tb else []):
-                    end = 0 if node == 0 else (1 if node == len(pos) - 1 else None)
-                    if end is None or len(vals) != 1:
+                r = camera_rotation(*p.angles[2 * n])
+                h = path_h(p.it, p.tb, n)
+                cam = {"r": r, "h": h, "ofx": 256 << 16, "ofy": 108 << 16}
+                seen, total, merged, kept = F.draw(cam, worlds, offsets, lists, n, joins, MARGIN,
+                                                   side, pool_ids)
+                cover = F.void_cover(cam, worlds, offsets, merged, MARGIN) \
+                    if side and merged is not None else [0, 0]
+                if not regular:
+                    hit = any(cover) if side else merged is not None and wedges_refused(
+                        cam, worlds, offsets, lists, n, joins, MARGIN) > 0
+                    if not hit:
                         continue
-                    rec = vals[0]
-                    slot, pidx, at_start = (rec >> 16) & 0xFF, (rec >> 8) & 0xFF, (rec & 0xFF) == 1
-                    if slot >= len(neigh) or ents.get(neigh[slot], (0,))[0] != 7:
-                        continue
-                    jz = ents[neigh[slot]][1]
-                    jc0 = struct.unpack_from("<I", jz[0], 0x184)[0]
-                    jit = jz[pidx * 3 + jc0] if pidx * 3 + jc0 < len(jz) else None
-                    jtb = table(jit) if jit else None
-                    if not jtb or 0x103 not in jtb:
-                        continue
-                    jse = rows(jit, jtb[0x103])[0][1][0]
-                    if ents.get(jse, (0,))[0] != 4:
-                        continue
-                    jl = node_lists(ents[jse][1], side)
-                    if jl is None:
-                        continue
-                    jnw = struct.unpack_from("<I", jz[0], 0)[0]
-                    jw = [struct.unpack_from("<I", jz[0], 4 + 48 * i)[0] for i in range(min(jnw, 8))]
-                    wmap = [wl_eids.index(e) if e in wl_eids else 0xFF for e in jw] + [0xFF] * (8 - len(jw))
-                    joins[end] = (jl, at_start, wmap)
-                    extra += [neigh[slot], jse]
-                pool_ids = []
-                if side:
-                    srcs, pool_zones = pool_sources(ents, zeid, k)
-                    pool_ids = F.pool(wl_eids, [(w, ll) for w, ll, _ in srcs])
-                    extra += pool_zones + [s for _, _, s in srcs]
-                for n in (len(pos) - 3, len(pos) // 2, 1):
-                    regular = got[side] < args.per_level and n != 1
-                    if not regular and (not side or void_case):
-                        continue
-                    cx, cy, cz = pos[n]
-                    offsets = [((w.origin[0] - cx) & 0xFFFFFFFF, ((w.origin[1] - cy) & 0xFFFFFFFF) & 0xFFFE,
-                                (w.origin[2] - cz) & 0xFFFFFFFF) for w in worlds]
-                    if sum(1 for v in lists[n] if (v >> 13) < len(worlds)) < 20:
-                        continue
-                    r = camera_rotation(*angles[2 * n])
-                    h = path_h(it, tb, n)
-                    cam = {"r": r, "h": h, "ofx": 256 << 16, "ofy": 108 << 16}
-                    seen, total, merged, kept = F.draw(cam, worlds, offsets, lists, n, joins, MARGIN,
-                                                       side, pool_ids)
-                    cover = F.void_cover(cam, worlds, offsets, merged, MARGIN) \
-                        if side and merged is not None else [0, 0]
-                    if not regular:
-                        if not any(cover):
-                            continue
-                        void_case = True
-                    entry_eids = [zeid] + wl_eids + [se] + extra
-                    placed = set(entry_eids)
-                    objs = []
-                    for prop in (0x13B, 0x13C):
-                        for _, vals in (rows(it, tb[prop]) if prop in tb else []):
-                            for v in vals:
-                                if v not in [o[0] for o in objs] and len(objs) < 200:
-                                    p = object_pos(ents, items, v, placed)
-                                    verdict = -1 if merged is None or p is None else \
-                                        F.object_verdict(cam, MARGIN, (cx, cy, cz), p)
-                                    objs.append((v, verdict))
-                    cases.append({
-                        "entries": [(e, ents[e][0], ents[e][1]) for e in dict.fromkeys(entry_eids)],
-                        "zone": zeid, "item": k, "node": n, "cam": (cx, cy, cz), "r": r, "h": h,
-                        "seen": seen, "total": total, "merged": merged, "kept": kept,
-                        "joins": sum(j is not None for j in joins),
-                        "kind": kind, "level": name, "objs": objs, "cover": cover,
-                    })
-                    if regular:
-                        got[side] += 1
-                    print("%s %s item %d kind %d node %d/%d: H %d, model %d/%d, kept %d, joins %d, pool %d, "
-                          "cover %d/%d" % (name, N.eid_name(zeid), k, kind, n, len(pos), h, seen, total, kept,
-                                           cases[-1]["joins"], len(pool_ids), cover[0], cover[1]))
+                    special[side] = True
+                entry_eids = [p.zeid] + p.wl_eids + [p.se] + extra
+                placed = set(entry_eids)
+                objs = []
+                for prop in (0x13B, 0x13C):
+                    for _, vals in (rows(p.it, p.tb[prop]) if prop in p.tb else []):
+                        for v in vals:
+                            if v not in [o[0] for o in objs] and len(objs) < 200:
+                                op = object_pos(ents, p.items, v, placed)
+                                verdict = -1 if merged is None or op is None else \
+                                    F.object_verdict(cam, MARGIN, (cx, cy, cz), op)
+                                objs.append((v, verdict))
+                cases.append({
+                    "entries": [(e, ents[e][0], ents[e][1]) for e in dict.fromkeys(entry_eids)],
+                    "zone": p.zeid, "item": p.k, "node": n, "cam": (cx, cy, cz), "r": r, "h": h,
+                    "seen": seen, "total": total, "merged": merged, "kept": kept,
+                    "joins": sum(j is not None for j in joins),
+                    "kind": p.kind, "level": name, "objs": objs, "cover": cover,
+                })
+                if regular:
+                    got[side] += 1
+                print("%s %s item %d kind %d node %d/%d: H %d, model %d/%d, kept %d, joins %d, pool %d, "
+                      "cover %d/%d" % (name, N.eid_name(p.zeid), p.k, p.kind, n, len(pos), h, seen, total,
+                                       kept, cases[-1]["joins"], len(pool_ids), cover[0], cover[1]))
     with open(args.out, "wb") as f:
         f.write(b"C2FS")
         f.write(struct.pack("<I", len(cases)))

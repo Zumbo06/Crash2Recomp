@@ -7,9 +7,10 @@
  * world records filled for the frame (offsets from the camera, the world's
  * items), an EID record table where 0x80014B90 looks - and the hook is driven
  * at the render call with the game's camera for that node in the GTE. What it
- * draws must equal what frustum_ref.py says, case by case; on side-on paths
- * nothing it adds may have a corner the GTE cannot place, and nothing from
- * the pool may reach into the 4:3 columns. Then the ways it must refuse:
+ * draws must equal what frustum_ref.py says, case by case; nothing it adds
+ * may have a corner the GTE cannot place (forward paths too since widescreen
+ * part 15), and nothing from the pool may reach into the 4:3 columns. Then
+ * the ways it must refuse:
  * worlds it cannot read, a camera that does not put the game's list on
  * screen, a linked path that is not resident.
  *
@@ -295,7 +296,7 @@ int main(int argc, char **argv)
     printf("1. what the camera test draws, against the reference (%d cases)\n", g_ncases);
     int ran = 0, model_ok = 0, joined = 0, placed_out = 0, obj_total = 0, obj_in = 0;
     int side_cases = 0, pooled = 0, pool_max = 0, pool_drawn = 0, side_checked = 0;
-    int covered = 0, cover_px = 0;
+    int covered = 0, cover_px = 0, fwd_checked = 0, fwd_refused = 0;
     long added = 0, listed = 0;
     double worst_ms = 0.0;
     for (int c = 0; c < g_ncases; ++c) {
@@ -344,24 +345,31 @@ int main(int argc, char **argv)
         int bk, kk, ok, ad;
         crash2_wide_slst_stats(st, &bk, &kk, &ok, &ad);
         CHECK(st[9] == 1, "case %d: drawn with the camera test (%llu)", c, st[9]);
-        /* Side-on: every kept candidate placeable, the pool's wholly in the
-         * extra columns of one side; elsewhere no pool at all. */
-        if (c2sl_built.side_on) {
+        /* On every path every kept candidate placeable (side-on since part
+         * 13, forward too since part 15), the pool's wholly in the extra
+         * columns of one side. */
+        {
             static C2wgWorld ws[C2WG_MAX_WORLDS];
             const int nw = c2wg_worlds(zone->addr, ws, C2WG_MAX_WORLDS);
             C2wgCam cam;
             memset(&cam, 0, sizeof cam);
             for (int i = 0; i < 9; ++i) cam.r[i] = k->r[i];
             cam.h = k->h; cam.ofx = k->ofx; cam.ofy = k->ofy; cam.margin = k->margin;
-            side_cases++;
-            if (c2sl_pool.n > 0) pooled++;
-            if (c2sl_pool.n > pool_max) pool_max = c2sl_pool.n;
-            pool_drawn += (int)st[13];
-            CHECK(st[12] == (unsigned long long)c2sl_pool.n, "case %d: pool count reported", c);
             for (int cc = 0; cc < c2sl_ncand; ++cc) {
-                if (!c2sl_ckeep[cc]) continue;
                 int32_t v[4][3];
                 const int n = c2wg_poly(g_ram, ws, nw, c2sl_cid[cc], v);
+                if (!c2sl_ckeep[cc]) {
+                    /* forward: reaching into the extra columns, but a wedge -
+                     * what 0052 to 0057 drew */
+                    if (!c2sl_built.side_on && n > 0 &&
+                        c2wg_classify(&cam, v, n, cam.margin) == C2WG_WIDE) {
+                        int placed = 1;
+                        for (int q = 0; q < n; ++q)
+                            placed &= c2wg_placeable(&cam, v[q][0], v[q][1], v[q][2]);
+                        fwd_refused += !placed;
+                    }
+                    continue;
+                }
                 int place_ok = n > 0, left = 0, right = 0;
                 for (int q = 0; q < n; ++q) {
                     int sx = 0, sy = 0;
@@ -370,13 +378,21 @@ int main(int argc, char **argv)
                     left += sx < 0;
                     right += sx >= 512;
                 }
-                side_checked++;
+                if (c2sl_built.side_on) side_checked++;
+                else fwd_checked++;
                 CHECK(place_ok, "case %d: added polygon %04X has a corner the GTE cannot place", c,
                       c2sl_cid[cc]);
                 if (cc >= c2sl_pool_first)
                     CHECK(left == n || right == n,
                           "case %d: pool polygon %04X reaches into the 4:3 columns", c, c2sl_cid[cc]);
             }
+        }
+        if (c2sl_built.side_on) {
+            side_cases++;
+            if (c2sl_pool.n > 0) pooled++;
+            if (c2sl_pool.n > pool_max) pool_max = c2sl_pool.n;
+            pool_drawn += (int)st[13];
+            CHECK(st[12] == (unsigned long long)c2sl_pool.n, "case %d: pool count reported", c);
             /* The void cover: as the reference scans it, in the last slot of the
              * ordering table, inside the extra columns, black and opaque. */
             CHECK(c2sl_vc.want[0] == k->cover[0] && c2sl_vc.want[1] == k->cover[1],
@@ -420,11 +436,14 @@ int main(int argc, char **argv)
     printf("   %d cases ran (%d did not fit in RAM), %d judged by the camera, %d with a linked path;\n"
            "   %.1f%% more polygons, the slowest frame %.2f ms; %d objects judged, %d in the extra columns\n"
            "   side-on: %d judged, %d with a pool (largest %d), %d pool polygons drawn, %d kept checked;\n"
-           "   void cover on %d of them, %d px on average\n",
+           "   void cover on %d of them, %d px on average;\n"
+           "   forward: %d kept checked, %d wedges refused\n",
            ran, placed_out, model_ok, joined, listed ? 100.0 * added / listed : 0.0, worst_ms,
            obj_total, obj_in, side_cases, pooled, pool_max, pool_drawn, side_checked, covered,
-           covered ? cover_px / covered : 0);
+           covered ? cover_px / covered : 0, fwd_checked, fwd_refused);
     CHECK(ran >= 20 && model_ok >= 20, "enough cases judged (%d)", model_ok);
+    CHECK(fwd_checked > 0 && fwd_refused > 0,
+          "forward additions checked (%d), wedges refused (%d)", fwd_checked, fwd_refused);
     CHECK(side_cases >= 20 && pooled >= 20 && pool_drawn > 0,
           "side-on cases with a pool (%d, %d, %d drawn)", side_cases, pooled, pool_drawn);
     CHECK(covered >= 5, "side-on cases with void to cover (%d)", covered);
