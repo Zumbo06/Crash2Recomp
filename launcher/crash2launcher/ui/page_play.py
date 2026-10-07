@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -38,7 +37,7 @@ from ..runtime import RESTART_EXIT_CODE, GameSession, build_plan, observed_from_
 from ..version import STATUS, VERSION
 from .common import card, dim, section, set_status, stat_row
 from .dialogs import confirm
-from .play_scene import PlayButton, PlayScene, REFERENCE_WIDTH, StatusBadge, StatusPanel
+from .play_scene import PlayButton, PlayScene, StatusBadge, StatusPanel, scene_scale
 from .theme import ERROR, OK, PLAY_GREEN, WARN
 
 # "[FPS] game: 59.9 fps (1.00x) | frames: 1246"
@@ -210,7 +209,7 @@ class PlayPage(PlayScene):
                                      "show what actually ran.")
         for i, (name, value) in enumerate((
             ("Version", self.version_lbl), ("Renderer", self.renderer_lbl),
-            ("Save slot", self.slot_lbl), ("Input", self.input_lbl),
+            ("Quick save", self.slot_lbl), ("Input", self.input_lbl),
         )):
             label = QLabel(name)
             label.setObjectName("PlayMetaLabel")
@@ -234,10 +233,6 @@ class PlayPage(PlayScene):
         self.notice.setWordWrap(True)
         # Process errors may contain filesystem paths or arbitrary output.
         self.notice.setTextFormat(Qt.TextFormat.PlainText)
-        self.ready_bar = QProgressBar()
-        self.ready_bar.setObjectName("PlayReadyBar")
-        self.ready_bar.setTextVisible(False)
-        self.ready_bar.setFixedHeight(9)
         self.setup_btn = QPushButton("Open Setup")
         self.setup_btn.setObjectName("PlaySecondary")
         self.setup_btn.clicked.connect(self.setup_requested.emit)
@@ -249,7 +244,6 @@ class PlayPage(PlayScene):
         right.addLayout(heading_row)
         right.addWidget(self.ready_hint)
         right.addWidget(self.notice)
-        right.addWidget(self.ready_bar)
         right.addWidget(self.setup_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         row.addLayout(right, 1)
         return panel
@@ -292,7 +286,7 @@ class PlayPage(PlayScene):
         if not hasattr(self, "status_panel"):
             return
         w, h = self.width(), self.height()
-        scale = w / REFERENCE_WIDTH
+        scale = scene_scale(w, h)    # the scene paints the art with this too
         x = round(84 * scale)
         button_w = max(220, round(458 * scale))
         button_h = max(54, round(115 * scale))
@@ -322,14 +316,21 @@ class PlayPage(PlayScene):
         self.diag_strip.setFixedWidth(diag_w)
         diag_h = max(64, self.diag_strip.layout().totalHeightForWidth(diag_w))
         self.diag_strip.setGeometry(diag_x, 22, diag_w, diag_h)
+        # The preview note is the one that matters (known issues), so a narrow
+        # window drops the platform line instead of the note.
+        narrow = w < 1000
+        self.footer.setVisible(not narrow)
         self.footer.setGeometry(22, h - 32, w - 44, 24)
-        self.preview_note.setVisible(w >= 1000)
-        self.preview_note.setGeometry(w // 2, h - 32, w // 2 - 22, 24)
+        align = Qt.AlignmentFlag.AlignLeft if narrow else Qt.AlignmentFlag.AlignRight
+        self.preview_note.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+        if narrow:
+            self.preview_note.setGeometry(22, h - 32, w - 44, 24)
+        else:
+            self.preview_note.setGeometry(w // 2, h - 32, w // 2 - 22, 24)
 
     def _set_readiness(self, title: str, hint: str, tone: str = "Ok", ready: bool = True) -> None:
         set_status(self.state_lbl, tone, title)
         self.ready_hint.setText(hint)
-        self.ready_bar.setValue(100 if ready else 0)
         self.status_badge.ready = ready
         self.status_badge.colour = {"Warn": WARN, "Error": ERROR}.get(tone, PLAY_GREEN)
         self.status_badge.setAccessibleName(title)
@@ -340,7 +341,8 @@ class PlayPage(PlayScene):
     def refresh(self) -> None:
         self.renderer_lbl.setText(RENDERER_LABELS.get(self.settings.renderer,
                                                       self.settings.renderer))
-        self.slot_lbl.setText(f"{self.settings.quick_save_slot:02d}")
+        # 1-based, as the Saves and Input pages number the slots.
+        self.slot_lbl.setText(f"Slot {self.settings.quick_save_slot + 1}")
         self.input_lbl.setText("Keyboard + pad" if self.settings.merge_all_input else "Keyboard")
         running = self.session.running
         self.stop_btn.setVisible(running)

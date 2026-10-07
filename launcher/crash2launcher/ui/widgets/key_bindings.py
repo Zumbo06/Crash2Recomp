@@ -131,6 +131,10 @@ class KeyBindingsEditor(QWidget):
             root.addLayout(grid)
         self.warning = dim("")
         root.addWidget(self.warning)
+        # Two game buttons on one key: the hotkey editor already warned about
+        # its own clashes, this one never did.
+        self.duplicate_warning = warn("")
+        root.addWidget(self.duplicate_warning)
         reset = QPushButton("Restore keyboard defaults")
         reset.clicked.connect(self.reset_defaults)
         root.addWidget(reset, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -169,6 +173,14 @@ class KeyBindingsEditor(QWidget):
             + ", ".join(f"{key} ({hot[key]})" for key in reserved)
             if reserved else "")
         self.warning.setVisible(bool(reserved))
+        dupes = keybinds.duplicates(self.settings.bindings)
+        def who(labels):
+            if len(labels) == 2:
+                return f"both {labels[0]} and {labels[1]}"
+            return ", ".join(labels[:-1]) + f" and {labels[-1]}"
+        self.duplicate_warning.setText("\n".join(
+            f"{key} is set for {who(labels)}." for key, labels in dupes))
+        self.duplicate_warning.setVisible(bool(dupes))
 
 
 def _pretty(bind: str) -> str:

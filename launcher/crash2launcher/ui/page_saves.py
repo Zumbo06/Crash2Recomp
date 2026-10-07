@@ -35,7 +35,7 @@ from ..runtime import GameSession
 from .common import card, dim, heading, row, section, set_status
 from .dialogs import confirm, tell
 from .theme import (BG_SUNKEN, BORDER, CARD_MARGINS, PAGE_MARGINS, SPACE_2,
-                    SPACE_3, SPACE_4, TEXT_FAINT)
+                    SPACE_3, SPACE_4, TEXT_DIM)
 
 THUMB_W, THUMB_H = 192, 144        # the runtime's 128x96, at 1.5x
 TILE_GAP = SPACE_4
@@ -81,7 +81,7 @@ class SlotTile(QWidget):
         # from the application stylesheet (see common.card).
         self.thumb.setStyleSheet(
             f"background: {BG_SUNKEN}; border: 1px solid {BORDER};"
-            f" color: {TEXT_FAINT};")
+            f" color: {TEXT_DIM};")
         lay.addWidget(self.thumb)
 
         self.title = QLabel()
@@ -96,8 +96,17 @@ class SlotTile(QWidget):
         self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.play_btn.clicked.connect(lambda: self.play.emit(self.index))
         self.delete_btn = QPushButton("Delete")
+        # Quieter than "Play from here": the destructive action should not
+        # carry the same weight as the main one (it still asks to confirm).
+        self.delete_btn.setObjectName("Ghost")
         self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_btn.clicked.connect(lambda: self.delete.emit(self.index))
+        # An empty slot shows no actions, but keeps their room so every tile
+        # in a row lines up.
+        for button in (self.play_btn, self.delete_btn):
+            policy = button.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            button.setSizePolicy(policy)
         buttons.addWidget(self.play_btn)
         buttons.addWidget(self.delete_btn)
         buttons.addStretch(1)
@@ -117,6 +126,8 @@ class SlotTile(QWidget):
             self.thumb.setText("No preview" if slot.exists else "Empty")
         self.play_btn.setEnabled(slot.exists and can_play)
         self.delete_btn.setEnabled(slot.exists and can_delete)
+        self.play_btn.setVisible(slot.exists)
+        self.delete_btn.setVisible(slot.exists)
         self.play_btn.setToolTip(
             "Starts the game and loads this save state." if slot.exists else "")
 

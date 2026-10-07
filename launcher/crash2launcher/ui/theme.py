@@ -17,12 +17,22 @@ Deliberately NOT styled here: `QCheckBox::indicator` and
 `QComboBox::down-arrow`. Styling either one makes Qt stop drawing the native
 glyph and draw only what the rule says - which is how the old theme ended up
 with a checkbox that had no checkmark and a blank 20px drop-down zone. Fusion
-draws both correctly from the palette, using ACCENT as Highlight.
+draws both correctly from the palette, using ACCENT as Highlight. What Fusion
+does NOT give a dark theme is a visible edge: it outlines the box in the window
+colour darkened, which on these surfaces is ~1.2:1. `_Style` keeps Fusion's
+drawing and adds a CONTROL_EDGE outline on top (see `_Style.drawPrimitive`).
+
+The universal `QWidget` rule sets text and font only, never a background: a
+background there paints every label and row container in BG over the raised
+cards and sidebar, which drew a darker band behind each row. Surfaces that
+need a fill name it - the window, dialogs, the sidebar, cards, inputs.
 """
 
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QPainter, QPalette, QPen
+from PySide6.QtWidgets import QProxyStyle, QStyle
 
 # --- palette --------------------------------------------------------------
 BG            = "#0f1114"   # window
@@ -33,8 +43,9 @@ BORDER        = "#262b33"   # hairline, the default
 BORDER_STRONG = "#333a44"   # only where a card must separate from a card
 
 TEXT          = "#e8eaee"
-TEXT_DIM      = "#8d95a3"
-TEXT_FAINT    = "#5c6472"   # disabled text
+TEXT_DIM      = "#8d95a3"   # hints, captions, placeholders: 5.8:1 on a card
+TEXT_FAINT    = "#5c6472"   # disabled text only - under 4.5:1 on purpose
+CONTROL_EDGE  = "#7a8290"   # checkbox/radio outline: >= 3:1 on BG and BG_RAISED
 
 ACCENT        = "#f07e1e"   # Crash orange
 ACCENT_HOVER  = "#ff9236"
@@ -67,12 +78,56 @@ RADIUS_SM, RADIUS_MD, RADIUS_LG = 6, 10, 14
 PAGE_MARGINS = (SPACE_6, SPACE_5, SPACE_6, SPACE_5)   # was (28, 24, 28, 24)
 CARD_MARGINS = (SPACE_4 + 2, SPACE_4, SPACE_4 + 2, SPACE_4)
 LABEL_COL = 180          # the settings row label column
+NUMBER_W = 160           # a number field: wide enough for "65535 ms", no more
 SIDEBAR_W = 208
 
 
+class _Style(QProxyStyle):
+    """Fusion, with a visible edge on check boxes and radio buttons.
+
+    Fusion's own indicator outline is the window colour darkened, so on this
+    dark theme an unchecked box was a #1d2127 square on a #16191e card - about
+    1.2:1, where a control's boundary needs 3:1. Fusion still draws the box and
+    its tick; this only strokes an outline on top, so nothing is restyled away
+    (see the module docstring on why ``::indicator`` stays unstyled).
+    """
+
+    _MARKS = (QStyle.PrimitiveElement.PE_IndicatorCheckBox,
+              QStyle.PrimitiveElement.PE_IndicatorRadioButton,
+              QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck)
+
+    def drawPrimitive(self, element, option, painter, widget=None):  # noqa: N802
+        super().drawPrimitive(element, option, painter, widget)
+        if element not in self._MARKS:
+            return
+        state = option.state
+        if not state & QStyle.StateFlag.State_Enabled:
+            edge = TEXT_FAINT
+        elif state & (QStyle.StateFlag.State_On | QStyle.StateFlag.State_NoChange):
+            edge = ACCENT
+        else:
+            edge = CONTROL_EDGE
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(edge), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        r = QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5)
+        if element == QStyle.PrimitiveElement.PE_IndicatorRadioButton:
+            painter.drawEllipse(r)
+        else:
+            painter.drawRoundedRect(r, 2, 2)
+        painter.restore()
+
+
+_STYLE: _Style | None = None   # kept alive: QApplication does not own a Python ref
+
+
 def apply_theme(app) -> None:
-    """Install Fusion + the dark palette, then the stylesheet."""
-    app.setStyle("Fusion")
+    """Install Fusion (with visible check-box edges) + the dark palette, then
+    the stylesheet."""
+    global _STYLE
+    _STYLE = _Style("Fusion")
+    app.setStyle(_STYLE)
 
     c = QColor
     p = QPalette()
@@ -86,7 +141,7 @@ def apply_theme(app) -> None:
     p.setColor(QPalette.ColorRole.BrightText, c(ERROR))
     p.setColor(QPalette.ColorRole.ToolTipBase, c(BG_INPUT))
     p.setColor(QPalette.ColorRole.ToolTipText, c(TEXT))
-    p.setColor(QPalette.ColorRole.PlaceholderText, c(TEXT_FAINT))
+    p.setColor(QPalette.ColorRole.PlaceholderText, c(TEXT_DIM))
     p.setColor(QPalette.ColorRole.Link, c(ACCENT))
     # Highlight drives the checkbox tick, combo selection and focus ring.
     p.setColor(QPalette.ColorRole.Highlight, c(ACCENT))
@@ -104,11 +159,12 @@ def apply_theme(app) -> None:
 
 QSS = f"""
 QWidget {{
-    background: {BG};
     color: {TEXT};
     font-family: "Segoe UI", "Inter", system-ui, sans-serif;
     font-size: 13px;
 }}
+/* The only fills at the top level: everything else shows what it sits on. */
+QWidget#MainWindow, QDialog, QMessageBox {{ background: {BG}; }}
 QScrollArea, QStackedWidget {{ background: transparent; border: none; }}
 
 /* ---- sidebar ---------------------------------------------------------- */
@@ -124,14 +180,14 @@ QScrollArea, QStackedWidget {{ background: transparent; border: none; }}
     padding: {SPACE_5}px {SPACE_4}px 0 {SPACE_4}px;
 }}
 #SidebarSubtitle {{
-    color: {TEXT_FAINT};
+    color: {TEXT_DIM};
     font-size: 11px;
     padding: 2px {SPACE_4}px {SPACE_5}px {SPACE_4}px;
 }}
 /* Group captions in the nav rail - the structural change that lets one rail
    carry what used to need two. */
 #NavGroup {{
-    color: {TEXT_FAINT};
+    color: {TEXT_DIM};
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 1.2px;
@@ -197,8 +253,9 @@ QPushButton#Primary {{
     font-weight: 700;
 }}
 QPushButton#Primary:hover    {{ background: {ACCENT_HOVER}; border-color: {ACCENT_HOVER}; }}
+/* Neutral when unavailable: the muted brown-orange read as broken, not off. */
 QPushButton#Primary:disabled {{
-    background: {ACCENT_MUTED}; border-color: {ACCENT_MUTED}; color: {TEXT_FAINT};
+    background: {BG_INPUT}; border-color: {BORDER}; color: {TEXT_FAINT};
 }}
 
 QPushButton#PlayButton {{
@@ -313,9 +370,9 @@ QToolTip {{
     color: #dce8f5; font-size: 12px; padding: 6px 10px;
 }}
 #PlayScene QPushButton#PlaySecondary:hover {{
-    background: #173149; border-color: {PLAY_GOLD}; color: white;
+    background: #173149; border-color: {ACCENT}; color: white;
 }}
-#PlayScene QPushButton#PlaySecondary:focus {{ border-color: {PLAY_GOLD}; }}
+#PlayScene QPushButton#PlaySecondary:focus {{ border-color: {ACCENT}; }}
 #PlayScene QFrame#PlayStatusPanel {{
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 #142c43, stop:0.12 {PLAY_PANEL}, stop:1 #071422);
@@ -326,13 +383,6 @@ QToolTip {{
 #PlayScene #PlayMetaValue {{ color: #eff5ff; font-size: 13px; font-weight: 600; }}
 #PlayScene QLabel[playHeading="true"] {{ font-size: 21px; font-weight: 700; }}
 #PlayScene QLabel#Ok {{ color: {PLAY_GREEN}; }}
-#PlayScene QProgressBar#PlayReadyBar {{
-    background: #14304a; border: 1px solid #315777; border-radius: 4px;
-}}
-#PlayScene QProgressBar#PlayReadyBar::chunk {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 #21bc75, stop:1 {PLAY_GREEN}); border-radius: 3px;
-}}
 #PlayScene #PlayFooter {{ color: #8da4bb; font-size: 10px; letter-spacing: 0.3px; }}
 #PlayScene QFrame#Card[tone="warn"] {{ background: #2a2518; border-color: {WARN}; }}
 #PlayScene #PlaySubtitle[compact="true"] {{ font-size: 10px; padding: 0 3px; }}

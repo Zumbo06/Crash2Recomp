@@ -17,7 +17,9 @@ both of which already exist and are tested.
 
 from __future__ import annotations
 
+import html
 import shutil
+import tomllib
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -284,6 +286,9 @@ class SetupPage(QWidget):
         self.build_bar.setVisible(False)
         self.build_log = LogConsole()
         self.build_log.setMinimumHeight(170)
+        # Shown once a build starts: an empty black box under a finished build
+        # read as something missing.
+        self.build_log.setVisible(False)
 
         self.build_note = QLabel()
         self.build_note.setWordWrap(True)
@@ -327,6 +332,7 @@ class SetupPage(QWidget):
             return
 
         self.steps.set_state("generate", ACTIVE)
+        self.build_log.setVisible(True)
         self.build_bar.setVisible(True)
         self.build_bar.setRange(0, 0)      # indeterminate until progress arrives
         self.build_btn.setEnabled(False)
@@ -595,6 +601,15 @@ class SetupPage(QWidget):
         self._stop_thread()
 
     # -- state -------------------------------------------------------------
+    def _built_disc_name(self) -> str:
+        """The disc image the current build came from, per its game.toml."""
+        try:
+            with self.layout_.game_toml.open("rb") as fh:
+                disc_path = tomllib.load(fh).get("game", {}).get("disc", "")
+        except (OSError, tomllib.TOMLDecodeError):
+            return ""
+        return Path(disc_path).name if isinstance(disc_path, str) and disc_path else ""
+
     def _refresh(self) -> None:
         have_disc = self._disc_ok
         self.build_btn.setEnabled(have_disc and not (self._job and self._job.running))
@@ -606,5 +621,14 @@ class SetupPage(QWidget):
             self.build_note.setText(
                 '<span style="color:%s">Already built - the Play page is '
                 "ready. Rebuild only if you change discs.</span>" % TEXT_DIM)
+            # A build the launcher did not make (or one from before it kept the
+            # path) has no disc here, and "No disc selected" under a finished
+            # build read as an error. The project records which disc it was.
+            if not self._disc_ok and not self.settings.disc_path:
+                name = self._built_disc_name()
+                if name:
+                    self.summary.setText(
+                        "Built from <b>%s</b>. Choose a disc only to rebuild."
+                        % html.escape(name))
         elif have_disc:
             self.steps.set_state("verify", DONE)

@@ -17,7 +17,25 @@ from .theme import PLAY_BG, PLAY_GOLD, PLAY_ORANGE, PLAY_EDGE
 
 REFERENCE_WIDTH = 1672
 SCENE_BOTTOM = 941
+FOOTER_TOP = 894          # reference y where the concept's own footer begins
+FOOTER_STRIP = 40         # window pixels kept below the art for the page footer
+# The concept's mock status box (version, "Game files verified", a progress
+# bar), border included. The live panel covers it at most sizes; masked so no
+# fragment of fake UI shows where the panel is narrower than the art.
+MOCK_STATUS = QRectF(528, 736, 880, 160)
 BUTTON_SOURCE = QRectF(84, 373, 458, 115)
+
+
+def scene_scale(width: int, height: int) -> float:
+    """Reference-art scale for a ``width`` x ``height`` scene.
+
+    The art fills the width, or the height above the footer strip when that
+    needs more - anchored top-left, so a tall or narrow window crops the
+    right-hand side of the picture instead of leaving an empty band under it.
+    The Play page positions its native controls with the same number.
+    """
+    return max(width / REFERENCE_WIDTH,
+               (height - FOOTER_STRIP) / FOOTER_TOP)
 
 
 class StatusPanel(QFrame):
@@ -84,17 +102,20 @@ class PlayScene(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.fillRect(self.rect(), QColor(PLAY_BG))
-        scale = self.width() / REFERENCE_WIDTH
+        scale = scene_scale(self.width(), self.height())
         art_height = SCENE_BOTTOM * scale
         if not self.artwork.isNull():
-            p.drawPixmap(QRectF(0, 0, self.width(), art_height), self.artwork,
+            p.drawPixmap(QRectF(0, 0, REFERENCE_WIDTH * scale, art_height), self.artwork,
                          QRectF(0, 0, REFERENCE_WIDTH, SCENE_BOTTOM))
+            p.fillRect(QRectF(MOCK_STATUS.x() * scale, MOCK_STATUS.y() * scale,
+                              MOCK_STATUS.width() * scale, MOCK_STATUS.height() * scale),
+                       QColor(PLAY_BG))
         else:
             self._paint_fallback(p, scale)
 
         # Remove the concept's footer. The live panel covers its mock values;
         # both use the same reference coordinates (see PlayPage).
-        footer_y = 894 * scale
+        footer_y = FOOTER_TOP * scale
         p.fillRect(QRectF(0, footer_y, self.width(), self.height()), QColor(PLAY_BG))
         fade = QLinearGradient(0, 885 * scale, 0, footer_y)
         clear = QColor(PLAY_BG)

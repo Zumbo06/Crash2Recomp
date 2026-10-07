@@ -32,11 +32,20 @@ itself. That is fine and takes precedence: we would then be copying the same
 manifests it already installed. The clear is scoped to ``mods/packages`` and
 deliberately spares ``state.toml``, which is user state.
 
-These manifests are framework-owned content, copied verbatim. When the vendored
-framework updates, re-copy them rather than hand-editing:
+These manifests are framework content with ONE local change: the player-facing
+``description`` strings and three option ``label`` strings are the launcher's
+own plain-language wording (the framework's were written for emulator
+developers - "host pacing", "the guest cannot desync"). Ids, names, options,
+ranges, defaults and versions are the framework's, unchanged; package names
+must stay, since the runtime quotes one in a message. When the vendored
+framework updates, re-copy the manifests and carry the wording over:
 
     cp -r _build/psxrecomp-src/mods/builtin/packages/. \\
           launcher/crash2launcher/moddata/builtin/packages/
+
+A same-version package already staged by an older launcher is refreshed when
+its manifest differs (``_stale_copy``), so new wording reaches existing
+installs; anything a player installed in a different version is left alone.
 """
 
 from __future__ import annotations
@@ -72,6 +81,28 @@ def available() -> bool:
     return source_dir().is_dir()
 
 
+def _stale_copy(src_pkg: Path, dst_pkg: Path) -> bool:
+    """True when ``dst_pkg`` is an older staging of the SAME version we ship.
+
+    Only that case is refreshed: the version directories match and a manifest
+    differs (this launcher reworded it, say). A version we do not ship - one
+    a player installed over ours - is theirs and is kept, as is a package
+    whose versions simply match byte for byte.
+    """
+    ours = {p.name for p in src_pkg.iterdir() if p.is_dir()}
+    theirs = {p.name for p in dst_pkg.iterdir() if p.is_dir()} if dst_pkg.is_dir() else set()
+    if not ours or theirs != ours:
+        return False
+    for version in ours:
+        a, b = src_pkg / version / "manifest.toml", dst_pkg / version / "manifest.toml"
+        try:
+            if a.read_bytes() != b.read_bytes():
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def stage_builtin(layout, *, force: bool = False) -> tuple[int, str]:
     """Copy the builtin catalog into ``<exe_dir>/mods/packages``.
 
@@ -81,7 +112,8 @@ def stage_builtin(layout, *, force: bool = False) -> tuple[int, str]:
 
     Existing package directories are left alone unless ``force`` - a player may
     have installed a newer version of a framework package, and overwriting it
-    on every launch would undo that silently.
+    on every launch would undo that silently. The one exception is a stale
+    copy of the very version we ship (see ``_stale_copy``).
     """
     # Never stage before a build exists. `mods` lives inside the build output
     # directory, and in a player bundle `psxrecomp.exe build` refuses a
@@ -107,7 +139,7 @@ def stage_builtin(layout, *, force: bool = False) -> tuple[int, str]:
             failed.append(f"{package_id} (missing from launcher data)")
             continue
         dst_pkg = dst / package_id
-        if dst_pkg.exists() and not force:
+        if dst_pkg.exists() and not force and not _stale_copy(src_pkg, dst_pkg):
             skipped.append(package_id)
             continue
         try:

@@ -216,7 +216,9 @@ class ModsPage(QWidget):
             widget = self._option_widget(package, feature, option)
             if widget is None:
                 continue
-            labelled = row(option.label, widget)
+            # A check box carries its own label, box first, as every other
+            # check box in the launcher does - not a label with a box after it.
+            labelled = widget if isinstance(widget, QCheckBox) else row(option.label, widget)
             rows.append(labelled)
             dependents.append(labelled)
             if option.description:
@@ -242,7 +244,7 @@ class ModsPage(QWidget):
         current = self.state.value_of(package, feature, option)
 
         if option.type == mods.BOOLEAN:
-            box = QCheckBox()
+            box = QCheckBox(option.label)
             box.setChecked(current == "true")
             box.toggled.connect(
                 lambda on, p=package, f=feature, o=option:

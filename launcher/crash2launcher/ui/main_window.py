@@ -89,6 +89,9 @@ class MainWindow(QWidget):
         super().__init__()
         self.layout_ = layout_
         self.settings = settings
+        # theme.QSS fills the window by this name; nothing below it paints a
+        # background unless it is a surface (sidebar, card, input).
+        self.setObjectName("MainWindow")
 
         self.setWindowTitle("Crash Bandicoot 2 Recompiled  -  %s" % full_version())
         self.resize(1440, 740)

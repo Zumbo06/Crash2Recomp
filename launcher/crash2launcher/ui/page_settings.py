@@ -12,7 +12,8 @@ from a quality option.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -24,6 +25,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -48,7 +51,7 @@ from ..config import (
     matching_preset,
     native_120fps_active,
 )
-from .common import card, dim, heading, row, section, warn
+from .common import FlowLayout, card, dim, heading, row, section, warn
 from .theme import ACCENT, PAGE_MARGINS, SPACE_4, TEXT_DIM
 from .widgets.key_bindings import HotkeyEditor, KeyBindingsEditor
 from .widgets.pad_bindings import PadBindingsEditor
@@ -252,6 +255,49 @@ def _postfx_label(name: str, value: int) -> str:
     return "%d%%" % value
 
 
+class NeutralSlider(QSlider):
+    """A horizontal slider that marks its neutral value and returns to it on a
+    double-click.
+
+    The post-processing ranges are not symmetric (gamma runs 50-200 around
+    100), so "100%" sat a third of the way along one slider and in the middle
+    of the next. The tick says where "unchanged" is on each.
+    """
+
+    def __init__(self, neutral: int, parent: QWidget | None = None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.neutral = neutral
+        self.setMinimumHeight(24)
+        self.setToolTip("Double-click to reset")
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        self.setValue(self.neutral)
+        event.accept()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        groove = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderGroove, self)
+        handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderHandle, self)
+        span = groove.width() - handle.width()
+        if span <= 0:
+            return
+        x = (groove.x() + handle.width() / 2
+             + QStyle.sliderPositionFromValue(self.minimum(), self.maximum(),
+                                              self.neutral, span))
+        cy = groove.center().y() + 0.5
+        p = QPainter(self)
+        p.setPen(QPen(QColor(TEXT_DIM), 2))
+        # Above and below the groove, clear of the 14 px handle.
+        p.drawLine(QPointF(x, cy - 11), QPointF(x, cy - 8))
+        p.drawLine(QPointF(x, cy + 8), QPointF(x, cy + 11))
+        p.end()
+
+
 class SettingsPage(QWidget):
     changed = Signal()
 
@@ -272,21 +318,29 @@ class SettingsPage(QWidget):
 
         self.title = heading("Video", SECTION_HINTS["Video"])
         root.addWidget(self.title)
-        root.addWidget(self._preset_bar())
 
         # One stack entry per sidebar section. Video stacks the old Display and
         # Image builders; the builders themselves are untouched, so every
         # control keeps the attribute name the coverage test looks for.
+        #
+        # The presets are video presets, so they live at the top of the Video
+        # section only - and inside its scroll area, under the same scroll bar
+        # as everything else on the page. They used to sit above the stack and
+        # showed on Audio and Cheats too.
+        presets = self._preset_bar()
         self.stack = QStackedWidget()
         for builders in ((self._display_page, self._image_page),
                          (self._audio_page,),
                          (self._input_page,),
                          (self._performance_page,),
                          (self._cheats_page,)):
+            pages = [b() for b in builders]
+            if builders[0] == self._display_page:
+                pages.insert(0, presets)
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            scroll.setWidget(self._merge(*[b() for b in builders]))
+            scroll.setWidget(self._merge(*pages))
             self.stack.addWidget(scroll)
         root.addWidget(self.stack, 1)
 
@@ -297,10 +351,10 @@ class SettingsPage(QWidget):
 
     # -- chrome ------------------------------------------------------------
     def _preset_bar(self) -> QWidget:
+        # Wraps rather than squeezing: at the minimum window width a row of
+        # five clipped every label ("uthenti", "nhance").
         buttons = QWidget()
-        lay = QHBoxLayout(buttons)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay = FlowLayout(buttons)
 
         self.preset_buttons: dict[str, QPushButton] = {}
         for name in PRESETS:
@@ -312,7 +366,9 @@ class SettingsPage(QWidget):
 
         self.preset_lbl = QLabel()
         self.preset_lbl.setTextFormat(Qt.TextFormat.RichText)
-        lay.addWidget(self.preset_lbl, 1)
+        self.preset_lbl.setMinimumHeight(
+            next(iter(self.preset_buttons.values())).sizeHint().height())
+        lay.addWidget(self.preset_lbl)
 
         return card(
             section("Preset"),
@@ -421,7 +477,9 @@ class SettingsPage(QWidget):
             card(
                 section("Output"),
                 row("Renderer", self.renderer),
-                row("Fullscreen", self.fullscreen),
+                # "Window mode" - the Home menu's name for the same choice, and
+                # what the values are (a row called Fullscreen read "Windowed").
+                row("Window mode", self.fullscreen),
                 row("Output resolution", self.output_resolution),
                 row("Screen shape", self.output_aspect),
                 row("Image fit", self.scaling),
@@ -485,9 +543,9 @@ class SettingsPage(QWidget):
                 section("Framing"),
                 row("Zoom", self.present_zoom),
                 row("Stretch", self.present_stretch),
-                row("Vertical pan", self.present_pan),
                 dim("Zoom crops top and bottom; Stretch widens the picture. "
                     "Mix them to fill the screen."),
+                row("Vertical pan", self.present_pan),
                 dim("Moves the picture up or down while Zoom is cropping."),
                 row("Overscan crop", self.overscan),
                 dim("Crops the unused black lines many PS1 games leave. Keep "
@@ -630,7 +688,7 @@ class SettingsPage(QWidget):
             card(
                 section("Assists"),
                 self.cheat_infinite_lives,
-                row("Damage", self.cheat_aku_aku),
+                row("Aku Aku", self.cheat_aku_aku),
                 dim("\"Keep 2 masks\" always absorbs a hit. \"No damage\" "
                     "keeps Crash invincible, like the gold Aku Aku mask."),
                 dim("Neither stops falls, crushing or drowning. Both pause "
@@ -770,8 +828,8 @@ class SettingsPage(QWidget):
         )
 
     def _postfx_slider(self, name: str) -> QWidget:
-        low, high, _neutral = POSTFX_RANGES[name]
-        slider = QSlider(Qt.Orientation.Horizontal)
+        low, high, neutral = POSTFX_RANGES[name]
+        slider = NeutralSlider(neutral)
         slider.setRange(low, high)
         slider.setValue(int(getattr(self.settings, name)))
         value = QLabel()

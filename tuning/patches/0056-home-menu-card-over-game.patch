@@ -1,0 +1,718 @@
+Home menu: a centred card over the dimmed game, grouped, in the launcher's words.
+
+From the design critique. The menu was a 640x480 sheet stretched over the
+whole window: opaque, so the display settings it changes could not be judged,
+and stretched, so the 8x8 font went wide and uneven on a 16:9 or 21:9 window.
+Twelve rows had no grouping, names differed from the launcher's for the same
+settings, Image fit cycled in a different order, and the armed "press again"
+state of Restart/Quit reddened both rows.
+
+psx_pause_menu.c/.h:
+- a 420x480 portrait card. Rows in four captioned groups - GAME (Resume,
+  Quick save, Quick load), DISPLAY (Gameplay aspect, Image fit, Window mode,
+  FPS counter, Post-processing), ASSISTS (Keep 99 lives, Aku Aku), SYSTEM
+  (Restart, Quit) - from one row table that drawing and psx_pause_menu_row_at
+  share; captions and gaps hit nothing;
+- names as in the launcher (GAMEPLAY ASPECT, FPS COUNTER, POST-PROCESSING,
+  KEEP 99 LIVES, AKU AKU: OFF / KEEP 2 MASKS / NO DAMAGE); "< value >" arrows
+  hug the value; armed red shows on the selected row only;
+- a one- or two-line note under the list for the selected row. Gameplay
+  aspect and Image fit say they apply when you resume: the held frame behind
+  the menu is a capture with the old framing baked in;
+- Crash orange (#F07E1E) is the one accent, as in the launcher (5.3:1 on the
+  selected row); every text colour is >= 4.5:1 on its background;
+- psx_pause_menu_place(): centred on the presenter's surface, at a whole 2x,
+  3x... when that fits with a 16 px margin, so glyphs stay square; fitted at
+  0.96 of the surface below 2x. PSX_PAUSE_BACKDROP_KEEP (96/255) is how much
+  of the frame shows behind it.
+
+gpu_gl_renderer.c (GL and D3D12): gl_dim_frame() multiplies the default
+framebuffer by a 1x1 grey through the present program (blend ZERO,SRC_COLOR;
+alpha ZERO,ONE), then the panel is drawn at its placed rect. Every hold
+capture is taken before gl_swap_with_osd(), so the pause loop's re-presents
+never compound the dim. host_osd.c (SDL renderer): a black fill at
+255-KEEP alpha, then the panel at its rect on the logical size.
+
+main.cpp: Image fit steps letterbox, fill, fit width, stretch (the
+launcher's order); the mode values are unchanged. The mouse is mapped into
+the presenter's surface (drawable pixels for GL/D3D12, logical coordinates
+for the SDL renderer) and through psx_pause_menu_place().
+
+No file here is in codegen_hash_sources.cmake: no recompile, no cache rebuild.
+
+--- a/runtime/src/psx_pause_menu.c
++++ b/runtime/src/psx_pause_menu.c
+@@ -1,10 +1,14 @@
+-/* psx_pause_menu.c - full-screen Home-key pause menu.
++/* psx_pause_menu.c - the Home-key pause menu.
+  *
+  * Deliberately shaped like psx_savestate_menu.c: a dumb rasterizer that
+  * main.cpp pushes state into. Drawing primitives are duplicated rather than
+  * shared because that is what the other overlay modules do (host_osd.c and
+  * psx_savestate_menu.c each carry their own font and helpers), and each one
+  * hardcodes its own panel stride.
++ *
++ * The panel is a portrait card, not a full screen: the presenters dim the
++ * held game frame and draw it centred at psx_pause_menu_place(), so a change
++ * to Image fit, Window mode or Post-processing shows behind it as it is made.
+  */
+ 
+ #include "psx_pause_menu.h"
+@@ -15,14 +19,32 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-#define PM_W 640
++#define PM_W 420
+ #define PM_H 480
+-#define PM_ROWS_Y 56
+-#define PM_ROW_H 26
+-#define PM_ROW_GAP 2
+-#define PM_ROWS_X 40
+-#define PM_ROWS_W 560
+-#define PM_VALUE_X 340
++#define PM_MARGIN 16            /* surface pixels kept clear around the panel */
++#define PM_HEAD_H 40
++#define PM_TOP 46               /* first group caption */
++#define PM_CAPTION_H 12
++#define PM_ROW_H 20
++#define PM_ROW_PITCH 22
++#define PM_GROUP_GAP 4
++#define PM_ROWS_X 16
++#define PM_ROWS_W 388
++#define PM_TEXT_X 28
++#define PM_VALUE_R 378          /* values right-aligned here, ">" after */
++#define PM_NOTE_Y 378
++#define PM_NOTE_CHARS 47
++#define PM_FOOT_Y 410
++
++/* Crash orange is the one accent, as in the launcher. On the selected row's
++ * background it is 5.3:1. */
++#define PM_BG      0xFF0F1118u
++#define PM_BAND    0xFF171B25u
++#define PM_EDGE    0xFF303746u
++#define PM_ACCENT  0xFFF07E1Eu
++#define PM_DANGER  0xFFFF8080u
++#define PM_SOFT    0xFFB8BDC8u
++#define PM_DIM     0xFF8D95A3u
+ 
+ /* Public-domain 8x8 ASCII 32..90 subset from font8x8_basic, same table the
+  * savestate menu uses. Uppercase only; draw_char upcases and maps the rest
+@@ -74,26 +96,88 @@
+ static int s_dirty = 1;
+ static uint32_t s_panel[PM_W * PM_H];
+ 
++/* Names match the launcher's for the same settings (Window mode, Gameplay
++ * aspect, Keep 99 lives, Aku Aku...), so a player meets one vocabulary. */
+ static const char *const ROW_LABEL[PSX_PAUSE_ROW_COUNT] = {
+     "RESUME", "QUICK SAVE", "QUICK LOAD",
+-    "GAME ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS DISPLAY", "POST FX",
+-    "99 LIVES", "AKU AKU", "RESTART GAME", "QUIT GAME",
++    "GAMEPLAY ASPECT", "IMAGE FIT", "WINDOW MODE", "FPS COUNTER",
++    "POST-PROCESSING",
++    "KEEP 99 LIVES", "AKU AKU", "RESTART GAME", "QUIT GAME",
+ };
+ static const char *const ASPECT_LABEL[PSX_PAUSE_ASPECT_COUNT] = {
+     "4:3", "14:9", "16:9", "21:9",
+ };
++/* Indexed by fit MODE (the value the renderer takes). main.cpp cycles them in
++ * the launcher's order - letterbox, fill, fit width, stretch. */
+ static const char *const FIT_LABEL[PSX_PAUSE_FIT_COUNT] = {
+     "LETTERBOX", "STRETCH", "FILL", "FIT WIDTH",
+ };
++/* The held frame behind the menu is a capture with the old fit baked in, so
++ * a new fit cannot be shown until the game runs again. Say so. */
++static const char *const FIT_NOTE[PSX_PAUSE_FIT_COUNT] = {
++    "KEEPS THE SHAPE, WITH BARS. APPLIES WHEN YOU RESUME.",
++    "FILLS THE WINDOW EXACTLY AND DISTORTS. APPLIES WHEN YOU RESUME.",
++    "KEEPS THE SHAPE AND CROPS THE EDGES. APPLIES WHEN YOU RESUME.",
++    "NO SIDE BARS; TOP AND BOTTOM MAY CROP. APPLIES WHEN YOU RESUME.",
++};
+ static const char *const WINDOW_LABEL[PSX_PAUSE_WINDOW_COUNT] = {
+     "WINDOWED", "BORDERLESS", "EXCLUSIVE",
+ };
+-/* Index is the C2_AKU_* level. "KEEP 2" always leaves a mask to absorb a hit;
+- * "NO DAMAGE" holds the game's own temporary invincibility so it never lapses.
+- * Neither stops pits, crushing or drowning. */
++/* Index is the C2_AKU_* level. "KEEP 2 MASKS" always leaves a mask to absorb
++ * a hit; "NO DAMAGE" holds the game's own temporary invincibility so it never
++ * lapses. Neither stops pits, crushing or drowning. */
+ static const char *const AKU_LABEL[PSX_PAUSE_AKU_COUNT] = {
+-    "OFF", "KEEP 2", "NO DAMAGE",
+-};
++    "OFF", "KEEP 2 MASKS", "NO DAMAGE",
++};
++/* One or two lines under the list about the selected row. FIT and POST FX
++ * depend on the value and are filled in by row_note(). */
++static const char *const ROW_NOTE[PSX_PAUSE_ROW_COUNT] = {
++    "BACK TO THE GAME.",
++    "SAVES THIS MOMENT TO THE QUICK SAVE SLOT.",
++    "LOADS THE QUICK SAVE SLOT.",
++    "HOW WIDE THE GAME DRAWS ITS VIEW. APPLIES WHEN YOU RESUME.",
++    NULL,
++    "WINDOWED, BORDERLESS FULL SCREEN OR EXCLUSIVE FULL SCREEN.",
++    "SHOWS THE FRAME RATE IN A CORNER OF THE SCREEN.",
++    NULL,
++    "LIVES STAY AT 99. THE COUNT IS SAVED TO YOUR MEMORY CARD.",
++    "KEEP 2 MASKS ALWAYS ABSORBS A HIT. NO DAMAGE KEEPS CRASH INVINCIBLE.",
++    "BOOTS THE GAME AGAIN. PROGRESS SINCE YOUR LAST SAVE IS LOST.",
++    "CLOSES THE GAME. PROGRESS SINCE YOUR LAST SAVE IS LOST.",
++};
++
++/* The list in four groups, each under a caption. */
++static const struct {
++    const char *caption;
++    int first, count;
++} GROUPS[] = {
++    { "GAME",    PSX_PAUSE_ROW_RESUME,  3 },
++    { "DISPLAY", PSX_PAUSE_ROW_ASPECT,  5 },
++    { "ASSISTS", PSX_PAUSE_ROW_LIVES,   2 },
++    { "SYSTEM",  PSX_PAUSE_ROW_RESTART, 2 },
++};
++#define PM_GROUPS ((int)(sizeof(GROUPS) / sizeof(GROUPS[0])))
++
++/* Row and caption tops, from one walk shared by drawing and hit-testing. */
++static int s_row_y[PSX_PAUSE_ROW_COUNT];
++static int s_caption_y[PM_GROUPS];
++
++static void layout_rows(void)
++{
++    static int done;
++    int g, r, y = PM_TOP;
++    if (done) return;
++    for (g = 0; g < PM_GROUPS; g++) {
++        s_caption_y[g] = y;
++        y += PM_CAPTION_H;
++        for (r = 0; r < GROUPS[g].count; r++) {
++            s_row_y[GROUPS[g].first + r] = y;
++            y += PM_ROW_PITCH;
++        }
++        y += PM_GROUP_GAP;
++    }
++    done = 1;
++}
+ 
+ int psx_pause_menu_row_is_option(int row)
+ {
+@@ -108,16 +192,45 @@
+ 
+ int psx_pause_menu_row_at(int px, int py)
+ {
++    int i;
++    layout_rows();
+     if (px < PM_ROWS_X || px >= PM_ROWS_X + PM_ROWS_W) return -1;
+-    int rel = py - PM_ROWS_Y;
+-    if (rel < 0) return -1;
+-    int pitch = PM_ROW_H + PM_ROW_GAP;
+-    int row = rel / pitch;
+-    /* Reject the gap between rows, so dragging down the list cannot land the
+-     * cursor on a row the pointer is not actually over. */
+-    if (rel - row * pitch >= PM_ROW_H) return -1;
+-    if (row < 0 || row >= PSX_PAUSE_ROW_COUNT) return -1;
+-    return row;
++    /* Captions and the gaps between rows hit nothing, so dragging down the
++     * list cannot land the cursor on a row the pointer is not over. */
++    for (i = 0; i < PSX_PAUSE_ROW_COUNT; i++)
++        if (py >= s_row_y[i] && py < s_row_y[i] + PM_ROW_H)
++            return i;
++    return -1;
++}
++
++void psx_pause_menu_place(int surf_w, int surf_h, int *x, int *y, int *w, int *h)
++{
++    double fit;
++    int pw, ph;
++    if (surf_w <= 0 || surf_h <= 0) {
++        if (x) *x = 0;
++        if (y) *y = 0;
++        if (w) *w = 0;
++        if (h) *h = 0;
++        return;
++    }
++    fit = (double)surf_w / PM_W;
++    if ((double)surf_h / PM_H < fit) fit = (double)surf_h / PM_H;
++    if (fit >= 2.0) {
++        /* Whole pixels: the 8x8 font stays square and every stroke even. */
++        int s = (int)fit;
++        if (s > 2 && s * PM_H > surf_h - 2 * PM_MARGIN) s--;
++        pw = s * PM_W;
++        ph = s * PM_H;
++    } else {
++        /* A small window cannot afford 2x: fit it, a little inside. */
++        pw = (int)(PM_W * fit * 0.96);
++        ph = (int)(PM_H * fit * 0.96);
++    }
++    if (x) *x = (surf_w - pw) / 2;
++    if (y) *y = (surf_h - ph) / 2;
++    if (w) *w = pw;
++    if (h) *h = ph;
+ }
+ 
+ static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
+@@ -186,15 +299,40 @@
+     }
+ }
+ 
+-/* Right-aligned, for the value column. */
++static int text_len(const char *s)
++{
++    int n = 0;
++    while (s && s[n]) n++;
++    return n;
++}
++
++/* Right-aligned at right_x. */
+ static void draw_text_r(uint32_t *dst, int right_x, int y, const char *s,
+                         uint32_t col, int scale)
+ {
+-    int len = 0;
+-    const char *p = s;
+     if (!s) return;
+-    while (*p++) len++;
+-    draw_text(dst, right_x - len * 8 * scale, y, s, col, scale);
++    draw_text(dst, right_x - text_len(s) * 8 * scale, y, s, col, scale);
++}
++
++/* Word-wrapped into at most two lines of PM_NOTE_CHARS. */
++static void draw_note(uint32_t *dst, int x, int y, const char *s, uint32_t col)
++{
++    char line[PM_NOTE_CHARS + 1];
++    int lines = 0;
++    while (s && *s && lines < 2) {
++        int n = text_len(s), cut = n;
++        if (n > PM_NOTE_CHARS) {
++            cut = PM_NOTE_CHARS;
++            while (cut > 0 && s[cut] != ' ') cut--;
++            if (cut == 0) cut = PM_NOTE_CHARS;
++        }
++        memcpy(line, s, (size_t)cut);
++        line[cut] = 0;
++        draw_text(dst, x, y + lines * 12, line, col, 1);
++        s += cut;
++        while (*s == ' ') s++;
++        lines++;
++    }
+ }
+ 
+ static void draw_psx_button(uint32_t *dst, int x, int y, char kind)
+@@ -216,6 +354,11 @@
+     }
+ }
+ 
++static int postfx_none(void)
++{
++    return !postfx_chain_wanted(postfx_settings()) && !postfx_settings()->dedither;
++}
++
+ static const char *value_for_row(int row, char *buf, size_t cap)
+ {
+     switch (row) {
+@@ -232,7 +375,7 @@
+     case PSX_PAUSE_ROW_POSTFX:
+         /* Live A/B of the launcher's post-processing; NONE when the launcher
+          * set no effect, so the row cannot look like it does something. */
+-        if (!postfx_chain_wanted(postfx_settings()) && !postfx_settings()->dedither)
++        if (postfx_none())
+             return "NONE";
+         return postfx_enabled() ? "ON" : "OFF";
+     case PSX_PAUSE_ROW_LIVES:
+@@ -242,7 +385,9 @@
+                          ? s_aku_level : 0];
+     case PSX_PAUSE_ROW_RESTART:
+     case PSX_PAUSE_ROW_QUIT:
+-        if (s_confirm_armed) {
++        /* Armed is a property of the selected row only: main.cpp disarms on
++         * any move, so the other one of the pair is never the armed one. */
++        if (s_confirm_armed && row == s_selected) {
+             snprintf(buf, cap, "PRESS AGAIN");
+             return buf;
+         }
+@@ -252,68 +397,83 @@
+     }
+ }
+ 
++static const char *row_note(int row)
++{
++    if (row == PSX_PAUSE_ROW_FIT)
++        return FIT_NOTE[(unsigned)s_fit < PSX_PAUSE_FIT_COUNT ? s_fit : 0];
++    if (row == PSX_PAUSE_ROW_POSTFX)
++        return postfx_none()
++            ? "NO EFFECTS ARE SET IN THE LAUNCHER'S POST-PROCESSING."
++            : "TURNS THE LAUNCHER'S PICTURE EFFECTS ON OR OFF.";
++    return (unsigned)row < PSX_PAUSE_ROW_COUNT ? ROW_NOTE[row] : NULL;
++}
++
+ static void rasterize_panel(void)
+ {
+-    int i;
++    int i, g;
+     char buf[64];
+     char key[32];
+ 
++    layout_rows();
+     for (i = 0; i < PM_W * PM_H; i++)
+-        s_panel[i] = 0xFF0F1118u;
+-
+-    fill_rect(s_panel, 0, 0, PM_W, 46, 0xFF171B25u);
+-    draw_text(s_panel, 24, 14, "PAUSED", 0xFFFFD24Du, 2);
++        s_panel[i] = PM_BG;
++    stroke_rect(s_panel, 0, 0, PM_W, PM_H, PM_EDGE);
++
++    /* Header: the title, and how to get back to the game. */
++    fill_rect(s_panel, 1, 1, PM_W - 2, PM_HEAD_H - 1, PM_BAND);
++    draw_text(s_panel, PM_ROWS_X + 2, 12, "PAUSED", PM_ACCENT, 2);
+     host_keymap_label(HOST_KEYMAP_PAUSE_MENU, key, sizeof(key));
+-    snprintf(buf, sizeof(buf), "%s MENU", key[0] ? key : "HOME");
+-    draw_text(s_panel, 432, 18, buf, 0xFFB8BDC8u, 1);
++    snprintf(buf, sizeof(buf), "%s: RESUME", key[0] ? key : "HOME");
++    draw_text_r(s_panel, PM_W - PM_ROWS_X - 2, 16, buf, PM_SOFT, 1);
++
++    for (g = 0; g < PM_GROUPS; g++)
++        draw_text(s_panel, PM_ROWS_X + 2, s_caption_y[g] + 2, GROUPS[g].caption,
++                  PM_DIM, 1);
+ 
+     for (i = 0; i < PSX_PAUSE_ROW_COUNT; i++) {
+-        int y = PM_ROWS_Y + i * (PM_ROW_H + PM_ROW_GAP);
++        int y = s_row_y[i];
+         int sel = (i == s_selected);
+         int opt = psx_pause_menu_row_is_option(i);
+-        uint32_t bg = sel ? 0xFF2B2830u : 0xFF191D27u;
+-        uint32_t fg = sel ? 0xFFFFD24Du : 0xFFE2E5EBu;
++        int armed = sel && s_confirm_armed
++            && (i == PSX_PAUSE_ROW_RESTART || i == PSX_PAUSE_ROW_QUIT);
++        uint32_t bg = armed ? 0xFF3A2028u : (sel ? 0xFF2B2830u : 0xFF191D27u);
++        uint32_t edge = armed ? PM_DANGER : (sel ? PM_ACCENT : 0xFF303746u);
++        uint32_t fg = armed ? PM_DANGER : (sel ? PM_ACCENT : 0xFFE2E5EBu);
+         uint32_t sub = sel ? 0xFFFFFFFFu : 0xFFB2B8C2u;
+         const char *val;
+ 
+-        /* Destructive actions stay red while armed so a second Enter is never
+-         * a surprise. */
+-        if ((i == PSX_PAUSE_ROW_RESTART || i == PSX_PAUSE_ROW_QUIT)
+-            && s_confirm_armed) {
+-            bg = sel ? 0xFF3A2028u : 0xFF2A1820u;
+-            fg = 0xFFFF8080u;
+-        }
+         fill_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H, bg);
+-        stroke_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H,
+-                    sel ? 0xFFFFD24Du : 0xFF303746u);
+-        draw_text(s_panel, PM_ROWS_X + 18, y + 9, ROW_LABEL[i], fg, 1);
++        stroke_rect(s_panel, PM_ROWS_X, y, PM_ROWS_W, PM_ROW_H, edge);
++        draw_text(s_panel, PM_TEXT_X, y + 6, ROW_LABEL[i], fg, 1);
+ 
+         buf[0] = 0;
+         val = value_for_row(i, buf, sizeof(buf));
+         if (val) {
++            /* The arrows hug the value they change: "< 16:9 >". */
+             if (opt && sel) {
+-                draw_text(s_panel, PM_VALUE_X - 4, y + 9, "<", 0xFFFFD24Du, 1);
+-                draw_text(s_panel, PM_ROWS_X + PM_ROWS_W - 26, y + 9, ">",
+-                          0xFFFFD24Du, 1);
++                draw_text(s_panel, PM_VALUE_R - text_len(val) * 8 - 14, y + 6,
++                          "<", PM_ACCENT, 1);
++                draw_text(s_panel, PM_VALUE_R + 6, y + 6, ">", PM_ACCENT, 1);
+             }
+-            draw_text_r(s_panel, PM_ROWS_X + PM_ROWS_W - 38, y + 9, val,
+-                        sub, 1);
++            draw_text_r(s_panel, PM_VALUE_R, y + 6, val, sub, 1);
+         }
+     }
+ 
+-    fill_rect(s_panel, 0, 400, PM_W, 80, 0xFF171B25u);
+-    draw_psx_button(s_panel, 32, 414, 'd');
+-    draw_text(s_panel, 56, 418, "MOVE", 0xFFE2E5EBu, 1);
+-    draw_psx_button(s_panel, 152, 414, 'x');
+-    draw_text(s_panel, 176, 418, "SELECT", 0xFFE2E5EBu, 1);
+-    draw_psx_button(s_panel, 288, 414, 'o');
+-    draw_text(s_panel, 312, 418, "CLOSE", 0xFFE2E5EBu, 1);
+-    draw_text(s_panel, 32, 442,
+-              "KEYS: ARROWS MOVE/CHANGE  ENTER SELECT  ESC CLOSE",
+-              0xFFB8BDC8u, 1);
+-    draw_text(s_panel, 32, 458,
++    /* What the selected row does. */
++    draw_note(s_panel, PM_ROWS_X + 2, PM_NOTE_Y, row_note(s_selected), PM_SOFT);
++
++    fill_rect(s_panel, 1, PM_FOOT_Y, PM_W - 2, PM_H - PM_FOOT_Y - 1, PM_BAND);
++    draw_psx_button(s_panel, PM_ROWS_X, PM_FOOT_Y + 8, 'd');
++    draw_text(s_panel, PM_ROWS_X + 24, PM_FOOT_Y + 13, "MOVE/CHANGE", 0xFFE2E5EBu, 1);
++    draw_psx_button(s_panel, PM_ROWS_X + 136, PM_FOOT_Y + 8, 'x');
++    draw_text(s_panel, PM_ROWS_X + 160, PM_FOOT_Y + 13, "SELECT", 0xFFE2E5EBu, 1);
++    draw_psx_button(s_panel, PM_ROWS_X + 232, PM_FOOT_Y + 8, 'o');
++    draw_text(s_panel, PM_ROWS_X + 256, PM_FOOT_Y + 13, "CLOSE", 0xFFE2E5EBu, 1);
++    draw_text(s_panel, PM_ROWS_X, PM_FOOT_Y + 36,
++              "ARROWS MOVE/CHANGE  ENTER SELECT  ESC CLOSE", PM_SOFT, 1);
++    draw_text(s_panel, PM_ROWS_X, PM_FOOT_Y + 52,
+               s_persistent ? "CHANGES HERE ARE KEPT FOR NEXT TIME"
+-                           : "MENU CHANGES APPLY NOW BUT RESET ON NEXT LAUNCH",
++                           : "CHANGES HERE RESET ON NEXT LAUNCH",
+               0xFF7F8796u, 1);
+     s_dirty = 0;
+ }
+--- a/runtime/include/psx_pause_menu.h
++++ b/runtime/include/psx_pause_menu.h
+@@ -1,4 +1,4 @@
+-/* psx_pause_menu.h - full-screen Home-key pause menu.
++/* psx_pause_menu.h - the Home-key pause menu.
+  *
+  * Same split as psx_savestate_menu: this module is a pure rasterizer with no
+  * input handling and no state of its own beyond what is pushed into it. The
+@@ -38,7 +38,9 @@
+  * 14:9 is the one the launcher defaults to for this title, so leaving it out
+  * meant the overlay could not return to the aspect the game had launched in. */
+ #define PSX_PAUSE_ASPECT_COUNT 4
+-#define PSX_PAUSE_FIT_COUNT    4   /* letterbox, stretch, fill, fit width */
++#define PSX_PAUSE_FIT_COUNT    4   /* letterbox, stretch, fill, fit width -
++                                    * the mode values. main.cpp cycles them
++                                    * in the launcher's order instead. */
+ #define PSX_PAUSE_WINDOW_COUNT 3   /* windowed, borderless, exclusive - the
+                                     * order psx_fullscreen_flag_for_mode()
+                                     * uses, so the index IS the mode value. */
+@@ -48,12 +50,24 @@
+ /* Non-zero when the row responds to Left/Right rather than Enter. */
+ int psx_pause_menu_row_is_option(int row);
+ 
+-/* Which row covers a point in PANEL coordinates, or -1 for none. The overlay
+- * is drawn stretched across the whole window (gpu_gl_renderer.c passes
+- * 0,0,ww,wh), so a caller maps a mouse position by simple proportion:
+- *   px = mouse_x * panel_w / window_w, py = mouse_y * panel_h / window_h
++/* Which row covers a point in PANEL coordinates, or -1 for none (captions and
++ * the gaps between rows included). A caller maps a mouse position from the
++ * presenter's surface through psx_pause_menu_place():
++ *   px = (sx - x) * panel_w / w, py = (sy - y) * panel_h / h
+  * with the panel size from psx_pause_menu_overlay_image(). */
+ int psx_pause_menu_row_at(int px, int py);
++
++/* Where both presenters draw the panel on a surf_w x surf_h surface (GL
++ * drawable pixels, or the SDL renderer's logical size): centred, at a whole
++ * multiple of its size when that is 2x or more so the 8x8 font stays square,
++ * and fitted a little inside a smaller surface otherwise. */
++void psx_pause_menu_place(int surf_w, int surf_h,
++                          int *x, int *y, int *w, int *h);
++
++/* How much of the game frame shows behind the panel, out of 255. The
++ * presenters multiply the held frame by this before drawing the panel, so
++ * display changes made in the menu can be judged as they are made. */
++#define PSX_PAUSE_BACKDROP_KEEP 96
+ 
+ /* Push the whole visible state in one call. `aspect` and `fit` are indices,
+  * `fps_on` and `confirm_armed` are booleans, `aku_level` is a
+@@ -71,7 +85,8 @@
+ void psx_pause_menu_set_persistent(int on);
+ 
+ /* ARGB8888, top-down, fully opaque. Returns 0 and NULLs the outputs when the
+- * menu is closed. Stretched to the full window by both present paths. */
++ * menu is closed. Both present paths draw it at psx_pause_menu_place() over
++ * the dimmed game frame. */
+ int psx_pause_menu_overlay_image(const uint32_t **pixels, int *w, int *h);
+ 
+ #ifdef __cplusplus
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6183,6 +6183,11 @@
+     { 4, 3 }, { 14, 9 }, { 16, 9 }, { 21, 9 }
+ };
+ 
++/* Image fit steps through the launcher's order - letterbox, fill, fit width,
++ * stretch - so the two lists read the same. The entries are fit MODES, which
++ * stay what the renderer, FIT_LABEL and the saved prefs use. */
++static const int kPauseFitOrder[PSX_PAUSE_FIT_COUNT] = { 0, 2, 3, 1 };
++
+ /* Staged display changes.
+  *
+  * The pause loop is a blocking nested loop inside sdl_vblank_present_body(),
+@@ -6555,10 +6560,13 @@
+         break;
+     }
+     case PSX_PAUSE_ROW_FIT: {
+-        int i = g_present_fit_mode + delta;
++        int i = 0;
++        for (int k = 0; k < PSX_PAUSE_FIT_COUNT; k++)
++            if (kPauseFitOrder[k] == g_present_fit_mode) i = k;
++        i += delta;
+         while (i < 0) i += PSX_PAUSE_FIT_COUNT;
+         while (i >= PSX_PAUSE_FIT_COUNT) i -= PSX_PAUSE_FIT_COUNT;
+-        pause_menu_apply_fit(i);
++        pause_menu_apply_fit(kPauseFitOrder[i]);
+         menu_prefs_note(MENU_PREF_FIT);
+         break;
+     }
+@@ -6746,20 +6754,56 @@
+ 
+ /* Mouse support for the overlay.
+  *
+- * The panel is drawn stretched over the entire window (gpu_gl_renderer.c calls
+- * gl_draw_osd_image with 0,0,ww,wh), so window -> panel is a plain proportion
+- * and needs no letterbox arithmetic. Returns -1 when the pointer is not over a
+- * row, including the gaps between rows. */
++ * Both presenters draw the panel at psx_pause_menu_place() on their own
++ * surface: the GL/D3D12 drawable in pixels, or the SDL renderer's logical
++ * size (host_osd.c). The pointer is taken into that surface first, then into
++ * the panel. Returns -1 when the pointer is not over a row, including the
++ * group captions and the gaps between rows. */
+ static int pause_menu_row_under_mouse(int mx, int my) {
+     const uint32_t *px = nullptr;
+     int pw = 0, ph = 0;
+     if (!psx_pause_menu_overlay_image(&px, &pw, &ph) || pw <= 0 || ph <= 0)
+         return -1;
+-    int ww = 0, wh = 0;
+-    SDL_GetWindowSize(sdl_window, &ww, &wh);
+-    if (ww <= 0 || wh <= 0) return -1;
+-    return psx_pause_menu_row_at((int)((long long)mx * pw / ww),
+-                                 (int)((long long)my * ph / wh));
++    int sw = 0, sh = 0;
++    long long sx = mx, sy = my;
++#ifndef PSX_SDL_NO_RENDER
++    if (!g_gl_active && sdl_renderer) {
++        /* Same size host_osd.c's sdl_logical_size() places the panel on. */
++#if defined(PSX_SDL3)
++        SDL_RendererLogicalPresentation mode =
++            SDL_LOGICAL_PRESENTATION_DISABLED;
++        float lx = 0.f, ly = 0.f;
++        if (!SDL_GetRenderLogicalPresentation(sdl_renderer, &sw, &sh, &mode) ||
++            sw <= 0 || sh <= 0)
++            SDL_GetRenderOutputSize(sdl_renderer, &sw, &sh);
++        if (!SDL_RenderCoordinatesFromWindow(sdl_renderer, (float)mx,
++                                             (float)my, &lx, &ly))
++            return -1;
++        sx = (long long)lx;
++        sy = (long long)ly;
++#else
++        /* SDL2 already hands mouse events over in logical coordinates. */
++        SDL_RenderGetLogicalSize(sdl_renderer, &sw, &sh);
++        if (sw <= 0 || sh <= 0)
++            SDL_GetRendererOutputSize(sdl_renderer, &sw, &sh);
++#endif
++    } else
++#endif
++    {
++        int ww = 0, wh = 0;
++        SDL_GetWindowSize(sdl_window, &ww, &wh);
++        SDL_GL_GetDrawableSize(sdl_window, &sw, &sh);
++        if (ww <= 0 || wh <= 0) return -1;
++        sx = (long long)mx * sw / ww;
++        sy = (long long)my * sh / wh;
++    }
++    if (sw <= 0 || sh <= 0) return -1;
++    int x = 0, y = 0, w = 0, h = 0;
++    psx_pause_menu_place(sw, sh, &x, &y, &w, &h);
++    if (w <= 0 || h <= 0 || sx < x || sy < y || sx >= x + w || sy >= y + h)
++        return -1;
++    return psx_pause_menu_row_at((int)((sx - x) * pw / w),
++                                 (int)((sy - y) * ph / h));
+ }
+ 
+ /* Hover moves the cursor but never changes a value: pointing at a row is not
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -348,6 +348,7 @@
+ static int           s_present_w = 0, s_present_h = 0;
+ static GLuint        s_osd_tex = 0;
+ static int           s_osd_tw = 0, s_osd_th = 0;
++static GLuint        s_dim_tex = 0;     /* 1x1 grey, see gl_dim_frame */
+ static GLuint        s_present_prog = 0, s_present_vao = 0;
+ static void          gl_swap_with_osd(void);
+ static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
+@@ -3577,6 +3578,7 @@
+     s_osd_tex = 0;
+     s_osd_tw = 0;
+     s_osd_th = 0;
++    s_dim_tex = 0;
+     s_depth24_skip_up = 0;
+     rect_clear(&s_d24_skip_fb);
+     hold_invalidate();
+@@ -4792,6 +4794,53 @@
+     p_glUseProgram(0);
+ }
+ 
++/* The pause menu's backdrop: multiply what is already in the default
++ * framebuffer by PSX_PAUSE_BACKDROP_KEEP/255, so the held game frame stays
++ * visible, darkened, behind the panel. A 1x1 grey through the present program
++ * with dst = dst * src needs no shader of its own and does not depend on the
++ * alpha the program writes; destination alpha is kept. Every hold capture is
++ * taken before gl_swap_with_osd(), so the darkening never compounds across
++ * the pause loop's re-presents. */
++static void gl_dim_frame(int ww, int wh) {
++    if (!s_present_prog || ww <= 0 || wh <= 0 ||
++        !p_glBlendFuncSeparate || !p_glBlendEquationSeparate)
++        return;
++    p_glActiveTexture(PSXGL_TEXTURE0);
++    if (!s_dim_tex) {
++        const uint32_t grey = 0xFF000000u
++            | (uint32_t)PSX_PAUSE_BACKDROP_KEEP * 0x010101u;
++        glGenTextures(1, &s_dim_tex);
++        glBindTexture(GL_TEXTURE_2D, s_dim_tex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0,
++                     GL_BGRA, GL_UNSIGNED_BYTE, &grey);
++    } else {
++        glBindTexture(GL_TEXTURE_2D, s_dim_tex);
++    }
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_STENCIL_TEST);
++    glDisable(GL_DEPTH_TEST);
++    glEnable(GL_BLEND);
++    p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
++    p_glBlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ZERO, GL_ONE);
++    glViewport(0, 0, ww, wh);
++    p_glUseProgram(s_present_prog);
++    p_glUniform1i(s_present_uTex, 0);
++    present_set_sharp(0, 0, 0, 0, 0);
++    p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
++    p_glBindVertexArray(s_present_vao);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    p_glBindVertexArray(0);
++    p_glUseProgram(0);
++    /* Back to GL's defaults; the PSX blend paths set their own per draw. */
++    p_glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
++    glDisable(GL_BLEND);
++}
++
+ /* Composite host toast + volume bar into the default framebuffer, then swap. */
+ static void gl_swap_with_osd(void) {
+     if (s_present_prog && s_ctx) {
+@@ -4826,9 +4875,15 @@
+             }
+             if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
+                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+-            /* Pause menu last: it is the topmost modal. */
+-            if (psx_pause_menu_overlay_image(&px, &ow, &oh) && px)
+-                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
++            /* Pause menu last: it is the topmost modal. A centred card over
++             * the dimmed game, not a full-window sheet, so the display
++             * settings it changes can be seen behind it. */
++            if (psx_pause_menu_overlay_image(&px, &ow, &oh) && px) {
++                int mx, my, mw, mh;
++                psx_pause_menu_place(ww, wh, &mx, &my, &mw, &mh);
++                gl_dim_frame(ww, wh);
++                gl_draw_osd_image(px, ow, oh, mw, mh, mx, my, ww, wh);
++            }
+         }
+     }
+     host_osd_present_done();
+--- a/runtime/src/host_osd.c
++++ b/runtime/src/host_osd.c
+@@ -529,10 +529,19 @@
+                           &s_sdl_ssm_th, px, w, h, 0, 0, lw, lh);
+         }
+         if (psx_pause_menu_overlay_image(&px, &w, &h) && px) {
++            /* A centred card over the dimmed game, as the GL presenter does:
++             * black at 255 - KEEP alpha leaves KEEP/255 of the frame. */
+             int lw = 640, lh = 480;
++            int mx, my, mw, mh;
+             sdl_logical_size(renderer, &lw, &lh);
++            psx_pause_menu_place(lw, lh, &mx, &my, &mw, &mh);
++            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
++            SDL_SetRenderDrawColor(renderer, 0, 0, 0,
++                                   (Uint8)(255 - PSX_PAUSE_BACKDROP_KEEP));
++            SDL_RenderFillRect(renderer, NULL);
++            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+             sdl_blit_argb(renderer, &s_sdl_pm_tex, &s_sdl_pm_tw,
+-                          &s_sdl_pm_th, px, w, h, 0, 0, lw, lh);
++                          &s_sdl_pm_th, px, w, h, mx, my, mw, mh);
+         }
+     }
+ #else

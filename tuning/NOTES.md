@@ -4209,3 +4209,82 @@ it reads the flag the load would, and moves the camera from the pose in RAM.
 **Found and not changed.** The screen fade (global 106, stepped once per loop
 at `0x800164C4`) runs per field, so fades last half as long at 60. Scripts wait
 for its end value, so only the look changes.
+
+## Home menu: a card over the game (patch 0056)
+
+From the design critique of the launcher and the Home menu. The launcher half
+is ordinary repo code (`launcher/crash2launcher/`, checked by
+`launcher/test_design_fixes.py`); this is the runtime half.
+
+### What was wrong
+
+- **Opaque and stretched.** A 640x480 sheet drawn over the whole window
+  (`0,0,ww,wh`). Image fit, Window mode and Post-processing could not be judged
+  from the menu that changes them, and the 8x8 font went wide and uneven on
+  anything but 4:3.
+- **Twelve rows, no grouping.** Names differed from the launcher's for the same
+  settings ("GAME ASPECT", "FPS DISPLAY", "99 LIVES", "KEEP 2"), and Image fit
+  cycled in mode order, not the launcher's.
+- **Armed state leaked.** One flag reddened both Restart and Quit.
+
+### The card
+
+- **Panel.** 420x480 (`PM_W`, `PM_H`), four captioned groups: GAME, DISPLAY,
+  ASSISTS, SYSTEM.
+- **One row table.** `layout_rows()` fills `s_row_y` once; drawing and
+  `psx_pause_menu_row_at` both read it, so the hit areas cannot drift from what
+  is drawn. Captions and gaps return -1.
+- **Note line.** Up to two lines of 47 characters for the selected row.
+  Gameplay aspect and Image fit say "APPLIES WHEN YOU RESUME". For the fit this
+  is a limit, not a choice: the held frame is a drawable capture
+  (`HOLD_DRAWABLE`) with the old framing baked in, so a new fit has nothing to
+  re-frame until the game runs. Post-processing does update live (the existing
+  `glpfx_end` redraw), and so does Window mode (the capture is re-letterboxed to
+  the new drawable).
+- **Colour.** Crash orange `#F07E1E` is the only accent: 5.3:1 on the selected
+  row, 6.3:1 for the title. The dimmest text, the persistence line, is 4.8:1.
+
+### Placement and backdrop
+
+- **`psx_pause_menu_place(sw, sh)`.** A whole-number scale when it is at least
+  2 (stepping down from 3 or more if the card would come within 16 px of the
+  top and bottom); otherwise 0.96 of the fitting scale. Results:
+  - 1080p and 1440p: 840x960;
+  - 4K: 1680x1920;
+  - 720p: 604x691, fitted.
+- **GL/D3D12: `gl_dim_frame()`.**
+  - It draws a 1x1 grey (`PSX_PAUSE_BACKDROP_KEEP` = 96) through the present
+    program with `glBlendFuncSeparate(ZERO, SRC_COLOR, ZERO, ONE)`. That is a
+    multiply that keeps destination alpha, whatever the program writes.
+  - The gl12 layer maps `SRC_COLOR` to `D3D12_BLEND_SRC_COLOR`.
+  - All five `hold_capture_drawable()` calls come before `gl_swap_with_osd()`,
+    so the 8 ms re-presents never dim an already dimmed frame.
+- **SDL renderer.** A black `SDL_RenderFillRect` at alpha 255-96, then the
+  panel at its rect on the logical size.
+- **Mouse.**
+  - GL/D3D12: window coordinates are scaled to the drawable.
+  - SDL3 renderer: `SDL_RenderCoordinatesFromWindow`.
+  - SDL2 renderer: already logical.
+  - Then the pointer goes through `psx_pause_menu_place`.
+
+### Checked without the game
+
+The scratchpad harness compiles `psx_pause_menu.c` with stubs.
+
+- Rows 0..11 hit-test in order, 20 px each.
+- Every caption, and both sides of the rows, return -1.
+- The last row ends above the note, and the note ends above the footer.
+- Placement is inside, centred and whole-pixel from 1920x1080 up, checked at
+  640x480 through 3840x2160 and at portrait 1080x1920.
+- Renders of each state, and a 1080p and 720p composite over a stand-in frame,
+  looked right.
+- Both trees build with no new warnings.
+
+### To check in play
+
+- **Backdrop.** Open the menu: the game shows dimmed behind a centred card.
+- **Live changes.** Post-processing and Window mode change behind it. Image
+  fit changes on resume.
+- **Armed state.** Arming Quit reddens Quit only.
+- **Mouse.** Hover and click land on the rows, windowed and in exclusive full
+  screen. The D3D12 renderer is also worth one look.

@@ -356,8 +356,9 @@ class Settings:
     # overlays and the pause menu are not. POSTFX_RANGES has the bounds.
     #
     # postfx_enabled is the master switch (PSX_POSTFX_ENABLED): off keeps the
-    # values below but starts the game with them off, and the Home menu's POST
-    # FX row can still switch them on. That row is also how it gets turned off.
+    # values below but starts the game with them off, and the Home menu's
+    # POST-PROCESSING row can still switch them on. That row is also how it
+    # gets turned off.
     postfx_enabled: bool = True
     postfx_aa: str = "off"              # off | fxaa | smaa
     postfx_sharpen: int = 0
@@ -488,7 +489,7 @@ class Settings:
     # Performance page now, and stays on so the readout works.
     fps_telemetry: bool = True
     # The FPS counter drawn in the game window itself (PSX_FPS_OSD), the one
-    # the F key and the Home menu's FPS DISPLAY row switch. Separate from
+    # the F key and the Home menu's FPS COUNTER row switch. Separate from
     # fps_telemetry, which feeds the Play page.
     fps_overlay: bool = False
     # Summarises, every ~5s, how the game picks SPU voices: key-ons per voice

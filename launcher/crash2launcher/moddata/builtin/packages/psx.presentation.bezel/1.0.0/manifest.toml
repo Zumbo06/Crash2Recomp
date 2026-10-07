@@ -3,7 +3,7 @@ id = "psx.presentation.bezel"
 version = "1.0.0"
 name = "Bezel Artwork"
 author = "psxrecomp"
-description = "Draws user-selected artwork behind the game image in OpenGL letterbox or pillarbox margins. Disabled by default; with the feature off, margins remain the normal black clear."
+description = "Shows a picture of your choice in the bars beside or above the game image, instead of black."
 resolver = "declarative"
 save_compatibility = "shared"
 
@@ -13,7 +13,7 @@ game_id = "*"
 [[feature]]
 id = "bezel"
 name = "Bezel Artwork"
-description = "Disabled by default. Select an image file to draw behind the game image whenever the selected aspect ratio leaves side or top/bottom margins. This is presentation-only and does not change guest rendering."
+description = "Off by default. Pick an image to fill the empty bars whenever the screen shape leaves some. Only what is drawn around the game changes."
 group = "Visual"
 default_enabled = false
 
@@ -21,7 +21,7 @@ default_enabled = false
 feature = "bezel"
 id = "artwork"
 label = "Bezel image"
-description = "Select an image to draw behind the game frame in letterbox or pillarbox margins."
+description = "The picture to show in the bars around the game image."
 format = "file"
 file_patterns = "*.png,*.jpg,*.jpeg,*.bmp"
 file_description = "Image files"

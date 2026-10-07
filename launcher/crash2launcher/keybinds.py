@@ -48,6 +48,40 @@ _CANONICAL.update({"enter": "Return", "esc": "Escape", "lshift": "Left Shift",
     "lalt": "Left Alt", "ralt": "Right Alt", "backslash": "\\"})
 
 
+LABELS = {action: label for _, rows in GROUPS for action, label, _ in rows}
+
+# Pairs that share keys on purpose: the arrow keys drive the D-pad and the
+# left stick together in the defaults, so one press works for either.
+SHARED_ON_PURPOSE = (
+    frozenset({"up", "ls_up"}), frozenset({"down", "ls_down"}),
+    frozenset({"left", "ls_left"}), frozenset({"right", "ls_right"}),
+)
+
+
+def duplicates(bindings: dict[str, str]) -> list[tuple[str, list[str]]]:
+    """Keys bound to more than one game action, as (key, [action labels]).
+
+    One key on two buttons presses both, which is rarely what a rebind meant -
+    moving Move up to W while R1 stays on W makes every step a shoulder press.
+    The D-pad / left-stick pairs in SHARED_ON_PURPOSE are left out.
+    """
+    owners: dict[str, list[str]] = {}
+    for action in DEFAULTS:
+        for key in split(bindings.get(action, DEFAULTS[action])):
+            if key and key != "None":
+                owners.setdefault(key, [])
+                if action not in owners[key]:
+                    owners[key].append(action)
+    out = []
+    for key, actions in owners.items():
+        if len(actions) < 2:
+            continue
+        if len(actions) == 2 and frozenset(actions) in SHARED_ON_PURPOSE:
+            continue
+        out.append((key, [LABELS[a] for a in actions]))
+    return out
+
+
 def split(value: str) -> tuple[str, str]:
     parts = value.split(",", 1)
     return parts[0].strip(), parts[1].strip() if len(parts) == 2 else "None"

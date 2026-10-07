@@ -3,7 +3,7 @@ id = "psx.enhancement.fast-loading"
 version = "1.0.0"
 name = "Fast Loading (host pacing)"
 author = "psxrecomp"
-description = "Speeds up the wall-clock pacing of loads without changing anything the game can observe. Every guest frame, CD interrupt and callback still happens on schedule."
+description = "Runs loads faster on your PC without changing anything the game can notice."
 resolver = "declarative"
 save_compatibility = "shared"
 
@@ -15,7 +15,7 @@ game_id = "*"
 [[feature]]
 id = "fast-loading"
 name = "Fast Loading (host pacing)"
-description = "Disabled by default. Host pacing is the safe accelerator: it only changes how fast real time is fed to a load, so the guest cannot desync. It does speed the game up while a load is detected, which some speedrun routes rely on NOT happening -- if that is you, leave this off and use CD Speed instead."
+description = "Off by default. The safe way to shorten loads: the game sees the same timing as on a console. The game also runs faster while a load is going on, which some speedrun routes avoid - speedrunners should use CD Speed instead."
 group = "Quality of Life"
 default_enabled = false
 
@@ -23,7 +23,7 @@ default_enabled = false
 feature = "fast-loading"
 id = "multiplier"
 label = "Host speed multiplier"
-description = "How much faster than real time a load may run. 1 is authentic. 2-32 is the useful range; larger values keep working but stop helping once the host, not the pacing, is the limit. Ignored while Uncapped is ticked."
+description = "How much faster than normal a load may run. 1 is the original speed; 2 to 32 is the useful range. Ignored while Uncapped is on."
 group = "Quality of Life"
 type = "integer"
 min = 1
@@ -35,8 +35,8 @@ disabled_by = "uncapped"
 [[option]]
 feature = "fast-loading"
 id = "uncapped"
-label = "Uncapped (as fast as the host allows)"
-description = "Run loads at whatever speed this machine can manage, ignoring the multiplier above."
+label = "Uncapped (as fast as your PC allows)"
+description = "Runs loads as fast as this PC can, ignoring the multiplier above."
 group = "Quality of Life"
 type = "boolean"
 default = "false"

@@ -3,7 +3,7 @@ id = "psx.enhancement.pgxp"
 version = "1.0.0"
 name = "PGXP Precision (geometry + textures)"
 author = "psxrecomp"
-description = "Sub-pixel vertex precision and perspective-correct texturing (the PGXP technique): the runtime shadows the GTE's full-precision projections and follows them to the GPU, so 3D polygons stop wobbling between whole pixels and large floor/wall textures stop warping. Visual-only: the game's own math, culling and readback see exactly what real hardware produces."
+description = "Stops 3D models wobbling and large floor and wall textures warping - the classic PS1 look. Visual only: gameplay is exactly as on a console."
 resolver = "declarative"
 save_compatibility = "shared"
 
@@ -15,15 +15,15 @@ game_id = "*"
 [[feature]]
 id = "pgxp"
 name = "PGXP Precision"
-description = "Disabled by default (the faithful floor). Corrections are validated per vertex against the exact packet words the game drew with and clamped to half a pixel, so 2D sprites and UI are never touched and a vertex the tracker cannot prove simply draws the faithful way. Most effective on a build compiled with the PGXP hook variant; on other builds coverage is reduced but never harmful. Needs supersampling >= 2 to be visible."
+description = "Off by default. Moves 3D corners by less than half a pixel and leaves 2D sprites and menus alone. Needs an internal resolution of 2x or higher to make a visible difference."
 group = "Visual"
 default_enabled = false
 
 [[option]]
 feature = "pgxp"
 id = "cpu_mode"
-label = "CPU-mode propagation"
-description = "Also track precision through CPU arithmetic (register repacking math). Off matches the reference implementations' default; on can raise coverage in games that rebuild vertices with integer math. Always safe either way - validation rejects anything stale."
+label = "Track through CPU math"
+description = "Also follows precision through the game's own arithmetic. Can fix more wobble in some games; safe either way."
 group = "Visual"
 type = "boolean"
 default = "false"
