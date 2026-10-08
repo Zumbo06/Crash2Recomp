@@ -4337,3 +4337,166 @@ Fullscreen, or a 16:9 output resolution, does.
   the sides, with sharpness and filtering as before.
 - In the Home menu, cycle GAMEPLAY ASPECT to ORIGINAL 4:3 and resume: the same
   picture, and the launcher shows it on return.
+
+## Image fit Original 4:3 (patch 0058)
+
+**The request.** An image fit called Original 4:3, with no black bars at the
+top and bottom.
+
+**Why 0057's Original 4:3 had them.** It showed the whole 240-line frame, and
+Crash 2 draws only rows 12..227 of it. The game's own blank lines were the
+black bands.
+
+**What it is now.** Original 4:3 is an image fit: `scaling_mode = "original"`
+in the launcher, fit mode 4 (`PSX_PAUSE_FIT_ORIGINAL`) in the runtime.
+
+- **How it is drawn.** It is letterbox with the game's blank lines trimmed:
+  `config.ORIGINAL_TRIM` = 12/12, passed as `PSX_ORIGINAL_TRIM`.
+  - The trim replaces the configured overscan crop while this fit is on.
+  - The kept band is the 4:3 frame less those lines, 40:27.
+    `overscan_aspect_mul` sizes it without stretching.
+  - So the picture fills the window's height, with bars at the sides only.
+    In a 2560x1440 window it is 2133x1440, with 213 px a side.
+- **No renderer change.** It is `present_set_fit()` in main.cpp. The other
+  fits get the configured crop back.
+- **Launcher.**
+  - Image fit lists it first: "Original 4:3 - PS1 picture, bars at the sides
+    only".
+  - Picking it sets the 4:3 gameplay aspect and turns zoom and stretch off.
+    Zoom, Stretch, Vertical pan and Overscan crop are greyed out while it is
+    on.
+  - A wider gameplay aspect ends it and goes back to Letterbox.
+  - An Auto window is shaped 40:27, so it shows no bars at all.
+  - The Authentic preset uses it.
+- **Home menu.**
+  - IMAGE FIT cycles ORIGINAL 4:3, letterbox, fill, fit width, stretch.
+  - Picking ORIGINAL 4:3 stages the 4:3 aspect.
+- **0057 is gone.** Its Gameplay aspect entry and its aspect-row label are
+  removed: there is one Original 4:3, under Image fit. The overscan keys 0057
+  wrote back are gone too.
+
+**Checked:**
+
+- `launcher/test_original_aspect.py` (rewritten), with every launcher script
+  passing;
+- the Home menu harness (label, note, width);
+- both trees build;
+- 0058 round-trips byte-for-byte.
+
+**To check in play.** Pick Original 4:3 in a 16:9 window or full screen. The
+picture should fill the height with bars only at the sides, and should not be
+stretched. The Home menu should show ORIGINAL 4:3 under IMAGE FIT.
+
+## Widescreen, part 15: forward paths measured; no more wedges (patch 0059)
+
+Every real-camera measurement before this covered side-on paths only. The
+script behind parts 13 and 14 was never committed.
+
+### The sweep: `tuning/wide_view_sweep`
+
+**What it covers.** `sweep.py` takes every camera path:
+
+- at every 4th node and the last (or `--nodes part13`: 1, 5, ... short of the
+  last);
+- with the game's resting camera (`export.level_paths`, shared with
+  `wide_frustum_sim`);
+- at 16:9.
+
+**What it draws.** Three pictures per view, rasterised by `raster.c` far to
+near:
+
+- `game`: the game's list;
+- `drawn`: what the hook draws, with the same rules as `frustum_ref.draw` and
+  the reasons kept, plus the void cover on side-on paths;
+- `ref`: every polygon of the zone's worlds.
+
+Corners behind the eye are drawn where the GTE puts them: the world renderer
+has no near test.
+
+**What it reports.**
+
+- 4:3 pixels the hook changes, split into holes filled and pixels drawn over;
+- in the extra columns: gap, only-in-a-neighbour's-worlds, void, covered,
+  wedge and see-through ("wrong");
+- for every gap pixel, why its polygon was not drawn.
+
+**Variants** let rules be measured before they are written in C. Run it with
+`sh build.sh` (raster.dll), then
+`python tuning/wide_view_sweep/sweep.py --variants hook,0054,pool --png 10`.
+
+**Against parts 13 and 14** (side-on, `--nodes part13`):
+
+- **Matches:**
+  - 3,069 views, exactly;
+  - Snow Go (S000000E) exactly: covers in 35 of 304 views, black 0.05%,
+    covered 5.55%;
+  - every merged list against `frustum_ref.draw` (`--verify`).
+- **Darker than recorded:**
+  - S000000F: 38.7% black, against 18.5% recorded;
+  - S0000016: 45.8%, against 15.5%;
+  - bonus areas S0000018-21.
+  - Growing coverage the cover scan's way explains only 3 points. The
+    recorded figures came from that lost script, so overall black reads 7.5%
+    here against 3.8% there.
+- **Comparisons below use this tool before and after**, so they hold either
+  way.
+
+### Forward paths, with the 0054 rules
+
+14,495 views; the camera model fails in 122.
+
+- **4:3 frame changed by the hook: 0.419%.**
+  - Holes filled 0.305%. Mostly views where the resting camera does not match
+    play: the warp room S0000002 (8.5%), S0000028 and S0000029.
+  - Drawn over the game's pixels: 0.114%.
+  - Wedges: 0.102%, against the game's own 0.053%.
+- **Wedges.** 416,153 of the 1,280,809 additions had a corner the GTE cannot
+  place.
+  - The world renderer projects such a corner near twice its camera offset
+    from the centre, and draws it.
+  - In S0000015 two additions covered the whole frame. In Air Crash
+    (S0000020) a slab covered the top.
+- **Gaps: 3.97% of the extra columns.** Of these:
+  - 71% are polygons other paths of the zone list;
+  - 17% are polygons neighbour zones' paths list;
+  - 11% are in no list.
+
+### Patch 0059: the side-on wedge rule on forward paths too
+
+`c2sl_fwd_keep()`: forward additions must have every corner placeable.
+
+| | 0054 | 0059 |
+|---|---|---|
+| 4:3 changed | 0.419% | 0.369% |
+| 4:3 wedges | 0.102% | 0.053% (the game's own) |
+| extra-column wedge pixels | 0.24% | 0.16% (the game's own) |
+| gaps | 3.97% | 3.97% |
+
+The gaps did not change: the refused polygons drew nothing useful.
+
+`wide_frustum_sim` now exports a forward case per level with a wedge refused
+(176 cases). C equals the reference on every one, and 3,916 wedges were
+refused.
+
+### Not shipped: a forward pool
+
+Letting forward paths read the side-on pool takes gaps from 3.97% to 1.23%,
+and see-through from 0.91% to 0.47%, with the 4:3 frame unchanged.
+
+But S0000009, a tube scene, draws only a ring and leaves black around it even
+inside the 4:3 frame. With the pool, the tube walls appear at the screen edges
+only.
+
+A guard is drafted in `frustum_ref.band_open`: no pool on a side whose 48-px
+band of the 4:3 frame is a dark, open scene, which is the void cover's own
+test. It is the `pool_band` variant in the sweep, not yet measured or written
+in C.
+
+### To check in play (Developer mode, a widescreen aspect)
+
+- **Forward runs.** No polygon should flash across the screen near the camera.
+  Watch S0000015 and S000001A, which look like tunnel levels, and Air Crash.
+  The margins should look as before otherwise.
+- **Side-on views.** The latest report there ("still wrong") is open. The
+  sweep's worst side-on views are its `side_*.png` pictures. A screenshot or a
+  level name would say which of them it is.

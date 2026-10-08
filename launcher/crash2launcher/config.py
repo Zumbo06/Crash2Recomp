@@ -102,7 +102,12 @@ OUTPUT_RESOLUTIONS = (
 )
 
 # How the image fills the output canvas.
-SCALING_MODES = ("letterbox", "stretch", "fill", "fit_width")
+SCALING_MODES = ("letterbox", "stretch", "fill", "fit_width", "original")
+
+# Crash 2 draws rows 12..227 of its 240-line field; the rest is genuinely
+# black. Image fit "original" trims exactly these, top and bottom, so the 4:3
+# picture fills the screen's height (runtime.py passes PSX_ORIGINAL_TRIM).
+ORIGINAL_TRIM = (12, 12)
 # Aku Aku assist strengths. The index into this tuple is the C2_AKU_* level the
 # runtime uses, so the order is part of the contract with crash2_cheats.h.
 CHEAT_AKU_LEVELS = ("off", "keep_masks", "no_damage")
@@ -247,6 +252,10 @@ class Settings:
     #               cropping the overflow (no distortion, loses edges)
     #   fit_width - width ALWAYS spans the display; bars top/bottom when the
     #               image is shorter, cropped when taller. Never side bars.
+    #   original  - the PS1's own 4:3 picture: whole, unstretched, with the
+    #               game's blank lines trimmed (ORIGINAL_TRIM) so it fills the
+    #               height - bars at the sides only. Implies a 4:3 aspect; the
+    #               zoom, stretch and overscan dials do not apply to it.
     scaling_mode: str = "letterbox"
 
     # Shape of the OUTPUT CANVAS, deliberately separate from `aspect` (which is
@@ -557,9 +566,14 @@ class Settings:
 
         Distinct from `aspect`, which is the shape the game RENDERS at. They are
         equal for everything except Pan & Scan, where a 4:3 render is zoomed to
-        fill a 16:9 canvas.
+        fill a 16:9 canvas, and Image fit Original 4:3, whose picture is the 4:3
+        frame less its blank lines - a window of that shape shows no bars.
         """
-        return self.aspect if self.output_aspect == "auto" else self.output_aspect
+        if self.output_aspect != "auto":
+            return self.output_aspect
+        if self.scaling_mode == "original":
+            return original_shape()
+        return self.aspect
 
     def clamp(self) -> "Settings":
         """Coerce out-of-range values back to something usable.
@@ -615,6 +629,9 @@ class Settings:
             setattr(self, name, max(low, min(high, value)))
         self.postfx_dedither = bool(self.postfx_dedither)
         if self.scaling_mode not in SCALING_MODES:
+            self.scaling_mode = "letterbox"
+        # Original 4:3 is the 4:3 picture; a wider aspect picked since wins.
+        if self.scaling_mode == "original" and self.aspect != "4:3":
             self.scaling_mode = "letterbox"
         # Cropping more than a quarter of the frame is a mistake, not a setting.
         for name in ("overscan_top", "overscan_bottom",
@@ -811,7 +828,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "present_zoom": -1,
         "present_pan": 0,
         "present_stretch": 0,
-        "scaling_mode": "letterbox",
+        "scaling_mode": "original",
         "texture_filter": "nearest",
         "present_filter": "plain",
         "crt_filter": "raw",
@@ -976,41 +993,36 @@ def postfx_string(settings: Settings) -> str:
     return ";".join(parts)
 
 
-# The PS1's own picture: the 4:3 render shown whole at its own shape, with
-# black bars wherever the screen is wider. Not a preset - a named state of the
-# framing fields - so it leaves image quality, the screen shape and the window
-# alone, and Authentic (which includes it) is recognised as it. Overscan is
-# part of it: trimming the game's blank lines makes the kept band wider than
-# 4:3 (gpu_gl_renderer.c overscan_aspect_mul), which narrows the bars.
+def original_shape() -> str:
+    """The shape of Image fit Original 4:3's picture, "num:den": the 4:3 frame
+    less the lines ORIGINAL_TRIM takes off (40:27 for Crash 2)."""
+    import math
+    num, den = 4 * 240, 3 * (240 - sum(ORIGINAL_TRIM))
+    g = math.gcd(num, den)
+    return "%d:%d" % (num // g, den // g)
+
+
+# Image fit Original 4:3: the PS1's own picture, with the settings it needs.
+# Picking it also sets the 4:3 aspect and turns the zoom and stretch dials off;
+# image quality, the screen shape and the window stay as they are. The overscan
+# crop is left alone - the runtime trims ORIGINAL_TRIM in its place while this
+# fit is on, and the crop applies again to the other fits.
 ORIGINAL_43: dict[str, Any] = {
     "aspect": "4:3",
-    "scaling_mode": "letterbox",
+    "scaling_mode": "original",
     "present_zoom": -1,
     "present_pan": 0,
     "present_stretch": 0,
-    "overscan_top": 0,
-    "overscan_bottom": 0,
-    "overscan_left": 0,
-    "overscan_right": 0,
 }
 
 
 def is_original_43(settings: Settings) -> bool:
-    """Whether the game draws 4:3 and the picture is shown whole, unstretched.
-
-    Zoom "None" (0) frames exactly as "Follow image fit" (-1) does under
-    Letterbox, and the vertical pan only moves a picture that is cropped, so
-    neither changes what is on screen here. The runtime's Home menu applies the
-    same test (main.cpp pause_menu_framing_is_original)."""
-    s = settings
-    return (s.aspect == "4:3" and s.scaling_mode == "letterbox"
-            and s.present_zoom in (-1, 0) and s.present_stretch == 0
-            and not (s.overscan_top or s.overscan_bottom
-                     or s.overscan_left or s.overscan_right))
+    """Whether Image fit Original 4:3 is on."""
+    return settings.scaling_mode == "original" and settings.aspect == "4:3"
 
 
 def apply_original_43(settings: Settings) -> Settings:
-    """Switch to the original 4:3 picture; everything else stays."""
+    """Switch to Image fit Original 4:3; everything else stays."""
     for key, value in ORIGINAL_43.items():
         setattr(settings, key, value)
     return settings

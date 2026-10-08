@@ -3,11 +3,11 @@ scenery hook draws in the extra columns, and what it leaves black.
 
     sh tuning/wide_view_sweep/build.sh            (raster.dll)
     python tuning/wide_view_sweep/sweep.py [--levels S0000020.NSF,...]
-        [--step 4] [--jobs N] [--variant hook] [--json FILE] [--png N]
-        [--verify N]
+        [--step 4] [--nodes all|part13] [--jobs N] [--variants hook,0054]
+        [--json FILE] [--png N] [--verify N]
 
 For every camera path (wide_frustum_sim/export.py level_paths) at every STEP-th
-node, the game's camera at rest there (crash2_wide_geom.h: the path point, the
+node and the last, the game's camera at rest there (crash2_wide_geom.h: the path point, the
 node's angles from the item after the path, H from 0x130) with the 16:9
 margin, 85 px a side. Three pictures are rasterised by raster.c, painter's
 order far to near by each polygon's mean depth (the ordering table), the
@@ -39,9 +39,10 @@ list (culled here), a candidate refused (outside the wide frame, inside the
 of the zone or of a neighbour zone, in no list at all, or in a neighbour's
 world the zone does not have (which the renderer cannot draw).
 
---variant picks the rules for forward paths (kind other than 3 and 8): "hook"
-is crash2_wide_slst.h as it is; the others are the candidates measured for
-widescreen part 15 (VARIANTS). --verify N checks the first N views' merged
+--variants picks the rules for forward paths (kind other than 3 and 8), one
+pass for all: "hook" is crash2_wide_slst.h as it is, "0054" the rules before
+widescreen part 15, the others candidates (VARIANTS). --nodes part13 samples
+the nodes parts 13 and 14 measured. --verify N checks the first N views' hook
 lists against frustum_ref.draw. JSON and PNGs are game data: out/ is
 gitignored.
 """

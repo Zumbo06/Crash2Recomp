@@ -295,6 +295,9 @@ def _build_env(settings: Settings) -> dict[str, str]:
     # runtime default, so we still pass it explicitly to make a relaunch after
     # switching back actually take effect.
     env["PSX_SCALING_MODE"] = settings.scaling_mode
+    # The blank lines Image fit Original 4:3 trims, top and bottom. Always
+    # passed: the Home menu can pick that fit while playing.
+    env["PSX_ORIGINAL_TRIM"] = "%d,%d" % config.ORIGINAL_TRIM
 
     # How the internal buffer is resampled down to the window.
     env["PSX_PRESENT_FILTER"] = settings.present_filter

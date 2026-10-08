@@ -25,7 +25,7 @@ from .config import Settings
 FILE_NAME = "ingame_changes.json"
 
 _FIT_NAMES = {"letterbox": "Letterbox", "stretch": "Stretch", "fill": "Fill",
-              "fit_width": "Fit width"}
+              "fit_width": "Fit width", "original": "Original 4:3"}
 _WINDOW_NAMES = {0: "Windowed", 1: "Borderless fullscreen",
                  2: "Exclusive fullscreen"}
 _AKU_NAMES = {"off": "Off", "keep_masks": "Keep 2 masks",
@@ -63,12 +63,6 @@ _RULES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], str] | None]] = {
                      lambda v: f"image fit {_FIT_NAMES.get(v, v)}"),
     "present_zoom": (_int_range(-1, 100), None),
     "present_stretch": (_int_range(0, 100), None),
-    # Picking ORIGINAL 4:3 in the Home menu also clears the overscan crop
-    # (config.ORIGINAL_43); the runtime writes all four.
-    "overscan_top": (_int_range(0, 60), None),
-    "overscan_bottom": (_int_range(0, 60), None),
-    "overscan_left": (_int_range(0, 60), None),
-    "overscan_right": (_int_range(0, 60), None),
     "fullscreen_mode": (lambda v: v if v in (0, 1, 2) and not isinstance(v, bool)
                         else None,
                         lambda v: f"window mode {_WINDOW_NAMES[v].lower()}"),
@@ -127,15 +121,9 @@ def apply_pending(path: Path, settings: Settings) -> tuple[list[str], list[str]]
                 kept.append(describe(good))
             else:
                 framing = True
-    framed = ("game aspect", "image fit")
-    if (framing or any(k.startswith(framed) for k in kept))             and config.is_original_43(settings):
-        # One change, named as the player picked it: ORIGINAL 4:3 set the
-        # aspect, the fit and the dials together.
-        kept = ["game aspect original 4:3"] + [
-            k for k in kept if not k.startswith(framed)]
     # Picking the fit that was already set still hands the framing back to it,
     # which is a visible change worth naming.
-    elif framing and not any(k.startswith("image fit") for k in kept):
+    if framing and not any(k.startswith("image fit") for k in kept):
         kept.append("image fit %s" % _FIT_NAMES.get(settings.scaling_mode,
                                                      settings.scaling_mode))
     return kept, dropped

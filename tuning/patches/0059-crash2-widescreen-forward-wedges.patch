@@ -1,0 +1,86 @@
+Native widescreen, forward paths: no added polygon with a corner the GTE cannot place.
+
+Measured with tuning/wide_view_sweep (every camera path, every 4th node and
+the last, the game's own camera at rest, 16:9): on forward paths 0052's camera
+test added polygons that reach into the extra columns but cross the eye
+plane - 416,153 of 1,280,809 additions, a third. The world renderer has no
+near test (0x80042420 RTPT straight into the screen test and the
+ordering-table slot), and behind the eye the GTE's saturated division lands a
+corner near twice its camera offset from the centre, inside the screen: such
+a polygon was drawn as a wedge, in places over the whole frame (S0000015,
+S000001A) or as a slab across the top (S0000020). The game's own lists avoid
+these; side-on paths have refused them since 0053.
+
+crash2_wide_slst.h: c2sl_fwd_keep() - on forward paths a candidate is kept
+when c2wg_classify calls it C2WG_WIDE and every corner is c2wg_placeable; a
+pool candidate by the side-on pool's rule (none reach forward paths yet). The
+header comment states the rule for every path.
+
+Across the game's forward views (14,495; the sweep, before / after):
+- 4:3 pixels changed by the hook 0.419% -> 0.369%, its wedges there 0.102%
+  -> 0.053% (the game's own lists draw 0.053%);
+- wedge pixels in the extra columns 0.24% -> 0.16% (the rest are the game's
+  own polygons reaching there);
+- gaps unchanged (3.97%): the refused polygons drew nothing useful.
+
+tuning/wide_frustum_sim checks it: frustum_ref.fwd_keep, an exported forward
+case per level with a wedge refused (176 cases), sim.c holding every forward
+addition to the rule - C equals the reference on every case, 3,916 wedges
+refused.
+
+No file here is in codegen_hash_sources.cmake.
+
+--- a/runtime/src/crash2_wide_slst.h
++++ b/runtime/src/crash2_wide_slst.h
+@@ -55,6 +55,14 @@
+  *   - The model is checked once per node: it must put at least half of the
+  *     game's own list on screen, or that node is drawn with the node window
+  *     below instead. Objects (crash2_wide_spawn.h) get the same camera.
++ *   - A candidate with a corner the GTE cannot place (behind the eye, or so
++ *     near that its division saturates) is never added. The game's own lists
++ *     avoid such polygons; drawn, one is a wedge from wherever that corner
++ *     lands - behind the eye the saturated division puts it near twice its
++ *     camera offset from the centre. On forward paths, where the camera looks
++ *     along the walls and floor beside it, a third of the additions were such
++ *     polygons and some covered the whole screen (widescreen part 15). On
++ *     side-on paths since part 13, on every path since part 15.
+  *
+  * Paths that look at the play from the side (kind 3 and 8: the side-scrolling
+  * stretches and the bonus rounds) get two more rules; forward paths neither:
+@@ -71,9 +79,6 @@
+  *     A pool polygon is drawn only while it lies wholly in the extra columns
+  *     of one side: inside the 4:3 frame another path's list says nothing about
+  *     this view, and the game's picture there stays untouched.
+- *   - A candidate with a corner the GTE cannot place (behind the eye, or so
+- *     near that its division saturates) is never added: it would be drawn as
+- *     a wedge from wherever that corner lands.
+  *   - The void cover. Where the level has no geometry at all - nothing in any
+  *     world of the zone or its neighbours - the extra columns show the cleared
+  *     frame: black wedges between the polygon edges where the modelled scene
+@@ -767,6 +772,17 @@
+     return !pool || left == n || right == n;
+ }
+ 
++/* The camera test's verdict on a forward path: what c2wg_classify calls
++ * C2WG_WIDE, with every corner placeable as on side-on paths (see the top of
++ * this file); a pool polygon by the side-on pool's rule. */
++static int c2sl_fwd_keep(const C2wgCam *c, int32_t (*v)[3], int n, int pool)
++{
++    if (pool) return c2sl_side_keep(c, v, n, 1);
++    for (int i = 0; i < n; i++)
++        if (!c2wg_placeable(c, v[i][0], v[i][1], v[i][2])) return 0;
++    return c2wg_classify(c, v, n, c->margin) == C2WG_WIDE;
++}
++
+ /* The camera test's candidates: every polygon the lists within k nodes of
+  * `node` hold (past the path's ends, the joined paths', mapped to our worlds)
+  * that the game's list (c2sl_game, m long) does not - nearest node first, each
+@@ -1008,7 +1024,7 @@
+         const int n = c2wg_poly(ram, ws, nw, c2sl_cid[c], v);
+         if (!n) continue;
+         if (side ? c2sl_side_keep(&cam, v, n, c >= c2sl_pool_first)
+-                 : c2wg_classify(&cam, v, n, cam.margin) == C2WG_WIDE) {
++                 : c2sl_fwd_keep(&cam, v, n, c >= c2sl_pool_first)) {
+             c2sl_ckeep[c] = 1;
+             budget--;
+             c2sl_pool_drawn += c >= c2sl_pool_first;

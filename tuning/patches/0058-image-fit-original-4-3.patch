@@ -1,0 +1,351 @@
+Image fit ORIGINAL 4:3: the PS1's picture, filling the height, bars at the sides only.
+
+Requested: an image fit called Original 4:3 with no black bars at the top and
+bottom. Patch 0057's ORIGINAL 4:3 (a GAMEPLAY ASPECT label) showed the whole
+240-line frame, and Crash 2 draws only rows 12..227 of it: its own blank lines
+made black bands at the top and bottom of the picture.
+
+ORIGINAL 4:3 is now fit mode 4 (PSX_PAUSE_FIT_ORIGINAL), and it is main.cpp's,
+not the renderer's. present_set_fit() drives the renderer as letterbox, with
+the game's blank lines (PSX_ORIGINAL_TRIM, "top,bottom" of 240 - the launcher
+passes 12,12) trimmed in place of the configured overscan crop. The kept band
+is the 4:3 frame less those lines, 40:27, and overscan_aspect_mul sizes it
+without stretching, so the picture fills the window's height and the bars are
+at the sides only. The other fits get the configured crop back
+(g_overscan_crop). No renderer, D3D12 or dispatch change.
+
+main.cpp:
+- PSX_SCALING_MODE=original selects it; zoom and stretch are cleared with it;
+- the Home menu's IMAGE FIT cycles ORIGINAL 4:3, letterbox, fill, fit width,
+  stretch (the launcher's order). Picking it stages the 4:3 aspect too; a
+  wider GAMEPLAY ASPECT ends it (letterbox), as in the launcher;
+- menu_prefs_write writes "original"; the overscan keys and
+  MENU_PREF_OVERSCAN of 0057 go, since the menu no longer changes the crop.
+
+psx_pause_menu.c/.h: FIT_LABEL/FIT_NOTE gain ORIGINAL 4:3 ("THE PS1'S OWN
+PICTURE, FILLING THE HEIGHT, BARS AT THE SIDES. APPLIES WHEN YOU RESUME.");
+PSX_PAUSE_FIT_COUNT 5; 0057's aspect-row label (psx_pause_menu_set_aspect_
+original) is removed - the aspect row reads 4:3 again.
+
+The software (SDL renderer) path letterboxes by logical size and has no crop,
+so there the fit shows the whole frame, as before.
+
+No file here is in codegen_hash_sources.cmake.
+
+--- a/runtime/src/psx_pause_menu.c
++++ b/runtime/src/psx_pause_menu.c
+@@ -93,7 +93,6 @@
+ static int s_postfx = -1;       /* last drawn value, see overlay_image */
+ static int s_confirm_armed;
+ static int s_persistent;        /* changes are kept by the launcher */
+-static int s_aspect_original;   /* aspect 0 is shown whole: ORIGINAL 4:3 */
+ static int s_dirty = 1;
+ static uint32_t s_panel[PM_W * PM_H];
+ 
+@@ -108,10 +107,11 @@
+ static const char *const ASPECT_LABEL[PSX_PAUSE_ASPECT_COUNT] = {
+     "4:3", "14:9", "16:9", "21:9",
+ };
+-/* Indexed by fit MODE (the value the renderer takes). main.cpp cycles them in
+- * the launcher's order - letterbox, fill, fit width, stretch. */
++/* Indexed by fit MODE (PSX_PAUSE_FIT_ORIGINAL is main.cpp's, not the
++ * renderer's). main.cpp cycles them in the launcher's order - original 4:3,
++ * letterbox, fill, fit width, stretch. */
+ static const char *const FIT_LABEL[PSX_PAUSE_FIT_COUNT] = {
+-    "LETTERBOX", "STRETCH", "FILL", "FIT WIDTH",
++    "LETTERBOX", "STRETCH", "FILL", "FIT WIDTH", "ORIGINAL 4:3",
+ };
+ /* The held frame behind the menu is a capture with the old fit baked in, so
+  * a new fit cannot be shown until the game runs again. Say so. */
+@@ -120,6 +120,7 @@
+     "FILLS THE WINDOW EXACTLY AND DISTORTS. APPLIES WHEN YOU RESUME.",
+     "KEEPS THE SHAPE AND CROPS THE EDGES. APPLIES WHEN YOU RESUME.",
+     "NO SIDE BARS; TOP AND BOTTOM MAY CROP. APPLIES WHEN YOU RESUME.",
++    "THE PS1'S OWN PICTURE, FILLING THE HEIGHT, BARS AT THE SIDES. APPLIES WHEN YOU RESUME.",
+ };
+ static const char *const WINDOW_LABEL[PSX_PAUSE_WINDOW_COUNT] = {
+     "WINDOWED", "BORDERLESS", "EXCLUSIVE",
+@@ -364,8 +365,6 @@
+ {
+     switch (row) {
+     case PSX_PAUSE_ROW_ASPECT:
+-        if (s_aspect == 0 && s_aspect_original)
+-            return "ORIGINAL 4:3";
+         return ASPECT_LABEL[(unsigned)s_aspect < PSX_PAUSE_ASPECT_COUNT
+                             ? s_aspect : 0];
+     case PSX_PAUSE_ROW_FIT:
+@@ -402,11 +401,6 @@
+ 
+ static const char *row_note(int row)
+ {
+-    if (row == PSX_PAUSE_ROW_ASPECT && s_aspect == 0)
+-        return s_aspect_original
+-            ? "THE PS1'S OWN SHAPE, WITH BLACK BARS AT THE SIDES. "
+-              "APPLIES WHEN YOU RESUME."
+-            : "4:3, ZOOMED OR STRETCHED BY THE LAUNCHER'S FRAMING.";
+     if (row == PSX_PAUSE_ROW_FIT)
+         return FIT_NOTE[(unsigned)s_fit < PSX_PAUSE_FIT_COUNT ? s_fit : 0];
+     if (row == PSX_PAUSE_ROW_POSTFX)
+@@ -528,14 +522,6 @@
+     s_persistent = on;
+ }
+ 
+-void psx_pause_menu_set_aspect_original(int on)
+-{
+-    on = on ? 1 : 0;
+-    if (s_aspect_original != on)
+-        s_dirty = 1;
+-    s_aspect_original = on;
+-}
+-
+ int psx_pause_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
+ {
+     if (!s_open) {
+--- a/runtime/include/psx_pause_menu.h
++++ b/runtime/include/psx_pause_menu.h
+@@ -35,13 +35,14 @@
+ /* Value counts for the option rows, so main.cpp can wrap the cursor without
+  * hardcoding them. */
+ /* 4:3, 14:9, 16:9, 21:9 - ascending width, matching the launcher's own list.
+- * Index 0 is ORIGINAL 4:3: picking it sets the original framing as well.
+  * 14:9 is the one the launcher defaults to for this title, so leaving it out
+  * meant the overlay could not return to the aspect the game had launched in. */
+ #define PSX_PAUSE_ASPECT_COUNT 4
+-#define PSX_PAUSE_FIT_COUNT    4   /* letterbox, stretch, fill, fit width -
+-                                    * the mode values. main.cpp cycles them
+-                                    * in the launcher's order instead. */
++#define PSX_PAUSE_FIT_COUNT    5   /* letterbox, stretch, fill, fit width,
++                                    * original 4:3 - the mode values. main.cpp
++                                    * cycles them in the launcher's order. */
++#define PSX_PAUSE_FIT_ORIGINAL 4   /* the PS1's 4:3 picture, the game's blank
++                                    * lines trimmed (main.cpp present_set_fit) */
+ #define PSX_PAUSE_WINDOW_COUNT 3   /* windowed, borderless, exclusive - the
+                                     * order psx_fullscreen_flag_for_mode()
+                                     * uses, so the index IS the mode value. */
+@@ -85,11 +86,6 @@
+  * to PSX_MENU_PREFS_FILE). Only the footer's wording depends on it. */
+ void psx_pause_menu_set_persistent(int on);
+ 
+-/* Non-zero when aspect index 0 is the PS1's own picture: 4:3 shown whole and
+- * unstretched (main.cpp pause_menu_framing_is_original). The row then reads
+- * ORIGINAL 4:3; a 4:3 the launcher zoomed or stretched reads plain 4:3. */
+-void psx_pause_menu_set_aspect_original(int on);
+-
+ /* ARGB8888, top-down, fully opaque. Returns 0 and NULLs the outputs when the
+  * menu is closed. Both present paths draw it at psx_pause_menu_place() over
+  * the dimmed game frame. */
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -591,7 +591,6 @@
+     MENU_PREF_LIVES  = 1u << 5,
+     MENU_PREF_AKU    = 1u << 6,
+     MENU_PREF_VOLUME = 1u << 7,
+-    MENU_PREF_OVERSCAN = 1u << 8,
+ };
+ static void menu_prefs_note(unsigned bits);
+ static void menu_prefs_write(void);
+@@ -1341,15 +1340,20 @@
+  * in config_loader.h). */
+ static int           g_video_aspect_num = 4;
+ static int           g_video_aspect_den = 3;
+-/* Presentation fit: 0 letterbox, 1 stretch, 2 fill, 3 fit_width. Mirrors what
+- * was last handed to gl_renderer_set_scaling_mode(), which has no getter, so
+- * the pause menu can show and cycle the live value. */
++/* Presentation fit: 0 letterbox, 1 stretch, 2 fill, 3 fit_width, 4 original
++ * 4:3 (PSX_PAUSE_FIT_ORIGINAL: letterbox with the game's blank lines trimmed,
++ * present_set_fit). The renderer has no getter for its mode, so this is what
++ * the pause menu shows and cycles. */
+ static int           g_present_fit_mode = 0;
+-/* The overscan crop as last handed to gl_renderer_set_overscan_crop(), top,
+- * bottom, left, right in 240ths and clamped as the renderer clamps them. Kept
+- * here for the Home menu: ORIGINAL 4:3 needs to know the picture is uncropped,
+- * and writes what it changed back to the launcher. */
++/* The configured overscan crop (PSX_OVERSCAN_CROP), top, bottom, left, right
++ * in 240ths and clamped as the renderer clamps them. Image fit ORIGINAL 4:3
++ * trims g_original_trim in its place (present_set_fit); leaving it puts this
++ * back. */
+ static int           g_overscan_crop[4] = { 0, 0, 0, 0 };
++/* The game's own blank lines, top and bottom of 240 (PSX_ORIGINAL_TRIM: Crash 2
++ * draws rows 12..227), which ORIGINAL 4:3 trims so its picture fills the
++ * window's height. */
++static int           g_original_trim[2] = { 0, 0 };
+ /* Resize-driven widescreen. The user's fixed aspect is still used to shape the
+  * initial window; after the game window exists these values follow its live
+  * aspect, clamped to 4:3..the widest mode offered by the title. */
+@@ -6189,10 +6193,12 @@
+     { 4, 3 }, { 14, 9 }, { 16, 9 }, { 21, 9 }
+ };
+ 
+-/* Image fit steps through the launcher's order - letterbox, fill, fit width,
+- * stretch - so the two lists read the same. The entries are fit MODES, which
+- * stay what the renderer, FIT_LABEL and the saved prefs use. */
+-static const int kPauseFitOrder[PSX_PAUSE_FIT_COUNT] = { 0, 2, 3, 1 };
++/* Image fit steps through the launcher's order - original 4:3, letterbox,
++ * fill, fit width, stretch - so the two lists read the same. The entries are
++ * fit MODES, which stay what FIT_LABEL and the saved prefs use. */
++static const int kPauseFitOrder[PSX_PAUSE_FIT_COUNT] = {
++    PSX_PAUSE_FIT_ORIGINAL, 0, 2, 3, 1
++};
+ 
+ /* Staged display changes.
+  *
+@@ -6233,22 +6239,7 @@
+     return 0;       /* windowed */
+ }
+ 
+-/* The PS1's own picture: the 4:3 render shown whole and unstretched, so a
+- * wider window gets black bars at the sides. The launcher's
+- * config.is_original_43 is the same test: zoom 0 frames as "follow the fit"
+- * under letterbox, and the pan only moves a picture that is cropped. */
+-static bool pause_menu_framing_is_original(void) {
+-    return g_present_fit_mode == 0 && gl_renderer_get_present_zoom() <= 0 &&
+-           gl_renderer_get_present_stretch() == 0 &&
+-           !(g_overscan_crop[0] | g_overscan_crop[1] |
+-             g_overscan_crop[2] | g_overscan_crop[3]);
+-}
+-
+ static void pause_menu_sync_overlay(void) {
+-    /* Aspect index 0 reads ORIGINAL 4:3 when the framing is the original's;
+-     * a 4:3 the launcher zoomed or stretched reads plain 4:3. */
+-    psx_pause_menu_set_aspect_original(pause_menu_aspect_index() == 0 &&
+-                                       pause_menu_framing_is_original());
+     psx_pause_menu_set_state(pause_menu_open, pause_menu_sel,
+                              pause_menu_aspect_index(), g_present_fit_mode,
+                              pause_menu_window_index(), fps_osd_enabled(),
+@@ -6301,7 +6292,7 @@
+     const std::filesystem::path &path = menu_prefs_path();
+     if (path.empty()) return;
+     static const char *const kFit[PSX_PAUSE_FIT_COUNT] = {
+-        "letterbox", "stretch", "fill", "fit_width"   /* FIT_LABEL order */
++        "letterbox", "stretch", "fill", "fit_width", "original" /* FIT_LABEL order */
+     };
+     static const char *const kAku[PSX_PAUSE_AKU_COUNT] = {
+         "off", "keep_masks", "no_damage"              /* C2_AKU_* order */
+@@ -6355,14 +6346,6 @@
+     if (c & MENU_PREF_VOLUME) {
+         std::snprintf(line, sizeof(line), "  \"volume\": %d,\n",
+                       host_volume_get());
+-        json += line;
+-    }
+-    if (c & MENU_PREF_OVERSCAN) {
+-        std::snprintf(line, sizeof(line),
+-                      "  \"overscan_top\": %d,\n  \"overscan_bottom\": %d,\n"
+-                      "  \"overscan_left\": %d,\n  \"overscan_right\": %d,\n",
+-                      g_overscan_crop[0], g_overscan_crop[1],
+-                      g_overscan_crop[2], g_overscan_crop[3]);
+         json += line;
+     }
+     if (json.size() >= 2 && json[json.size() - 2] == ',')
+@@ -6462,24 +6445,30 @@
+  * STRETCH and FILL all drew the same picture and the row looked dead. Handing
+  * framing back to the fit makes every value look like its name; the launcher
+  * keeps the dials cleared too (menu_prefs_write). */
++/* Image fit in the renderer's terms. ORIGINAL 4:3 is not a renderer mode: it
++ * is letterbox with the game's own blank lines (g_original_trim) trimmed in
++ * place of the configured overscan crop, so the 4:3 picture fills the window's
++ * height and the bars are at the sides only - the kept band is the 4:3 frame
++ * less those lines (40:27 for Crash 2), which overscan_aspect_mul sizes
++ * without stretching. The other fits get the configured crop back. */
++static void present_set_fit(int mode) {
++    g_present_fit_mode = mode;
++    if (mode == PSX_PAUSE_FIT_ORIGINAL) {
++        gl_renderer_set_scaling_mode(0);
++        gl_renderer_set_present_pan(0);
++        gl_renderer_set_overscan_crop(g_original_trim[0], g_original_trim[1], 0, 0);
++    } else {
++        gl_renderer_set_scaling_mode(mode);
++        gl_renderer_set_overscan_crop(g_overscan_crop[0], g_overscan_crop[1],
++                                      g_overscan_crop[2], g_overscan_crop[3]);
++    }
++}
++
+ static void pause_menu_apply_fit(int mode) {
+     if (mode < 0 || mode >= PSX_PAUSE_FIT_COUNT) return;
+-    g_present_fit_mode = mode;
+-    gl_renderer_set_scaling_mode(mode);
++    present_set_fit(mode);
+     gl_renderer_set_present_zoom(-1);
+     gl_renderer_set_present_stretch(0);
+-}
+-
+-/* ORIGINAL 4:3 takes the framing with it: letterbox (which clears zoom and
+- * stretch), no pan and no overscan crop - trimming the game's blank lines
+- * makes the kept band wider than 4:3 and narrows the bars. Presentation only,
+- * so it is safe from the pause loop; the aspect itself is staged as usual. */
+-static void pause_menu_apply_original_framing(void) {
+-    pause_menu_apply_fit(0);
+-    gl_renderer_set_present_pan(0);
+-    gl_renderer_set_overscan_crop(0, 0, 0, 0);
+-    for (int &v : g_overscan_crop) v = 0;
+-    menu_prefs_note(MENU_PREF_FIT | MENU_PREF_OVERSCAN);
+ }
+ 
+ /* Live, no relaunch: the GL backend re-derives its viewport from
+@@ -6598,8 +6587,12 @@
+         while (i >= PSX_PAUSE_ASPECT_COUNT) i -= PSX_PAUSE_ASPECT_COUNT;
+         pause_menu_apply_aspect(i);
+         menu_prefs_note(MENU_PREF_ASPECT);
+-        /* Index 0 is ORIGINAL 4:3. The other aspects leave the framing be. */
+-        if (i == 0) pause_menu_apply_original_framing();
++        /* ORIGINAL 4:3 is the 4:3 picture: a wider aspect ends it, as in the
++         * launcher. */
++        if (i != 0 && g_present_fit_mode == PSX_PAUSE_FIT_ORIGINAL) {
++            pause_menu_apply_fit(0);
++            menu_prefs_note(MENU_PREF_FIT);
++        }
+         break;
+     }
+     case PSX_PAUSE_ROW_FIT: {
+@@ -6611,6 +6604,11 @@
+         while (i >= PSX_PAUSE_FIT_COUNT) i -= PSX_PAUSE_FIT_COUNT;
+         pause_menu_apply_fit(kPauseFitOrder[i]);
+         menu_prefs_note(MENU_PREF_FIT);
++        /* ORIGINAL 4:3 brings the 4:3 aspect with it (staged, as always). */
++        if (kPauseFitOrder[i] == PSX_PAUSE_FIT_ORIGINAL && pause_menu_aspect_index() != 0) {
++            pause_menu_apply_aspect(0);
++            menu_prefs_note(MENU_PREF_ASPECT);
++        }
+         break;
+     }
+     case PSX_PAUSE_ROW_WINDOW: {
+@@ -13744,11 +13742,14 @@
+         const int mode = (std::strcmp(e, "stretch")   == 0) ? 1
+                        : (std::strcmp(e, "fill")      == 0) ? 2
+                        : (std::strcmp(e, "fit_width") == 0) ? 3
++                       : (std::strcmp(e, "original")  == 0) ? PSX_PAUSE_FIT_ORIGINAL
+                        : 0;
+         g_present_fit_mode = mode;
+-        gl_renderer_set_scaling_mode(mode);
+-        static const char *kFitNames[] = {
+-            "letterbox", "stretch", "fill", "fit_width (no side bars)"
++        /* ORIGINAL 4:3 needs the crop and trim read first: below. */
++        if (mode != PSX_PAUSE_FIT_ORIGINAL) gl_renderer_set_scaling_mode(mode);
++        static const char *kFitNames[PSX_PAUSE_FIT_COUNT] = {
++            "letterbox", "stretch", "fill", "fit_width (no side bars)",
++            "original 4:3 (the game's blank lines trimmed)"
+         };
+         std::fprintf(stdout, "psxrecomp: presentation fit = %s\n", kFitNames[mode]);
+     }
+@@ -13814,6 +13815,22 @@
+                 "psxrecomp: overscan crop = top %d, bottom %d, left %d, right %d "
+                 "(of 240)\n", t, b, l, r);
+         }
++    }
++    /* The game's blank lines, "top,bottom" of 240, for Image fit ORIGINAL 4:3
++     * (the launcher always passes them: the Home menu can pick that fit). */
++    if (const char *e = std::getenv("PSX_ORIGINAL_TRIM")) {
++        int t = 0, b = 0;
++        if (std::sscanf(e, "%d,%d", &t, &b) == 2) {
++            g_original_trim[0] = t > 0 ? (t < 60 ? t : 60) : 0;
++            g_original_trim[1] = b > 0 ? (b < 60 ? b : 60) : 0;
++        }
++    }
++    if (g_present_fit_mode == PSX_PAUSE_FIT_ORIGINAL) {
++        present_set_fit(PSX_PAUSE_FIT_ORIGINAL);
++        gl_renderer_set_present_zoom(-1);
++        gl_renderer_set_present_stretch(0);
++        std::fprintf(stdout, "psxrecomp: original 4:3 trims %d/%d lines of 240\n",
++                     g_original_trim[0], g_original_trim[1]);
+     }
+     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);

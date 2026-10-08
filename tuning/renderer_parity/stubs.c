@@ -19,6 +19,14 @@ int  psx_rewind_overlay_image(const uint32_t **p, int *w, int *h) { (void)p; (vo
 float psx_rewind_slide(void) { return 0.0f; }
 int  psx_savestate_menu_overlay_image(const uint32_t **p, int *w, int *h) { (void)p; (void)w; (void)h; return 0; }
 int  psx_pause_menu_overlay_image(const uint32_t **p, int *w, int *h) { (void)p; (void)w; (void)h; return 0; }
+void psx_pause_menu_place(int sw, int sh, int *x, int *y, int *w, int *h)
+{
+    (void)sw; (void)sh;
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (w) *w = 0;
+    if (h) *h = 0;
+}
 void host_osd_present_done(void) {}
 int  gpu_display_is_depth24(void) { return 0; }
 void gpu_get_display_info(GpuDisplayInfo *out) { if (out) memset(out, 0, sizeof(*out)); }
